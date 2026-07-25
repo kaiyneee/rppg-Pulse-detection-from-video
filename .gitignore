@@ -1,0 +1,4 @@
+data/shape_predictor_68_face_landmarks.dat
+venv/
+__pycache__/
+.DS_Store

@@ -1,0 +1,16 @@
+# Проверено на Python 3.12.3. Версии ниже — те, что реально протестированы
+# при разработке этого модуля (см. docs/research_report.md, раздел 8).
+
+numpy>=2.0
+scipy>=1.13
+opencv-python>=4.9
+mediapipe>=0.10.14        # 0.10.x — минимальная версия с Tasks API FaceLandmarker
+scikit-learn>=1.4          # PCA, FastICA
+matplotlib>=3.8             # Bland-Altman и др. графики в benchmark/
+
+# Опционально (пайплайн работает и без них, см. соответствующие модули):
+numba>=0.59                 # ускорение POS (src/rppg/accel/fast_ops.py); без неё используется чистый numpy fallback
+onnxruntime>=1.17           # для подключения обученного (deep learning) метода извлечения сигнала, см. research_report.md #6.3
+# torch>=2.2                # только если добавляете обучаемый метод (не используется в базовом пайплайне)
+
+pandas>=2.2                 # benchmark/evaluate.py, скрипты
