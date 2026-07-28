@@ -32,9 +32,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.stats import skew as _skew
 from sklearn.decomposition import PCA, FastICA
 
-from rppg.signal.preprocessing import detrend as _detrend
+from rppg.signal.preprocessing import detrend as _detrend, bandpass_filter as _bandpass_filter
 from rppg.signal.quality import select_best_component_by_periodicity
 
 
@@ -55,7 +56,7 @@ class PulseExtractionMethod(ABC):
     name: str = "base"
 
     @abstractmethod
-    def extract(self, window: SignalWindow, roi_name: str) -> np.ndarray:
+    def extract(self, window: SignalWindow, roi_name: str | None) -> np.ndarray:
         """Возвращает 1D пульсовой сигнал длины T (ещё без bandpass-фильтра)."""
         raise NotImplementedError
 
@@ -65,6 +66,25 @@ def _temporal_normalize(rgb: np.ndarray) -> np.ndarray:
     means = np.mean(rgb, axis=0)
     means = np.where(np.abs(means) < 1e-8, 1e-8, means)
     return rgb / means
+
+
+def _orient_by_skew(signal: np.ndarray) -> np.ndarray:
+    """Фиксирует полярность компоненты, полученной из PCA/ICA/head-motion —
+    в отличие от CHROM/POS (фиксированная проекционная матрица), знак этих
+    компонент математически не определён. Для оценки BPM это не важно
+    (спектр чётный по знаку), но критично для find_peaks: при инверсии
+    детектируются диастолические впадины вместо систолических пиков, что
+    раздувает джиттер IBI (RMSSD/pNN50) при почти неизменном среднем HR.
+
+    Физиологическая PPG-волна имеет резкий систолический подъём и более
+    пологий спад -> при правильной полярности распределение амплитуд
+    положительно асимметрично (skew > 0). Разворачиваем знак, если это
+    не так.
+    """
+    signal = np.asarray(signal, dtype=float)
+    if _skew(signal) < 0:
+        return -signal
+    return signal
 
 
 class GreenMethod(PulseExtractionMethod):
@@ -97,11 +117,21 @@ class ChromMethod(PulseExtractionMethod):
         xs = 3 * rn - 2 * gn
         ys = 1.5 * rn + gn - 1.5 * bn
 
-        std_xs = np.std(xs)
-        std_ys = np.std(ys)
-        alpha = std_xs / std_ys if std_ys > 1e-8 else 1.0
+        # В оригинале (de Haan & Jeanne, 2013) alpha считается ПОСЛЕ
+        # полосовой фильтрации Xs/Ys: alpha = std(Xf)/std(Yf). Если считать
+        # его по нефильтрованным Xs/Ys (как раньше здесь), в std доминирует
+        # низкочастотный дрейф (освещение/ROI), а не пульсовая компонента —
+        # alpha смещается, и CHROM теряет устойчивость к движению, ради
+        # которой и был выбран этот метод.
+        low_hz, high_hz = window.hr_band_hz
+        xf = _bandpass_filter(xs, window.fps, low_hz, high_hz)
+        yf = _bandpass_filter(ys, window.fps, low_hz, high_hz)
 
-        return xs - alpha * ys
+        std_xf = np.std(xf)
+        std_yf = np.std(yf)
+        alpha = std_xf / std_yf if std_yf > 1e-8 else 1.0
+
+        return xf - alpha * yf
 
 
 class PosMethod(PulseExtractionMethod):
@@ -154,6 +184,14 @@ class PosMethod(PulseExtractionMethod):
             alpha = std1 / std2 if std2 > 1e-8 else 1.0
             h_window = s1 + alpha * s2
             h_window = h_window - np.mean(h_window)
+            # Algorithm 1 (Wang et al., 2016) нормирует каждое окно на его std
+            # перед overlap-add, не только центрирует. Без этого шумные окна
+            # (движение/блик подняли дисперсию) вносят непропорционально
+            # больший вклад в сумму — именно устойчивость к такому шуму и есть
+            # причина, по которой POS выбран методом по умолчанию.
+            std_hw = np.std(h_window)
+            if std_hw > 1e-8:
+                h_window = h_window / std_hw
             h[n : n + ws] += h_window
         return h
 
@@ -180,7 +218,7 @@ class PcaColorMethod(PulseExtractionMethod):
         best = select_best_component_by_periodicity(
             components.T, window.fps, window.hr_band_hz
         )
-        return components[:, best]
+        return _orient_by_skew(components[:, best])
 
 
 class IcaColorMethod(PulseExtractionMethod):
@@ -210,7 +248,7 @@ class IcaColorMethod(PulseExtractionMethod):
         best = select_best_component_by_periodicity(
             components.T, window.fps, window.hr_band_hz
         )
-        return components[:, best]
+        return _orient_by_skew(components[:, best])
 
 
 class HeadMotionMethod(PulseExtractionMethod):
@@ -248,7 +286,7 @@ class HeadMotionMethod(PulseExtractionMethod):
         best = select_best_component_by_periodicity(
             components.T, window.fps, window.hr_band_hz
         )
-        return components[:, best]
+        return _orient_by_skew(components[:, best])
 
 
 METHOD_REGISTRY: dict[str, type[PulseExtractionMethod]] = {
