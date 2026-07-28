@@ -79,8 +79,19 @@ def _pos_core_numba(rgb: np.ndarray, ws: int, proj: np.ndarray) -> np.ndarray:
             mean_hw += h_window[i]
         mean_hw /= ws
 
+        # Algorithm 1 (Wang et al., 2016): окно нормируется на свой std перед
+        # overlap-add, не только центрируется — иначе шумные окна вносят
+        # непропорционально большой вклад (см. methods.py::PosMethod).
+        var_hw = 0.0
         for i in range(ws):
-            h[n + i] += h_window[i] - mean_hw
+            d = h_window[i] - mean_hw
+            var_hw += d * d
+        std_hw = np.sqrt(var_hw / ws)
+        if std_hw < 1e-8:
+            std_hw = 1.0
+
+        for i in range(ws):
+            h[n + i] += (h_window[i] - mean_hw) / std_hw
 
     return h
 
