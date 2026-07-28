@@ -117,9 +117,32 @@ class QualityConfig:
 
 @dataclass
 class HRVConfig:
+    """Пороги HRV — окно HRV отдельно от окна BPM (см. hrv/features.py и
+    RPPGPipeline._update_ibi_log/_maybe_compute_hrv, п.14 требований):
+    BPM оценивается спектрально по короткому скользящему окну (WindowConfig),
+    а HRV time/frequency-domain метрикам по Task Force (1996) нужны
+    существенно более длинные ряды IBI, поэтому они копятся отдельно."""
+
     pnn_threshold_ms: float = 50.0
     pnn20_threshold_ms: float = 20.0
     compute_frequency_domain: bool = True
+    edge_trim_seconds: float = 1.0
+    # Порог доли отбракованных (ectopic_artifact_mask) интервалов, выше
+    # которого HRV за окно не публикуется (п.17, стандарт Kubios/neurokit2).
+    max_artifact_fraction: float = 0.05
+    # Порог "скачка" IBI относительно соседей для маскирования как
+    # физиологически неправдоподобного (п.16).
+    ectopic_max_relative_change: float = 0.4
+    # Минимум накопленного ряда IBI перед первой публикацией HRV и
+    # предпочтительная длина (Task Force, 1996 — 5 минут; п.14).
+    min_accumulation_seconds: float = 120.0
+    target_accumulation_seconds: float = 300.0
+    # HRV пересчитывается не на каждом BPM-шаге, а раз в это число секунд.
+    step_seconds: float = 60.0
+    # Минимальная длительность ряда IBI для LF/HF (п.15): LF 0.04-0.15 Гц
+    # -> периоды 6.7-25с, HF 0.15-0.4 Гц -> периоды 2.5-6.7с.
+    lf_min_duration_seconds: float = 120.0
+    hf_min_duration_seconds: float = 60.0
 
 
 @dataclass
