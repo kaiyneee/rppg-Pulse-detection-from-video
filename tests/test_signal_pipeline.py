@@ -21,7 +21,17 @@ import numpy as np
 from rppg.signal.preprocessing import bandpass_filter, detrend, preprocess_signal
 from rppg.signal.methods import SignalWindow, get_method
 from rppg.signal.frequency import estimate_hr
-from rppg.hrv.features import extract_hrv_features, detect_pulse_peaks, hrv_time_domain
+from rppg.signal.respiration import estimate_respiration_rate
+from rppg.hrv.features import (
+    extract_hrv_features,
+    extract_hrv_features_from_ibi,
+    detect_pulse_peaks,
+    refine_peaks_subsample,
+    compute_ibi_ms,
+    ectopic_artifact_mask,
+    hrv_time_domain,
+    hrv_frequency_domain,
+)
 
 
 FPS = 30.0
@@ -230,6 +240,172 @@ def test_hrv_features_match_known_ibi_statistics():
     assert hrv.n_beats > 100
 
 
+def test_white_noise_is_not_publishable():
+    """Регрессия: жёсткий SNR-гейт в assess_quality (см. quality.py).
+
+    Раньше overall = 0.5*snr_score + 0.3*roi_score + 0.2*stability_score
+    сравнивался с порогом 0.5 БЕЗ отдельной проверки SNR: на чистом шуме
+    snr_score=0, а roi/stability при одном ROI/без landmark-точек нейтральны
+    (0.5), что давало overall == 0.5 и publishable=True для сигнала без
+    какой-либо пульсовой составляющей — прямая дыра в требовании ТЗ
+    "не передавать BPM при низком качестве сигнала"."""
+    print("\n=== Тест: белый шум -> publishable == False ===")
+    from rppg.signal.quality import assess_quality, dominant_frequency_and_snr
+    from rppg.config import QualityConfig
+
+    rng = np.random.default_rng(42)
+    noise = rng.normal(0, 1, int(FPS * DURATION_S))
+    _, snr_db = dominant_frequency_and_snr(noise, FPS, BAND)
+
+    qcfg = QualityConfig()
+    sqi = assess_quality(
+        spectral_snr_db=snr_db,
+        bpm_by_roi={"forehead": 75.0},  # один ROI -> нейтральный roi_score=0.5
+        landmark_trajectories=None,  # нейтральный stability_score=0.5
+        min_spectral_snr_db=qcfg.min_spectral_snr_db,
+        max_cross_roi_bpm_diff=qcfg.max_cross_roi_bpm_diff,
+        min_landmark_stability=qcfg.min_landmark_stability,
+        min_overall_score_to_publish=qcfg.min_overall_score_to_publish,
+    )
+    print(f"  spectral_snr_db={snr_db:.2f} dB, overall={sqi.overall_score:.3f}, "
+          f"publishable={sqi.is_reliable}")
+    assert not sqi.is_reliable, "Белый шум не должен быть publishable"
+
+
+def test_subsample_peak_refinement_reduces_rmssd_quantization_error():
+    """Регрессия для п.13 (Этап C): на 30 fps шаг индекса пика = 33.3 мс,
+    сопоставимый с самим RMSSD (20-50 мс у здоровых в покое). Без
+    суб-сэмпловой параболической интерполяции RMSSD в основном измеряет
+    квантование кадров, а не физиологию — проверяем на сигнале с известным
+    (очень малым) истинным джиттером IBI, что интерполяция реально снижает
+    эту ошибку, а не просто существует в коде."""
+    print("\n=== Тест: суб-сэмпловая интерполяция пиков снижает шум квантования RMSSD ===")
+    fps = 30.0
+    rng = np.random.default_rng(7)
+    true_ibi_ms = 800.0
+    jitter_ms = rng.normal(0, 3.0, 400)  # истинный джиттер ~3мс (намеренно << шага 33.3мс)
+    true_ibis = true_ibi_ms + jitter_ms
+    beat_times_s = np.cumsum(true_ibis) / 1000.0
+    n = int((beat_times_s[-1] + 1) * fps)
+    signal = np.zeros(n)
+    for bt in beat_times_s:
+        center_idx = bt * fps
+        idxs = np.arange(max(0, int(center_idx) - 5), min(n, int(center_idx) + 6))
+        signal[idxs] += np.exp(-0.5 * ((idxs - center_idx) / 1.2) ** 2)
+
+    true_rmssd = np.sqrt(np.mean(np.diff(true_ibis) ** 2))
+
+    peaks = detect_pulse_peaks(signal, fps)
+    ibi_int = compute_ibi_ms(peaks.astype(float), fps)
+    rmssd_int = np.sqrt(np.mean(np.diff(ibi_int) ** 2))
+
+    peaks_sub = refine_peaks_subsample(signal, peaks)
+    ibi_sub = compute_ibi_ms(peaks_sub, fps)
+    rmssd_sub = np.sqrt(np.mean(np.diff(ibi_sub) ** 2))
+
+    err_int = abs(rmssd_int - true_rmssd)
+    err_sub = abs(rmssd_sub - true_rmssd)
+    print(f"  истинный RMSSD={true_rmssd:.2f}мс, целые индексы={rmssd_int:.2f}мс (ошибка {err_int:.2f}), "
+          f"суб-сэмпл={rmssd_sub:.2f}мс (ошибка {err_sub:.2f})")
+    assert err_sub < err_int, "суб-сэмпловая интерполяция должна снижать ошибку RMSSD от квантования кадров"
+    assert err_sub < 2.0, "суб-сэмпловая оценка должна быть близка к истинному RMSSD"
+
+
+def test_ectopic_masking_does_not_stitch_false_diff():
+    """Регрессия для п.16: старое поведение (удаление выброса из ряда)
+    "сшивает" соседние валидные интервалы через дыру и даёт ложную разность
+    в np.diff. Правильно — маскировать и исключать из diff() любую пару,
+    где хотя бы один сосед невалиден."""
+    print("\n=== Тест: маскирование эктопических IBI не создаёт ложный 'сшитый' diff ===")
+    ibi = np.full(20, 800.0)
+    ibi[9] = 850.0
+    ibi[10] = 2000.0  # явный артефакт
+    ibi[11] = 750.0
+    mask = ectopic_artifact_mask(ibi, max_relative_change=0.4)
+    assert not mask[10], "явный выброс должен быть замаскирован"
+
+    # То, что дал бы старый подход "удалить и сшить": прыжок idx9(850) -> idx12(800)
+    # напрямую, полностью пропуская замаскированные idx10/idx11 — фиктивная разность -50,
+    # которой в реальности между двумя РЕАЛЬНО соседними ударами не было.
+    deleted = ibi[mask]
+    stitched_diffs = np.diff(deleted)
+    assert -50.0 in stitched_diffs, "sanity: удаление действительно фабрикует эту фиктивную разность"
+
+    # То, что реально использует hrv_time_domain (маскирование): пары, где хотя бы
+    # один сосед невалиден, из diff() исключаются целиком, а не сшиваются.
+    pair_valid = mask[:-1] & mask[1:]
+    used_diffs = np.diff(ibi)[pair_valid]
+    assert -50.0 not in used_diffs, (
+        "маскирование не должно давать ту же фиктивную разность, что и удаление со сшиванием"
+    )
+    print("  [OK] маскирование исключает 'сшитый' diff, который производит удаление")
+
+
+def test_hrv_artifact_fraction_gates_publishable():
+    """Регрессия для п.17: если доля отбракованных IBI превышает порог
+    (по умолчанию 5%), HRV за это окно не должен публиковаться — тот же
+    принцип flag-based гейта, что и PTSDPulseFeatures.publishable для BPM."""
+    print("\n=== Тест: доля артефактов > порога -> HRVFeatures.publishable == False ===")
+    rng = np.random.default_rng(11)
+    clean_ibi = rng.normal(800, 20, 200)
+    hrv_clean = extract_hrv_features_from_ibi(clean_ibi)
+    assert hrv_clean.publishable, "чистый ряд IBI должен быть publishable"
+
+    dirty_ibi = clean_ibi.copy()
+    for i in range(10, 200, 13):  # ~15% изолированных выбросов
+        dirty_ibi[i] *= 2.5
+    hrv_dirty = extract_hrv_features_from_ibi(dirty_ibi)
+    print(f"  чистый: artifact_fraction={hrv_clean.artifact_fraction:.3f} publishable={hrv_clean.publishable}")
+    print(f"  зашумлённый: artifact_fraction={hrv_dirty.artifact_fraction:.3f} publishable={hrv_dirty.publishable}")
+    assert hrv_dirty.artifact_fraction > 0.05
+    assert not hrv_dirty.publishable, "HRV с >5% отбракованных интервалов не должен быть publishable"
+
+
+def test_lf_hf_require_separate_minimum_durations():
+    """Регрессия для п.15: старый общий порог duration<20с был мягче ЛЮБОГО
+    периода LF-полосы (6.7-25с) и на 10-секундном окне обнулял LF/HF ещё до
+    проверки. Нужны раздельные пороги: HF >= 60с, LF >= 120с."""
+    print("\n=== Тест: LF требует >=120с, HF требует >=60с ===")
+    rng = np.random.default_rng(1)
+
+    def make_ibi(duration_s):
+        n = int(duration_s * 1000 / 800.0) + 5
+        return rng.normal(800.0, 40.0, n)
+
+    fd_short = hrv_frequency_domain(make_ibi(10))
+    assert fd_short["lf_power"] is None and fd_short["hf_power"] is None
+
+    fd_mid = hrv_frequency_domain(make_ibi(90))
+    assert fd_mid["hf_power"] is not None and fd_mid["lf_power"] is None, "90с: только HF, ещё не LF"
+
+    fd_long = hrv_frequency_domain(make_ibi(150))
+    assert fd_long["lf_power"] is not None and fd_long["hf_power"] is not None, "150с: и LF, и HF"
+    print("  [OK] LF/HF появляются на разных минимальных длительностях, а не одновременно на duration<20")
+
+
+def test_respiration_rate_from_amplitude_modulation():
+    """Регрессия для п.18: частота дыхания оценивается по огибающей
+    (амплитудной модуляции) пульсовой волны в полосе 0.15-0.4 Гц."""
+    print("\n=== Тест: оценка частоты дыхания по амплитудной модуляции ===")
+    fps = 30.0
+    duration = 40.0
+    n = int(fps * duration)
+    t = np.arange(n) / fps
+    hr_hz = 75 / 60.0
+    resp_hz_true = 0.25  # 15 дыханий/мин
+    carrier = np.sin(2 * np.pi * hr_hz * t)
+    envelope = 1.0 + 0.5 * np.sin(2 * np.pi * resp_hz_true * t)
+    rng = np.random.default_rng(4)
+    pulse_with_resp = envelope * carrier + rng.normal(0, 0.02, n)
+
+    resp_bpm, resp_hz = estimate_respiration_rate(pulse_with_resp, fps)
+    print(f"  истинная частота дыхания={resp_hz_true * 60:.1f} дых/мин, оценка={resp_bpm:.1f} дых/мин")
+    assert resp_hz is not None and abs(resp_hz - resp_hz_true) < 0.03
+
+    short_bpm, short_hz = estimate_respiration_rate(pulse_with_resp[:100], fps)
+    assert short_bpm is None and short_hz is None, "слишком короткий сигнал должен безопасно вернуть None"
+
+
 def run_all():
     tests = [
         test_color_based_methods_recover_known_bpm,
@@ -239,6 +415,12 @@ def run_all():
         test_bandpass_rejects_out_of_band_and_keeps_in_band,
         test_detrend_removes_slow_trend,
         test_hrv_features_match_known_ibi_statistics,
+        test_white_noise_is_not_publishable,
+        test_subsample_peak_refinement_reduces_rmssd_quantization_error,
+        test_ectopic_masking_does_not_stitch_false_diff,
+        test_hrv_artifact_fraction_gates_publishable,
+        test_lf_hf_require_separate_minimum_durations,
+        test_respiration_rate_from_amplitude_modulation,
     ]
     failed = []
     for test in tests:

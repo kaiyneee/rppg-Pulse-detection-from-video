@@ -172,7 +172,14 @@ def assess_quality(
     else:
         level = QualityLevel.LOW
 
-    is_reliable = overall >= min_overall_score_to_publish
+    # Взвешенное overall само по себе не гейт: SNR — единственный компонент,
+    # который непосредственно измеряет "есть ли вообще пульсовая
+    # составляющая в сигнале"; roi/stability оценивают согласованность и
+    # трекинг и остаются высокими даже на чистом шуме. Поэтому публикация
+    # требует ОБА условия отдельно, а не только их взвешенное среднее —
+    # иначе snr_score=0 (чистый шум) при roi=stab=1.0 даёт overall=0.5 и
+    # проходит порог "низкое качество -> не публиковать" из ТЗ.
+    is_reliable = (overall >= min_overall_score_to_publish) and (spectral_snr_db >= min_spectral_snr_db)
 
     if not is_reliable:
         warnings.append(
