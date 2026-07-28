@@ -103,13 +103,41 @@ def build_roi_mask(
     return mask
 
 
+def build_skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    """Пороговая маска кожи в YCrCb (Chai & Ngan, 1999 — стандартный порог,
+    воспроизводится в большинстве rPPG-репозиториев): 133 <= Cr <= 173,
+    77 <= Cb <= 127.
+
+    Зачем нужна ПОВЕРХ полигона ROI: FOREHEAD_IDX упирается в точку 10 у
+    верха овала лица — это уже линия роста волос, MediaPipe её отдельно не
+    размечает. shrink_factor=0.9 не спасает при чёлке, а яркостный порог
+    в roi_mean_rgb (10-250) пропускает светлые/русые волосы, у которых
+    яркость похожа на кожу. Без skin-маски такие пиксели попадают в
+    оценку ROI и загрязняют пульсовой сигнал не связанной с пульсом
+    составляющей (цвет и текстура волос, а не кожи).
+    """
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]
+    cb = ycrcb[:, :, 2]
+    mask = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+    return mask.astype(np.uint8)
+
+
 def roi_mean_rgb(frame_bgr: np.ndarray, mask: np.ndarray, min_valid_fraction: float = 0.6) -> tuple[np.ndarray | None, bool]:
-    """Среднее R,G,B по маске. Возвращает (rgb[3] | None, valid).
+    """Робастная оценка R,G,B по маске (медиана, не среднее). Возвращает
+    (rgb[3] | None, valid).
+
+    Медиана вместо среднего: покадровый яркостный порог (good = не клиппинг)
+    отсекает переменную долю пикселей ROI (блик может убрать 30% пикселей за
+    один кадр) — при усреднении это даёт скачок среднего, не связанный с
+    пульсом, а связанный только с тем, ЧТО именно вошло в выборку в этом
+    кадре. Медиана устойчива к такой смене состава выборки, пока
+    большинство пикселей остаётся валидным.
 
     valid=False, если после исключения переэкспонированных/недоэкспонированных
     пикселей (типичный артефакт при бликах/тенях) валидных пикселей осталось
     меньше min_valid_fraction от площади ROI — тогда кадр не должен тянуть
-    среднее ROI в сторону артефакта, а должен считаться отсутствующим
+    оценку ROI в сторону артефакта, а должен считаться отсутствующим
     (см. preprocessing.interpolate_missing).
     """
     ys, xs = np.where(mask > 0)
@@ -123,9 +151,9 @@ def roi_mean_rgb(frame_bgr: np.ndarray, mask: np.ndarray, min_valid_fraction: fl
     if good.sum() < min_valid_fraction * len(ys):
         return None, False
 
-    mean_bgr = pixels[good].mean(axis=0)
-    mean_rgb = mean_bgr[::-1].copy()  # BGR -> RGB
-    return mean_rgb, True
+    median_bgr = np.median(pixels[good], axis=0)
+    median_rgb = median_bgr[::-1].copy()  # BGR -> RGB
+    return median_rgb, True
 
 
 @dataclass
@@ -144,11 +172,13 @@ def extract_rois(
     min_valid_fraction: float = 0.6,
 ) -> ROIExtractionResult:
     landmarks_px = landmarks_to_pixels(landmarks_norm, frame_bgr.shape)
+    skin_mask = build_skin_mask(frame_bgr)
 
     rgb_by_roi: dict[str, np.ndarray | None] = {}
     valid_by_roi: dict[str, bool] = {}
     for name in roi_names:
         mask = build_roi_mask(landmarks_px, name, frame_bgr.shape, shrink_factor)
+        mask = mask & skin_mask
         rgb, valid = roi_mean_rgb(frame_bgr, mask, min_valid_fraction)
         rgb_by_roi[name] = rgb
         valid_by_roi[name] = valid
