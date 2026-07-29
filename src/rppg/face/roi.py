@@ -69,6 +69,16 @@ ROI_LANDMARK_INDICES: dict[str, list[int]] = {
 # в оригинальном репозитории устранялся вычитанием областей глаз/рта).
 STABLE_TRACKING_IDX = sorted(set(FACE_OVAL) | set(NOSE))
 
+# Наружные уголки глаз (canthus) — уже входят в проверенные множества
+# RIGHT_EYE/LEFT_EYE выше. Используются как стандартный прокси межзрачкового
+# расстояния (interocular distance) для АБСОЛЮТНОЙ нормировки джиттера
+# landmark-точек в quality.landmark_stability_score (п.19 требований):
+# расстояние между наружными уголками глаз даёт масштаб лица в пикселях
+# (инвариантный к разрешению кадра/расстоянию до камеры), не требуя
+# iris-landmarks, которые не всегда есть в выводе модели.
+RIGHT_EYE_OUTER_IDX = 33
+LEFT_EYE_OUTER_IDX = 263
+
 
 def landmarks_to_pixels(landmarks_norm: np.ndarray, frame_shape: tuple[int, int]) -> np.ndarray:
     """landmarks_norm: (N,2) или (N,3) нормализованные [0,1] координаты
@@ -76,6 +86,66 @@ def landmarks_to_pixels(landmarks_norm: np.ndarray, frame_shape: tuple[int, int]
     h, w = frame_shape[:2]
     px = landmarks_norm[:, :2] * np.array([w, h])
     return px.astype(np.int32)
+
+
+def interocular_distance_px(landmarks_px: np.ndarray) -> float:
+    """Расстояние между наружными уголками глаз в пикселях — прокси
+    межзрачкового расстояния для абсолютного масштабирования лица (п.19)."""
+    p_right = landmarks_px[RIGHT_EYE_OUTER_IDX].astype(np.float64)
+    p_left = landmarks_px[LEFT_EYE_OUTER_IDX].astype(np.float64)
+    return float(np.linalg.norm(p_left - p_right))
+
+
+def build_background_roi_mask(
+    frame_shape: tuple[int, int],
+    landmarks_px: np.ndarray,
+    patch_fraction: float = 0.12,
+    margin_fraction: float = 0.03,
+) -> np.ndarray | None:
+    """
+    Фоновый ROI (п.22 требований) — фиксированный квадратный патч в одном из
+    углов кадра, заведомо ВНЕ ограничивающего прямоугольника лица (+запас
+    margin_fraction). Используется quality.detect_illumination_flicker, чтобы
+    отличить реальный пульс от синхронного мерцания освещения: у фона (стены
+    за головой) нет кровоснабжения, поэтому любая узкополосная периодичность
+    в его яркости на той же частоте, что и "пульс" на лице, — почти наверняка
+    внешний источник (мерцание/PWM), а не сердцебиение.
+
+    Это дешёвая эвристика на основе bounding box'а лица, а не сегментация
+    сцены — не гарантирует, что патч это именно стена, а не волосы/одежда/
+    другой объект, но для детектора мерцания важно только то, что патч НЕ
+    является кожей лица.
+
+    Возвращает None, если ни один угол кадра не гарантированно свободен от
+    лица (лицо занимает весь кадр вплотную к краям).
+    """
+    h, w = frame_shape[:2]
+    x_min, y_min = float(landmarks_px[:, 0].min()), float(landmarks_px[:, 1].min())
+    x_max, y_max = float(landmarks_px[:, 0].max()), float(landmarks_px[:, 1].max())
+
+    patch = int(round(patch_fraction * min(h, w)))
+    margin = int(round(margin_fraction * min(h, w)))
+    if patch < 4:
+        return None
+
+    face_box = (x_min - margin, y_min - margin, x_max + margin, y_max + margin)
+    candidates = [
+        (0, 0),                  # верхний левый угол
+        (w - patch, 0),          # верхний правый угол
+        (0, h - patch),          # нижний левый угол
+        (w - patch, h - patch),  # нижний правый угол
+    ]
+
+    for px0, py0 in candidates:
+        px1, py1 = px0 + patch, py0 + patch
+        overlaps_face = not (
+            px1 <= face_box[0] or px0 >= face_box[2] or py1 <= face_box[1] or py0 >= face_box[3]
+        )
+        if not overlaps_face:
+            mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+            mask[py0:py1, px0:px1] = 1
+            return mask
+    return None
 
 
 def _shrink_polygon(points: np.ndarray, factor: float) -> np.ndarray:
@@ -162,6 +232,9 @@ class ROIExtractionResult:
     valid_by_roi: dict[str, bool]
     landmarks_px: np.ndarray
     stable_tracking_points: np.ndarray  # (len(STABLE_TRACKING_IDX), 2)
+    interocular_distance_px: float  # п.19 — абсолютный масштаб лица
+    background_rgb: np.ndarray | None  # п.22 — фон вне лица, для детектора мерцания
+    background_valid: bool
 
 
 def extract_rois(
@@ -184,10 +257,21 @@ def extract_rois(
         valid_by_roi[name] = valid
 
     stable_points = landmarks_px[STABLE_TRACKING_IDX].astype(np.float64)
+    ipd = interocular_distance_px(landmarks_px)
+
+    background_rgb: np.ndarray | None = None
+    background_valid = False
+    bg_mask = build_background_roi_mask(frame_bgr.shape, landmarks_px)
+    if bg_mask is not None:
+        # Фон намеренно БЕЗ skin_mask — это не кожа, и порог кожи отсеял бы его целиком.
+        background_rgb, background_valid = roi_mean_rgb(frame_bgr, bg_mask, min_valid_fraction)
 
     return ROIExtractionResult(
         rgb_by_roi=rgb_by_roi,
         valid_by_roi=valid_by_roi,
         landmarks_px=landmarks_px,
         stable_tracking_points=stable_points,
+        interocular_distance_px=ipd,
+        background_rgb=background_rgb,
+        background_valid=background_valid,
     )
