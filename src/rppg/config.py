@@ -90,7 +90,20 @@ class FilterConfig:
     high_hz: float = 4.0
     filter_order: int = 4
     detrend_method: str = "tarvainen"  # "linear" | "tarvainen" | "none"
-    tarvainen_lambda: float = 300.0
+    # п.36 требований: 300 в исходном коде было взято из HRV-литературы БЕЗ
+    # проверки, что оно означает на fs=30 Гц (видео) — та же λ имеет РАЗНУЮ
+    # частоту среза на разной fs (см. signal.preprocessing.tarvainen_cutoff_hz).
+    # Стандартная HRV-практика (Kubios/PhysioData Toolbox: RR-тахограмма
+    # ресэмплируется на 4 Гц, λ=500 -> cutoff~=0.04 Hz, см. docstring
+    # tarvainen_frequency_response) при переносе λ=300 БЕЗ пересчёта на
+    # fs=30 Гц даёт cutoff=0.344 Hz — почти в 10 раз выше, чем предполагалось
+    # в литературе, и уже заметно (2.4%) затрагивает нижний край пульсовой
+    # полосы (0.7 Hz). λ=3542 подобрано так, чтобы cutoff=0.1 Hz — период
+    # 10с, РОВНО WindowConfig.window_seconds: тренды медленнее одного окна
+    # анализа считаются дрейфом и удаляются, всё быстрее — нет (при этом на
+    # 0.7 Hz затухание падает до 0.02%, т.е. пульсовая полоса становится ещё
+    # прозрачнее). Полный вывод и АЧХ — scripts/analyze_tarvainen_lambda.py.
+    tarvainen_lambda: float = 3542.0
     normalize_method: str = "zscore"  # "zscore" | "minmax" | "none"
 
 
@@ -203,6 +216,32 @@ class AccelerationConfig:
 
 
 @dataclass
+class FusionConfig:
+    """SQI-взвешенное объединение сигналов нескольких ROI/модальностей
+    вместо argmax-выбора одного "лучшего" по SNR (п.34 требований, см.
+    signal/fusion.py). Выключено по умолчанию — включение НЕ меняет
+    поведение существующих конфигов до явного opt-in, т.к. выигрыш от
+    fusion относительно argmax нужно доказывать экспериментально
+    (см. scripts/compare_fusion_vs_argmax.py), а не считать данностью."""
+
+    enabled: bool = False
+    # Помимо выбранного цветового метода (self.method), дополнительно
+    # считать head-motion канал НАРЯДУ с ним (а не вместо) — без этого
+    # fusion работал бы только по 3 ROI ОДНОЙ модальности, теряя "двух
+    # модальностей" из формулировки п.34. Игнорируется, если method уже
+    # head_motion (тогда это единственная модальность).
+    include_head_motion: bool = True
+    # Окно поиска лага при выравнивании сигналов перед суммированием
+    # (color-rPPG и head-motion физически разные явления и не гарантированно
+    # синфазны, см. signal/fusion.py::_align_sign_and_lag).
+    max_lag_seconds: float = 0.3
+    # Диапазон spectral SNR (дБ), отображаемый в вес источника [0,1] —
+    # см. signal/fusion.snr_db_to_weight.
+    weight_floor_db: float = -5.0
+    weight_ceil_db: float = 15.0
+
+
+@dataclass
 class PipelineConfig:
     """Верхнеуровневая конфигурация — то, что передаётся в RPPGPipeline."""
 
@@ -213,6 +252,7 @@ class PipelineConfig:
     quality: QualityConfig = field(default_factory=QualityConfig)
     hrv: HRVConfig = field(default_factory=HRVConfig)
     accel: AccelerationConfig = field(default_factory=AccelerationConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
     method: ExtractionMethod = ExtractionMethod.POS
     frequency_method: FrequencyMethod = FrequencyMethod.WELCH
 

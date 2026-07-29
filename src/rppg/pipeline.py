@@ -42,13 +42,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from rppg.config import PipelineConfig
+from rppg.config import PipelineConfig, ExtractionMethod
 from rppg.face.landmarker import FaceLandmarkerWrapper
 from rppg.face.roi import extract_rois, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend
 from rppg.signal.methods import get_method, SignalWindow
 from rppg.signal.frequency import estimate_hr
 from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
+from rppg.signal.fusion import fuse_signals_by_sqi, snr_db_to_weight
 from rppg.signal.respiration import estimate_respiration_rate
 from rppg.hrv.features import (
     detect_pulse_peaks,
@@ -141,7 +142,17 @@ class RPPGPipeline:
             self._buf.ensure_roi(roi.value)
 
         self._last_estimate_ms: int | None = None
-        self._method = get_method(self.cfg.method.value)
+        # AccelerationConfig.use_numba раньше был объявлен в конфиге, но
+        # никуда не передавался — get_method() вызывался без kwargs, и
+        # PosMethod всегда получал свой дефолт use_numba=True независимо от
+        # конфига (п.32: без этого сравнение "с Numba и без" через
+        # PipelineConfig было бы невозможно сделать, не трогая код). kwarg
+        # передаётся только методам, которые его принимают (сейчас — только
+        # POS; GreenMethod/ChromMethod/... не имеют параметров __init__).
+        method_kwargs = {}
+        if self.cfg.method == ExtractionMethod.POS:
+            method_kwargs["use_numba"] = self.cfg.accel.use_numba
+        self._method = get_method(self.cfg.method.value, **method_kwargs)
 
         # п.20: история BPM лучшего ROI по последним оценкам (перекрывающиеся
         # окна) — для temporal_consistency_score. maxlen соответствует
@@ -479,6 +490,75 @@ class RPPGPipeline:
             normalize_method=self.cfg.filt.normalize_method,
         )
 
+    def _compute_fusion(
+        self,
+        fps: float,
+        band: tuple[float, float],
+        timestamps_sec: np.ndarray,
+        landmark_traj: np.ndarray,
+        per_roi_bpm: dict[str, float],
+        per_roi_signal: dict[str, np.ndarray],
+        per_roi_raw_signal: dict[str, np.ndarray],
+        warnings: list[str],
+    ) -> tuple[str, np.ndarray, float, np.ndarray | None]:
+        """SQI-взвешенное объединение всех доступных источников (3 цветовых
+        ROI + опционально head-motion канал) в ОДИН сигнал, вместо
+        argmax-выбора одного ROI (п.34 требований, см. signal/fusion.py).
+
+        Возвращает (label, fused_signal, fused_bpm, harmonic_check_signal) —
+        harmonic_check_signal строится тем же fusion-объединением, но по
+        ДЕТРЕНДИРОВАННЫМ (не bandpass-отфильтрованным) исходным сигналам —
+        та же логика, что и для одиночного best_roi в _compute_estimate,
+        нужна harmonic_plausibility (см. её docstring в quality.py)."""
+        fusion_sources = dict(per_roi_signal)
+        if self._method.name != "head_motion" and self.cfg.fusion.include_head_motion:
+            self._estimate_head_motion(
+                landmark_traj, fps, band, timestamps_sec, per_roi_bpm, fusion_sources, warnings,
+                per_roi_raw_signal=per_roi_raw_signal,
+            )
+
+        if len(fusion_sources) < 2:
+            # Недостаточно независимых источников для осмысленного fusion —
+            # деградируем к единственному доступному, а не городим
+            # "взвешенное объединение" из одного сигнала.
+            only_name = next(iter(fusion_sources))
+            harmonic_signal = None
+            if only_name in per_roi_raw_signal:
+                harmonic_signal = detrend(
+                    per_roi_raw_signal[only_name], method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda
+                )
+            return only_name, fusion_sources[only_name], per_roi_bpm.get(only_name, float("nan")), harmonic_signal
+
+        weights: dict[str, float] = {}
+        for name, sig in fusion_sources.items():
+            _, snr_db = dominant_frequency_and_snr(sig, fps, band)
+            weights[name] = snr_db_to_weight(snr_db, self.cfg.fusion.weight_floor_db, self.cfg.fusion.weight_ceil_db)
+
+        fused_signal, _diag = fuse_signals_by_sqi(
+            fusion_sources, weights, fps=fps, max_lag_seconds=self.cfg.fusion.max_lag_seconds
+        )
+        # Валидная маска здесь всегда "всё валидно": каждый исходный сигнал
+        # уже прошёл interpolate_missing до попадания в fusion_sources, а
+        # lomb_scargle на полностью валидной равномерной сетке эквивалентен
+        # обычной периодограмме — не теряет своего смысла, просто не
+        # эксплуатирует своё преимущество для НЕравномерной выборки здесь.
+        fused_bpm = self._estimate_frequency(
+            fused_signal, np.ones(len(fused_signal), dtype=bool), fused_signal, fps, band, timestamps_sec
+        )
+
+        harmonic_check_signal = None
+        detrended_sources = {
+            name: detrend(per_roi_raw_signal[name], method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda)
+            for name in fusion_sources if name in per_roi_raw_signal
+        }
+        if detrended_sources:
+            harmonic_check_signal, _ = fuse_signals_by_sqi(
+                detrended_sources, {n: weights[n] for n in detrended_sources},
+                fps=fps, max_lag_seconds=self.cfg.fusion.max_lag_seconds,
+            )
+
+        return "fusion", fused_signal, fused_bpm, harmonic_check_signal
+
     def _compute_estimate(self, timestamp_ms: int) -> PTSDPulseFeatures:
         fps = self._estimate_fps()
         band = (self.cfg.filt.low_hz, self.cfg.filt.high_hz)
@@ -512,30 +592,36 @@ class RPPGPipeline:
                 per_roi_bpm=per_roi_bpm,
             )
 
-        # ROI с максимальным spectral SNR используется как основной источник BPM/HRV.
-        best_roi = max(
-            per_roi_signal,
-            key=lambda n: dominant_frequency_and_snr(per_roi_signal[n], fps, band)[1],
-        )
-        best_signal = per_roi_signal[best_roi]
-        best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
-
-        # п.21: для проверки на гармоники/субгармоники нужен ДЕТРЕНДИРОВАННЫЙ,
-        # но НЕ узкополосно отфильтрованный сигнал — иначе сам bandpass в
-        # preprocess_signal обрезает 2f/f/2 ещё до того, как их можно измерить
-        # (см. harmonic_plausibility docstring в quality.py).
-        harmonic_check_signal = None
-        if best_roi in per_roi_raw_signal:
-            harmonic_check_signal = detrend(
-                per_roi_raw_signal[best_roi],
-                method=self.cfg.filt.detrend_method,
-                lam=self.cfg.filt.tarvainen_lambda,
+        if self.cfg.fusion.enabled:
+            best_roi, best_signal, current_bpm, harmonic_check_signal = self._compute_fusion(
+                fps, band, timestamps_sec, landmark_traj, per_roi_bpm, per_roi_signal, per_roi_raw_signal, warnings,
             )
+            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+        else:
+            # ROI с максимальным spectral SNR используется как основной источник BPM/HRV.
+            best_roi = max(
+                per_roi_signal,
+                key=lambda n: dominant_frequency_and_snr(per_roi_signal[n], fps, band)[1],
+            )
+            best_signal = per_roi_signal[best_roi]
+            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+            current_bpm = per_roi_bpm.get(best_roi, float("nan"))
+
+            # п.21: для проверки на гармоники/субгармоники нужен ДЕТРЕНДИРОВАННЫЙ,
+            # но НЕ узкополосно отфильтрованный сигнал — иначе сам bandpass в
+            # preprocess_signal обрезает 2f/f/2 ещё до того, как их можно измерить
+            # (см. harmonic_plausibility docstring в quality.py).
+            harmonic_check_signal = None
+            if best_roi in per_roi_raw_signal:
+                harmonic_check_signal = detrend(
+                    per_roi_raw_signal[best_roi],
+                    method=self.cfg.filt.detrend_method,
+                    lam=self.cfg.filt.tarvainen_lambda,
+                )
 
         interocular_distances_px = np.array(self._buf.interocular_dist, dtype=float)
         background_signal = self._estimate_background_signal(fps, band)
 
-        current_bpm = per_roi_bpm.get(best_roi, float("nan"))
         recent_bpm_history = list(self._recent_bpm_history) + [current_bpm]
 
         sqi = assess_quality(
@@ -562,15 +648,19 @@ class RPPGPipeline:
 
         respiration_rate_bpm, _ = estimate_respiration_rate(best_signal, fps)
 
+        method_used = self._method.name
+        if self.cfg.fusion.enabled:
+            method_used = f"fusion({self._method.name}+head_motion)" if best_roi == "fusion" else best_roi
+
         return PTSDPulseFeatures(
             timestamp_ms=timestamp_ms,
-            bpm=per_roi_bpm.get(best_roi, float("nan")),
+            bpm=current_bpm,
             hrv=hrv,
             sqi_score=sqi.overall_score,
             sqi_level=sqi.level.value,
             publishable=sqi.is_reliable,
             warnings=warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else []),
-            method_used=self._method.name,
+            method_used=method_used,
             frequency_method_used=self.cfg.frequency_method.value,
             per_roi_bpm=per_roi_bpm,
             respiration_rate_bpm=respiration_rate_bpm,
