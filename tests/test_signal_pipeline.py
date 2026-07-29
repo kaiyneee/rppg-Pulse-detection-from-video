@@ -1,14 +1,19 @@
 """
 Тесты на синтетических данных.
 
-Осознанное ограничение (см. docs/research_report.md, раздел 8.4): в этой
-среде нет доступа к реальным видео/камере и к MediaPipe-модели (файл модели
-не скачать без сети), поэтому здесь проверяется весь сигнальный конвейер —
-detrend/normalize/bandpass -> 6 методов извлечения -> 3 метода частотного
-анализа -> HRV-признаки -- на синтетических, но физиологически правдоподобных
-данных с известным "истинным" BPM. Это не заменяет валидацию на реальных
-датасетах (VIPL-HR/UBFC-rPPG/PURE/MMSE-HR, см. benchmark/evaluate.py), но
-достоверно проверяет, что математика реализована без ошибок.
+Большинство тестов здесь проверяют сигнальный конвейер — detrend/normalize/
+bandpass -> 6 методов извлечения -> 3 метода частотного анализа ->
+HRV-признаки -- на синтетических, но физиологически правдоподобных данных
+с известным "истинным" BPM, БЕЗ MediaPipe. Это не заменяет валидацию на
+реальных датасетах (VIPL-HR/UBFC-rPPG/PURE/MMSE-HR, см. benchmark/evaluate.py),
+но достоверно проверяет, что математика реализована без ошибок.
+
+MediaPipe и модель Face Landmarker (models/face_landmarker.task) в этой
+среде ДОСТУПНЫ (в отличие от более ранней версии этого докстринга) — часть
+тестов (test_occluded_face_pipeline_never_publishes, test_end_to_end_*)
+поэтому запускает РЕАЛЬНЫЙ RPPGPipeline целиком, а не только signal-уровень,
+и грациозно пропускается (не падает), если модель/пакет всё же недоступны в
+какой-то другой среде запуска.
 
 Запуск: PYTHONPATH=src python3 -m pytest tests/ -v
         (или просто: PYTHONPATH=src python3 tests/test_signal_pipeline.py)
@@ -115,6 +120,36 @@ def test_color_based_methods_recover_known_bpm():
         _assert_bpm_close(est.bpm, true_bpm, tol, f"{method_name.upper()} + Welch")
 
 
+def test_pos_numba_matches_numpy_reference():
+    """Регрессия для п.45: PosMethod.extract утверждает в докстринге, что
+    numba и numpy-реализации overlap-add дают "идентичный результат" — это
+    нужно доказать тестом, а не принять на слово. Сравниваются НАПРЯМУЮ
+    низкоуровневые overlap-add функции (pos_overlap_add_numba vs
+    PosMethod._pos_overlap_add_reference) на ОДНОМ И ТОМ ЖЕ сыром RGB-входе,
+    а не через полный сигнальный конвейер, где детрендинг/bandpass могли бы
+    замаскировать расхождение."""
+    print("\n=== Тест: POS numba и numpy-эталон дают идентичный результат (п.45) ===")
+    from rppg.accel.fast_ops import pos_overlap_add_numba, NUMBA_AVAILABLE
+
+    if not NUMBA_AVAILABLE:
+        print("  [SKIP] numba не установлена в этой среде")
+        return
+
+    method = get_method("pos")
+    rgb = make_synthetic_rgb(75.0, noise_std=0.4, seed=9)
+    ws = max(3, int(round(method.window_seconds * FPS)))
+
+    numba_result = pos_overlap_add_numba(rgb, ws, method.projection_matrix)
+    numpy_result = method._pos_overlap_add_reference(rgb, ws)
+
+    max_diff = float(np.max(np.abs(numba_result - numpy_result)))
+    print(f"  максимальное расхождение numba vs numpy: {max_diff:.2e}")
+    assert np.allclose(numba_result, numpy_result, atol=1e-9), (
+        f"numba и numpy реализации POS должны давать идентичный результат, "
+        f"макс. расхождение={max_diff:.2e}"
+    )
+
+
 def test_head_motion_method_recovers_known_bpm():
     print("\n=== Тест: HEAD_MOTION восстанавливает известный BPM ===")
     true_bpm = 68.0
@@ -205,6 +240,145 @@ def test_detrend_removes_slow_trend():
         edge_diff_after = abs(np.mean(y[-30:]) - np.mean(y[:30]))
         assert edge_diff_after < edge_diff_before, f"{method}: тренд не уменьшился"
         print(f"  [OK] {method}: edge_diff {edge_diff_before:.3f} -> {edge_diff_after:.3f}")
+
+
+def test_tarvainen_cutoff_matches_documented_reference_and_new_default_is_transparent_to_pulse_band():
+    """Регрессия для п.36: tarvainen_lambda=300 в исходном коде был взят из
+    HRV-литературы БЕЗ проверки, что он означает на fs=30 Hz (видео), а не
+    на типичный для HRV-практики ресэмплинг RR-тахограммы на 4 Hz.
+
+    Два независимых утверждения проверяются здесь:
+      (1) сама формула АЧХ (tarvainen_cutoff_hz) даёт ПРАВИЛЬНЫЙ результат —
+          сверено с независимо документированным эталоном (Kubios/PhysioData
+          Toolbox: lambda=500 @ fs=4 Hz -> cutoff~=0.04 Hz);
+      (2) новый дефолт (config.FilterConfig.tarvainen_lambda) на fs=30 Hz
+          почти не трогает нижний край пульсовой полосы (0.7 Hz) — старое
+          значение 300 давало заметное (2.36%) затухание уже на 0.7 Hz."""
+    print("\n=== Тест: АЧХ tarvainen_detrend сверена с документированным эталоном (п.36) ===")
+    from rppg.signal.preprocessing import tarvainen_cutoff_hz, tarvainen_frequency_response
+    from rppg.config import FilterConfig
+
+    ref_cutoff = tarvainen_cutoff_hz(500.0, 4.0)
+    print(f"  lambda=500 @ fs=4 Hz -> cutoff={ref_cutoff:.4f} Hz (эталон ~0.04 Hz)")
+    assert abs(ref_cutoff - 0.04) < 0.01, "формула АЧХ должна воспроизводить документированный эталон Kubios/PhysioData"
+
+    old_cutoff_at_our_fs = tarvainen_cutoff_hz(300.0, FPS)
+    print(f"  lambda=300 (старое значение) @ fs={FPS} Hz -> cutoff={old_cutoff_at_our_fs:.4f} Hz")
+    assert old_cutoff_at_our_fs > 0.25, (
+        "sanity: перенос lambda=300 без пересчёта на fs=30 действительно даёт "
+        "cutoff в разы выше, чем предполагала HRV-литература (~0.04-0.05 Hz)"
+    )
+
+    new_lambda = FilterConfig().tarvainen_lambda
+    _, h_old = tarvainen_frequency_response(300.0, FPS, freqs_hz=np.array([BAND[0]]))
+    _, h_new = tarvainen_frequency_response(new_lambda, FPS, freqs_hz=np.array([BAND[0]]))
+    print(f"  затухание на {BAND[0]} Hz: старое={100 * (1 - h_old[0]):.2f}%  новое={100 * (1 - h_new[0]):.3f}%")
+    assert h_new[0] > 0.999, "новый дефолт должен быть почти прозрачен (>99.9%) для нижнего края пульсовой полосы"
+    assert h_new[0] > h_old[0], "новый дефолт должен затухать на пульсовой полосе МЕНЬШЕ, чем старый"
+
+
+def test_align_sign_and_lag_recovers_known_shift():
+    """Регрессия для п.34: _align_sign_and_lag должна точно восстанавливать
+    известный целочисленный сдвиг и инверсию знака — на этом инварианте
+    держится вся fuse_signals_by_sqi (без него суммирование сигналов из
+    разных модальностей рискует деструктивной интерференцией, см.
+    docstring signal/fusion.py)."""
+    print("\n=== Тест: выравнивание фазы/знака восстанавливает известный сдвиг (п.34) ===")
+    from rppg.signal.fusion import _align_sign_and_lag
+
+    n = 300
+    t = np.arange(n) / FPS
+    reference = np.sin(2 * np.pi * 1.2 * t)
+
+    true_shift = 5
+    shifted_and_flipped = -np.roll(reference, true_shift)
+
+    aligned, recovered_lag, corr = _align_sign_and_lag(shifted_and_flipped, reference, max_lag_samples=20)
+    print(f"  применённый сдвиг={true_shift}, восстановленный лаг={recovered_lag}, corr={corr:.4f}")
+    edge = 20
+    max_diff = np.max(np.abs(aligned[edge:-edge] - reference[edge:-edge]))
+    print(f"  макс. отклонение после выравнивания (без краёв): {max_diff:.6f}")
+    assert corr > 0.99, "после коррекции знака корреляция с референсом должна быть близка к 1"
+    assert max_diff < 1e-6, "выровненный сигнал должен практически совпасть с референсом"
+
+
+def test_fuse_signals_by_sqi_weighting_favors_clean_source():
+    """Регрессия для п.34: источник с более высоким весом (например, из
+    более высокого spectral SNR) должен доминировать в объединённом
+    сигнале — грязный (шумный) источник с низким весом не должен портить
+    результат, который дал бы чистый источник сам по себе."""
+    print("\n=== Тест: SQI-взвешенное fusion — чистый источник доминирует над шумным ===")
+    from rppg.signal.fusion import fuse_signals_by_sqi
+
+    n = 300
+    t = np.arange(n) / FPS
+    true_signal = np.sin(2 * np.pi * 1.2 * t)
+    rng = np.random.default_rng(0)
+
+    clean = true_signal + rng.normal(0, 0.05, n)
+    noisy = rng.normal(0, 3.0, n)  # почти чистый шум, не несёт пульса
+
+    fused, diag = fuse_signals_by_sqi(
+        {"clean": clean, "noisy": noisy},
+        {"clean": 0.95, "noisy": 0.05},
+        fps=FPS,
+    )
+    corr_fused = np.corrcoef(fused, true_signal)[0, 1]
+    corr_noisy_alone = np.corrcoef(noisy, true_signal)[0, 1]
+    print(f"  вес clean={diag['clean']['weight']:.3f}, вес noisy={diag['noisy']['weight']:.3f}")
+    print(f"  corr(fused, true)={corr_fused:.3f}  corr(noisy_alone, true)={corr_noisy_alone:.3f}")
+    assert corr_fused > 0.9, "при доминирующем весе чистого источника fused должен сильно коррелировать с истиной"
+
+
+def test_fuse_signals_by_sqi_aligns_out_of_phase_source_without_cancellation():
+    """Регрессия для п.34: если один источник (например, head-motion) на
+    самом деле несёт тот же пульс, но со сдвигом фазы/инвертированным
+    знаком относительно другого (color-rPPG) — БЕЗ выравнивания наивное
+    суммирование могло бы дать деструктивную интерференцию (ослабление
+    сигнала вместо усиления). fuse_signals_by_sqi обязана выровнять источник
+    перед суммированием (см. _align_sign_and_lag), а не наивно складывать."""
+    print("\n=== Тест: fusion выравнивает несинфазный источник вместо деструктивной интерференции ===")
+    from rppg.signal.fusion import fuse_signals_by_sqi
+
+    n = 300
+    t = np.arange(n) / FPS
+    rng = np.random.default_rng(2)
+    true_signal = np.sin(2 * np.pi * 1.2 * t)
+
+    source_a = true_signal + rng.normal(0, 0.05, n)
+    # source_b несёт тот же пульс, но инвертирован по знаку и сдвинут по фазе
+    # (имитация другой физической модальности, см. модульный docstring fusion.py).
+    source_b = -np.roll(true_signal, 4) + rng.normal(0, 0.05, n)
+
+    fused, diag = fuse_signals_by_sqi({"a": source_a, "b": source_b}, {"a": 0.6, "b": 0.4}, fps=FPS)
+
+    naive_sum = source_a + source_b  # то, что получилось бы БЕЗ выравнивания
+    rms_fused = np.sqrt(np.mean(fused**2))
+    rms_naive = np.sqrt(np.mean(naive_sum**2))
+    corr_fused_true = np.corrcoef(fused, true_signal)[0, 1]
+
+    print(f"  лаг источника b относительно a: {diag['b']['lag_samples']} отсчётов, "
+          f"corr после выравнивания={diag['b']['corr_with_reference']:.3f}")
+    print(f"  RMS(fused)={rms_fused:.3f} vs RMS(наивная сумма без выравнивания)={rms_naive:.3f}")
+    print(f"  corr(fused, true)={corr_fused_true:.3f}")
+
+    assert corr_fused_true > 0.9, "после выравнивания fused должен сильно коррелировать с истинным пульсом"
+    assert rms_fused > rms_naive, (
+        "выровненное объединение должно давать БОЛЬШУЮ амплитуду, чем наивная сумма без "
+        "выравнивания знака/фазы (которая для инвертированного источника частично гасит сигнал)"
+    )
+
+
+def test_fuse_signals_by_sqi_zero_weights_fallback_to_uniform():
+    print("\n=== Тест: fusion при всех нулевых весах не падает, а использует равномерные ===")
+    from rppg.signal.fusion import fuse_signals_by_sqi
+
+    n = 100
+    a = np.ones(n)
+    b = np.ones(n) * 2.0
+    fused, diag = fuse_signals_by_sqi({"a": a, "b": b}, {"a": 0.0, "b": 0.0}, fps=FPS)
+    assert abs(diag["a"]["weight"] - 0.5) < 1e-9 and abs(diag["b"]["weight"] - 0.5) < 1e-9
+    assert np.allclose(fused, 1.5)
 
 
 def test_hrv_features_match_known_ibi_statistics():
@@ -499,6 +673,241 @@ def test_occluded_face_pipeline_never_publishes():
     print("  [OK] за 200 кадров без лица в кадре publishable не стал True ни разу")
 
 
+def _make_synthetic_landmarks_for_pipeline_test(seed: int = 0, n_points: int = 478) -> np.ndarray:
+    """478 точек в грубом эллипсе (нормализованные [0,1] координаты) —
+    ТОЛЬКО чтобы ROI-полигоны строились на невырожденных наборах точек;
+    реальная геометрия лица тут не нужна (см. докстринг
+    test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video)."""
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0, 2 * np.pi, n_points)
+    radius = np.sqrt(rng.uniform(0, 1, n_points))
+    x = 0.5 + 0.18 * radius * np.cos(theta)
+    y = 0.5 + 0.25 * radius * np.sin(theta)
+    z = rng.normal(0, 0.01, n_points)
+    return np.stack([x, y, z], axis=1)
+
+
+def _make_pulsating_frame(
+    t_sec: float, true_bpm: float, rng: np.random.Generator, h: int = 240, w: int = 320
+) -> np.ndarray:
+    """Кадр с оттенком кожи (BGR=(40,60,100) — подобран так, чтобы попадать
+    в диапазон face.roi.build_skin_mask), пульсирующим по цвету с известным
+    true_bpm — ТОЛЬКО внутри эллипса, соответствующего разбросу точек
+    _make_synthetic_landmarks_for_pipeline_test. Фон СТАТИЧЕН и НЕ
+    пульсирует: если бы пульсировал весь кадр целиком, фоновый ROI (см.
+    face/roi.py::build_background_roi_mask, п.22) показывал бы ту же
+    частоту, что и лицо, и detect_illumination_flicker справедливо
+    заблокировал бы публикацию — тест тогда проверял бы не то, что нужно."""
+    frame = np.full((h, w, 3), (90, 70, 60), dtype=np.uint8)
+    f_hz = true_bpm / 60.0
+    pulse = np.sin(2 * np.pi * f_hz * t_sec)
+    base_bgr = np.array([40.0, 60.0, 100.0])
+    channel_amp = np.array([9.0, 15.0, 5.0])  # относительная чувствительность B/G/R как в make_synthetic_rgb
+    color = base_bgr + channel_amp * pulse + rng.normal(0, 1.5, 3)
+    color = np.clip(color, 0, 255).astype(np.uint8)
+
+    cy, cx = h // 2, w // 2
+    ry, rx = int(0.25 * h), int(0.18 * w)
+    yy, xx = np.ogrid[:h, :w]
+    ellipse_mask = ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0
+    frame[ellipse_mask] = color
+    return frame
+
+
+def test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video():
+    """Регрессия для п.39 требований: сквозной тест через
+    RPPGPipeline.process_frame ЦЕЛИКОМ (буферизация окна по реальному
+    времени -> ROI-экстракция со skin-маской -> метод извлечения сигнала ->
+    оценка частоты -> SQI-гейтинг -> IBI-накопитель), а не только
+    сигнальный уровень. Такой тест ловит баги ОРКЕСТРАЦИИ (неверная
+    передача landmark_trajectories между стадиями, окно, считающееся по
+    числу кадров вместо реального времени переменного fps, и т.п.),
+    которые остальные тесты этого файла в принципе не видят — они вызывают
+    сигнальные функции (extract/preprocess_signal/estimate_hr) напрямую, в
+    обход самого RPPGPipeline.
+
+    См. ОГОВОРКУ в докстринге _make_pulsating_frame про MediaPipe: реальное
+    фото лица в этой среде недоступно (и не должно скачиваться из
+    неофициальных источников без явного согласия, см. обсуждение доступа к
+    rPPG-датасетам), поэтому детекция подменяется на фиксированный
+    синтетический результат — для проверки ОРКЕСТРАЦИИ (а не точности
+    детекции лица) этого достаточно: важно, что downstream-код
+    (roi/method/frequency/sqi/ibi) реально исполняется на кадрах с
+    ИЗВЕСТНЫМ пульсирующим цветом "кожи"."""
+    print("\n=== Сквозной тест: RPPGPipeline.process_frame на синтетическом видео с известным BPM (п.39) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    cfg = PipelineConfig()
+    try:
+        pipe = RPPGPipeline(cfg)
+    except FileNotFoundError as exc:
+        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+        return
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+        return
+
+    true_bpm = 78.0
+    landmarks = _make_synthetic_landmarks_for_pipeline_test()
+    synthetic_result = FaceFrameResult(
+        detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+    )
+    pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result  # monkeypatch только для теста
+
+    rng = np.random.default_rng(42)
+    fps = 30.0
+    n_frames = int(fps * 20.0)  # 20с синтетического видео
+
+    results = []
+    try:
+        for i in range(n_frames):
+            t_sec = i / fps
+            frame = _make_pulsating_frame(t_sec, true_bpm, rng)
+            result = pipe.process_frame(frame, int(t_sec * 1000))
+            if result is not None:
+                results.append(result)
+    finally:
+        pipe.close()
+
+    print(f"  получено {len(results)} оценок за {n_frames} кадров")
+    assert len(results) > 0, "пайплайн должен вернуть хотя бы одну оценку за 20с синтетического видео"
+
+    publishable = [r for r in results if r.publishable]
+    print(f"  publishable: {len(publishable)}/{len(results)}")
+    for r in publishable[-3:]:
+        per_roi = {k: round(v, 1) for k, v in r.per_roi_bpm.items()}
+        print(f"    t={r.timestamp_ms}ms bpm={r.bpm:.2f} sqi={r.sqi_score:.3f} per_roi_bpm={per_roi}")
+    assert publishable, "на чистом синтетическом пульсирующем видео хотя бы одна оценка должна быть publishable"
+
+    last = publishable[-1]
+    err = abs(last.bpm - true_bpm)
+    print(f"  последняя publishable оценка: bpm={last.bpm:.2f} (истинный={true_bpm}), ошибка={err:.2f} BPM")
+    assert err < 5.0, f"сквозная оценка BPM должна быть близка к истинной (получено {err:.2f} BPM ошибки)"
+
+
+def test_config_yaml_json_roundtrip_preserves_non_default_values():
+    """Регрессия для п.42 требований: save_config/load_config должны точно
+    восстанавливать PipelineConfig, включая НЕстандартные значения (Enum-
+    поля method/frequency_method, tuple Enum-полей roi.enabled_rois,
+    вложенный FusionConfig.enabled) — иначе "конфиг эксперимента,
+    сохранённый рядом с результатами" (п.42) не гарантирует, что при
+    повторном запуске это будет ТОТ ЖЕ конфиг."""
+    print("\n=== Тест: YAML/JSON roundtrip PipelineConfig сохраняет нестандартные значения (п.42) ===")
+    import tempfile
+    from pathlib import Path
+    from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod, ROIName
+    from rppg.config_io import save_config, load_config, config_from_dict
+
+    cfg = PipelineConfig(method=ExtractionMethod.CHROM, frequency_method=FrequencyMethod.LOMB_SCARGLE)
+    cfg.fusion.enabled = True
+    cfg.roi.enabled_rois = (ROIName.FOREHEAD, ROIName.LEFT_CHEEK)
+    cfg.filt.tarvainen_lambda = 1234.5
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for ext in (".yaml", ".json"):
+            path = Path(tmpdir) / f"config{ext}"
+            save_config(cfg, path)
+            loaded = load_config(path)
+            print(f"  {ext}: loaded == original: {loaded == cfg}")
+            assert loaded == cfg, f"{ext}: roundtrip должен точно восстановить конфиг"
+            assert loaded.roi.enabled_rois == (ROIName.FOREHEAD, ROIName.LEFT_CHEEK)
+            assert isinstance(loaded.method, ExtractionMethod) and loaded.method == ExtractionMethod.CHROM
+
+    partial = config_from_dict({"method": "pos", "quality": {"min_overall_score_to_publish": 0.7}})
+    print(f"  частичный конфиг: method={partial.method.value}, "
+          f"min_score={partial.quality.min_overall_score_to_publish}, "
+          f"остальные поля quality не тронуты (min_spectral_snr_db={partial.quality.min_spectral_snr_db})")
+    assert partial.method == ExtractionMethod.POS
+    assert partial.quality.min_overall_score_to_publish == 0.7
+    assert partial.quality.min_spectral_snr_db == PipelineConfig().quality.min_spectral_snr_db, (
+        "частичный конфиг не должен трогать НЕуказанные поля секции"
+    )
+
+
+def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
+    """Регрессия для п.43 требований: "Каждое окно -> строка с timestamp,
+    BPM по каждому ROI, компоненты SQI, warnings" — прогоняем ТОТ ЖЕ
+    сквозной сценарий, что и test_end_to_end_pipeline_recovers_known_bpm_
+    from_synthetic_video, но с log_path, и проверяем, что получившийся
+    JSONL реально содержит ВСЕ обещанные поля, а не только сводный
+    sqi_score/sqi_level."""
+    print("\n=== Тест: структурированный JSONL-лог по окнам (п.43) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "windows.jsonl"
+        cfg = PipelineConfig()
+        try:
+            pipe = RPPGPipeline(cfg, log_path=log_path)
+        except FileNotFoundError as exc:
+            print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+            return
+        except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+            print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+            return
+
+        true_bpm = 75.0
+        landmarks = _make_synthetic_landmarks_for_pipeline_test()
+        synthetic_result = FaceFrameResult(
+            detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+        )
+        pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+
+        rng = np.random.default_rng(11)
+        fps = 30.0
+        n_frames = int(fps * 8.0)
+        try:
+            for i in range(n_frames):
+                t_sec = i / fps
+                frame = _make_pulsating_frame(t_sec, true_bpm, rng)
+                pipe.process_frame(frame, int(t_sec * 1000))
+        finally:
+            pipe.close()
+
+        # ВАЖНО: всё, что читает log_path, должно оставаться ВНУТРИ этого
+        # `with tempfile.TemporaryDirectory()` — сама директория удаляется
+        # при выходе из блока.
+        assert log_path.exists(), "log_path должен быть создан, раз пайплайн выдал хотя бы одно окно"
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        print(f"  строк в логе: {len(lines)}")
+        assert len(lines) > 0, "должна быть хотя бы одна строка лога за 8с синтетического видео"
+
+        required_fields = {
+            "timestamp_ms", "bpm", "per_roi_bpm", "publishable", "method_used",
+            "frequency_method_used", "sqi_overall_score", "sqi_level",
+            "sqi_spectral_snr_db", "sqi_cross_roi_agreement", "sqi_landmark_stability",
+            "sqi_temporal_consistency", "sqi_harmonic_score", "sqi_flicker_suspected",
+            "respiration_rate_bpm", "warnings",
+        }
+        for line in lines:
+            record = json.loads(line)  # sanity: каждая строка — валидный JSON
+            missing = required_fields - set(record.keys())
+            assert not missing, f"строка лога не содержит поля {missing}: {record}"
+            assert isinstance(record["per_roi_bpm"], dict)
+            assert isinstance(record["warnings"], list)
+
+        last = json.loads(lines[-1])
+        print(f"  последняя запись: bpm={last['bpm']:.2f}, sqi_overall={last['sqi_overall_score']:.3f}, "
+              f"sqi_landmark_stability={last['sqi_landmark_stability']:.3f}, "
+              f"sqi_temporal_consistency={last['sqi_temporal_consistency']:.3f}")
+
+
 def test_subsample_peak_refinement_reduces_rmssd_quantization_error():
     """Регрессия для п.13 (Этап C): на 30 fps шаг индекса пика = 33.3 мс,
     сопоставимый с самим RMSSD (20-50 мс у здоровых в покое). Без
@@ -636,11 +1045,17 @@ def test_respiration_rate_from_amplitude_modulation():
 def run_all():
     tests = [
         test_color_based_methods_recover_known_bpm,
+        test_pos_numba_matches_numpy_reference,
         test_head_motion_method_recovers_known_bpm,
         test_frequency_estimators_agree_on_clean_tone,
         test_lombscargle_handles_irregular_sampling,
         test_bandpass_rejects_out_of_band_and_keeps_in_band,
         test_detrend_removes_slow_trend,
+        test_tarvainen_cutoff_matches_documented_reference_and_new_default_is_transparent_to_pulse_band,
+        test_align_sign_and_lag_recovers_known_shift,
+        test_fuse_signals_by_sqi_weighting_favors_clean_source,
+        test_fuse_signals_by_sqi_aligns_out_of_phase_source_without_cancellation,
+        test_fuse_signals_by_sqi_zero_weights_fallback_to_uniform,
         test_hrv_features_match_known_ibi_statistics,
         test_white_noise_is_not_publishable,
         test_landmark_stability_penalizes_strong_uniform_sway,
@@ -649,6 +1064,9 @@ def run_all():
         test_illumination_flicker_detected_via_background_roi,
         test_static_photo_or_mannequin_is_not_publishable,
         test_occluded_face_pipeline_never_publishes,
+        test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video,
+        test_config_yaml_json_roundtrip_preserves_non_default_values,
+        test_structured_window_logger_writes_valid_jsonl_with_sqi_components,
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,
         test_ectopic_masking_does_not_stitch_false_diff,
         test_hrv_artifact_fraction_gates_publishable,

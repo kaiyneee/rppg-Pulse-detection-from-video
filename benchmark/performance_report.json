@@ -1,0 +1,147 @@
+{
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "processor": "arm",
+    "python_version": "3.9.6",
+    "cpu_count": 10,
+    "numba_version": "0.60.0"
+  },
+  "mediapipe_cpu": {
+    "mean_ms": 1.3669677250000039,
+    "median_ms": 1.362958500000011,
+    "std_ms": 0.02617178804264535,
+    "p95_ms": 1.406385750000044,
+    "n": 40
+  },
+  "mediapipe_gpu": {
+    "error": "подпроцесс упал (returncode=-6):     @        0x182c54c1c  thread_start"
+  },
+  "roi_extraction": {
+    "mean_ms": 3.511199359999992,
+    "median_ms": 3.4848124999999897,
+    "std_ms": 0.12810743524673815,
+    "p95_ms": 3.794705949999877,
+    "n": 200
+  },
+  "extraction_methods": {
+    "green": {
+      "mean_ms": 0.02442419000002083,
+      "median_ms": 0.024250000000058947,
+      "std_ms": 0.0006731214109605969,
+      "p95_ms": 0.025673200000042584,
+      "n": 100
+    },
+    "chrom": {
+      "mean_ms": 0.1920741999999942,
+      "median_ms": 0.1877915000001451,
+      "std_ms": 0.015358910264080317,
+      "p95_ms": 0.20833510000008992,
+      "n": 100
+    },
+    "pos": {
+      "mean_ms": 0.07453710000003166,
+      "median_ms": 0.07350000000005963,
+      "std_ms": 0.0032366746438328878,
+      "p95_ms": 0.08115480000006059,
+      "n": 100
+    },
+    "pca": {
+      "mean_ms": 0.4331416799999976,
+      "median_ms": 0.42541700000020555,
+      "std_ms": 0.025631368129234836,
+      "p95_ms": 0.474060400000087,
+      "n": 100
+    },
+    "ica": {
+      "mean_ms": 0.7641770400000292,
+      "median_ms": 0.7558334999999694,
+      "std_ms": 0.022882582237953062,
+      "p95_ms": 0.8195377999998366,
+      "n": 100
+    },
+    "pos_no_numba": {
+      "mean_ms": 5.949466660000059,
+      "median_ms": 5.956771000000138,
+      "std_ms": 0.07048270146721661,
+      "p95_ms": 6.070823250000057,
+      "n": 100
+    },
+    "head_motion": {
+      "mean_ms": 3.0965515899999474,
+      "median_ms": 2.6901040000004706,
+      "std_ms": 1.1750739191979402,
+      "p95_ms": 4.8203482499995065,
+      "n": 100
+    }
+  },
+  "pos_numba_speedup_x": 81.04450340129668,
+  "frequency_methods": {
+    "fft": {
+      "mean_ms": 0.018407689999992982,
+      "median_ms": 0.018374999999792863,
+      "std_ms": 0.000237285406027936,
+      "p95_ms": 0.01871309999987858,
+      "n": 200
+    },
+    "welch": {
+      "mean_ms": 0.0451827150000339,
+      "median_ms": 0.04441699999979676,
+      "std_ms": 0.0037762351626911576,
+      "p95_ms": 0.04965624999995198,
+      "n": 200
+    },
+    "lomb_scargle": {
+      "mean_ms": 1.1882058350000468,
+      "median_ms": 0.8149999999997881,
+      "std_ms": 0.49648905538490345,
+      "p95_ms": 1.9195249999998327,
+      "n": 200
+    }
+  },
+  "sqi": {
+    "mean_ms": 0.2355024700000108,
+    "median_ms": 0.23279200000025924,
+    "std_ms": 0.013017490557305748,
+    "p95_ms": 0.24710864999981652,
+    "n": 100
+  },
+  "numba_cold_warm": {
+    "cold_compile_first_call_ms": 435.8337,
+    "cold_compile_process_second_call_ms": 0.0766,
+    "disk_cache_hit_first_call_ms": 120.7765,
+    "disk_cache_hit_process_second_call_ms": 0.0769
+  },
+  "pipeline_floor_fps": {
+    "n_frames": 150,
+    "total_ms": 204.95395799999994,
+    "ms_per_frame": 1.3663597199999997,
+    "fps": 731.8716918850625
+  },
+  "pipeline_with_face_cold_numba": {
+    "n_frames": 300,
+    "mean_ms_per_frame": 5.192900699999994,
+    "median_ms_per_frame": 3.482458499999952,
+    "p95_ms_per_frame": 3.5920187500000478,
+    "max_ms_per_frame": 501.30537499999986,
+    "max_ms_frame_idx": 120,
+    "fps_mean_excl_first_estimate_window": 287.15345782297584,
+    "first_estimate_frame_idx": 120,
+    "first_estimate_wall_ms": 919.925167
+  },
+  "pipeline_with_face_warm_numba": {
+    "n_frames": 300,
+    "mean_ms_per_frame": 4.068491643333339,
+    "median_ms_per_frame": 3.4907705000000178,
+    "p95_ms_per_frame": 3.5649524000002653,
+    "max_ms_per_frame": 166.2432500000002,
+    "max_ms_frame_idx": 120,
+    "fps_mean_excl_first_estimate_window": 286.46970632987615,
+    "first_estimate_frame_idx": 120,
+    "first_estimate_wall_ms": 584.444666
+  },
+  "estimated_steady_state_fps_with_face": {
+    "formula": "mediapipe_median_ms + roi_median_ms + (3*(pos_median_ms+welch_median_ms)+sqi_median_ms)/step_frames",
+    "est_ms_per_frame": 4.867322433333328,
+    "est_fps": 205.4517681326408
+  }
+}

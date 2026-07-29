@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -168,7 +169,24 @@ class PosMethod(PulseExtractionMethod):
 
                 return pos_overlap_add_numba(rgb, ws, self.projection_matrix)
             except ImportError:
-                pass  # Numba недоступна — используем эталонную реализацию ниже.
+                pass  # Numba не установлена — тихий, ожидаемый откат.
+            except Exception as exc:  # noqa: BLE001 - см. комментарий ниже (п.44)
+                # Numba УСТАНОВЛЕНА, но упала при JIT-компиляции/выполнении
+                # (например, TypingError на непривычном dtype/форме входа).
+                # Раньше ловился только ImportError — эта ветка НЕ была
+                # покрыта, и исключение улетало наверх в общий
+                # except Exception пайплайна (pipeline.py::_estimate_color_roi),
+                # где превращалось в "ROI не дал сигнала" вместо честного
+                # отката на эталонную (более медленную, но идентичную по
+                # результату — см. tests/test_signal_pipeline.py::
+                # test_pos_numba_matches_numpy_reference) numpy-реализацию.
+                warnings.warn(
+                    f"POS: numba-реализация упала во время выполнения "
+                    f"({type(exc).__name__}: {exc}) — откат на эталонную "
+                    "numpy-реализацию для этого окна.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         return self._pos_overlap_add_reference(rgb, ws)
 

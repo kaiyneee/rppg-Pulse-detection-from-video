@@ -221,13 +221,13 @@ def hrv_frequency_domain(
 
     freqs, psd = welch(uniform_ibi, fs=resample_hz, nperseg=min(len(uniform_ibi), 256))
     hf_mask = (freqs >= 0.15) & (freqs < 0.40)
-    hf_power = float(np.trapz(psd[hf_mask], freqs[hf_mask])) if hf_mask.any() else 0.0
+    hf_power = float(np.trapezoid(psd[hf_mask], freqs[hf_mask])) if hf_mask.any() else 0.0
 
     lf_power = None
     lf_hf_ratio = None
     if duration >= lf_min_duration_seconds:
         lf_mask = (freqs >= 0.04) & (freqs < 0.15)
-        lf_power = float(np.trapz(psd[lf_mask], freqs[lf_mask])) if lf_mask.any() else 0.0
+        lf_power = float(np.trapezoid(psd[lf_mask], freqs[lf_mask])) if lf_mask.any() else 0.0
         lf_hf_ratio = lf_power / hf_power if hf_power > 1e-8 else None
 
     return dict(lf_power=lf_power, hf_power=hf_power, lf_hf_ratio=lf_hf_ratio)

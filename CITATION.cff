@@ -1,0 +1,112 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "rPPG-PTSD: contactless heart rate and HRV measurement module for PTSD-relevant physiological research"
+type: software
+authors:
+  - name: "kaiyneee"
+repository-code: "https://github.com/kaiyneee/rppg-Pulse-detection-from-video"
+license: MIT
+abstract: >
+  A modular remote-photoplethysmography (rPPG) pipeline (MediaPipe Face
+  Landmarker + 6 signal-extraction methods + SQI-gated quality control +
+  HRV feature extraction) for contactless measurement of heart rate and
+  heart-rate-variability markers potentially relevant to PTSD research.
+  Not a diagnostic or screening tool — see README.md.
+references:
+  - type: conference-paper
+    title: "Detecting Pulse from Head Motions in Video"
+    authors:
+      - family-names: Balakrishnan
+        given-names: Guha
+      - family-names: Durand
+        given-names: Fredo
+      - family-names: Guttag
+        given-names: John
+    year: 2013
+    collection-title: "IEEE Conference on Computer Vision and Pattern Recognition (CVPR)"
+    notes: "Head-motion (ballistocardiographic) extraction method; original scientific inspiration for this project."
+  - type: article
+    title: "Robust Pulse Rate From Chrominance-Based rPPG"
+    authors:
+      - family-names: de Haan
+        given-names: Gerard
+      - family-names: Jeanne
+        given-names: Vincent
+    year: 2013
+    journal: "IEEE Transactions on Biomedical Engineering"
+    notes: "CHROM color-based extraction method."
+  - type: article
+    title: "Algorithmic Principles of Remote PPG"
+    authors:
+      - family-names: Wang
+        given-names: Wenjin
+      - family-names: den Brinker
+        given-names: Albertus C.
+      - family-names: Stuijk
+        given-names: Sander
+      - family-names: de Haan
+        given-names: Gerard
+    year: 2016
+    journal: "IEEE Transactions on Biomedical Engineering"
+    notes: "POS color-based extraction method (default)."
+  - type: article
+    title: "Non-contact, automated cardiac pulse measurements using video imaging and blind source separation"
+    authors:
+      - family-names: Poh
+        given-names: Ming-Zher
+      - family-names: McDuff
+        given-names: Daniel J.
+      - family-names: Picard
+        given-names: Rosalind W.
+    year: 2010
+    journal: "Optics Express"
+    notes: "ICA color-based extraction method."
+  - type: conference-paper
+    title: "Measuring pulse rate with a webcam - a non-contact method for evaluating cardiac activity"
+    authors:
+      - family-names: Lewandowska
+        given-names: Magdalena
+      - family-names: Ruminski
+        given-names: Jacek
+      - family-names: Kowalik
+        given-names: Tomasz
+      - family-names: Nowak
+        given-names: Jedrzej
+    year: 2011
+    collection-title: "Federated Conference on Computer Science and Information Systems (FedCSIS)"
+    notes: "PCA color-based extraction method."
+  - type: article
+    title: "Remote plethysmographic imaging using ambient light"
+    authors:
+      - family-names: Verkruysse
+        given-names: Wim
+      - family-names: Svaasand
+        given-names: Lars O.
+      - family-names: Nelson
+        given-names: J. Stuart
+    year: 2008
+    journal: "Optics Express"
+    notes: "GREEN-channel extraction method."
+  - type: article
+    title: "An advanced detrending method with application to HRV analysis"
+    authors:
+      - family-names: Tarvainen
+        given-names: Mika P.
+      - family-names: Ranta-aho
+        given-names: Perttu O.
+      - family-names: Karjalainen
+        given-names: Pasi A.
+    year: 2002
+    journal: "IEEE Transactions on Biomedical Engineering"
+    notes: "Smoothness-priors detrending; lambda recalibrated for 30 fps in this project, see scripts/analyze_tarvainen_lambda.py."
+  - type: software
+    title: "head-pulse-track"
+    authors:
+      - name: "irfan798"
+    repository-code: "https://github.com/irfan798/head-pulse-track"
+    notes: >
+      Scientific inspiration that first pointed at Balakrishnan et al. (2013)
+      for this problem. That repository carries no license (all rights
+      reserved by its authors); no source code from it is reused in this
+      project, which is an independent implementation built on the
+      MediaPipe Face Landmarker Tasks API. See README.md "Acknowledgements".

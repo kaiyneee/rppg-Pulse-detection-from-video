@@ -35,9 +35,14 @@ from mediapipe.tasks.python.vision.face_landmarker import (
 )
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
 
+# Зафиксировано на float16/1/ (не /latest/) для воспроизводимости — п.41
+# требований. Проверено: /1/ и /latest/ на момент фиксации byte-identical
+# (одинаковые etag "b0e7274907a1644404fef66b28dd6d85" и content-length
+# 3758596, совпадает с models/face_landmarker.task в этом репозитории), но
+# /latest/ может смениться в будущем без предупреждения — /1/ не сменится.
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/latest/face_landmarker.task"
+    "face_landmarker/float16/1/face_landmarker.task"
 )
 
 

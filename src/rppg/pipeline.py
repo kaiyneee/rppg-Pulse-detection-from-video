@@ -39,18 +39,20 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
 from rppg.config import PipelineConfig, ExtractionMethod
 from rppg.face.landmarker import FaceLandmarkerWrapper
 from rppg.face.roi import extract_rois, STABLE_TRACKING_IDX
-from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend
+from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
 from rppg.signal.methods import get_method, SignalWindow
 from rppg.signal.frequency import estimate_hr
 from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
 from rppg.signal.fusion import fuse_signals_by_sqi, snr_db_to_weight
 from rppg.signal.respiration import estimate_respiration_rate
+from rppg.structured_log import StructuredWindowLogger, WindowLogRecord
 from rppg.hrv.features import (
     detect_pulse_peaks,
     refine_peaks_subsample,
@@ -124,8 +126,14 @@ class _RingBuffer:
 
 
 class RPPGPipeline:
-    def __init__(self, config: PipelineConfig | None = None):
+    def __init__(self, config: PipelineConfig | None = None, log_path: str | Path | None = None):
+        """log_path: если задан, каждое оценённое окно дополнительно
+        пишется структурированной JSONL-строкой (см. structured_log.py,
+        п.43 требований) — timestamp, BPM по каждому ROI, ВСЕ компоненты
+        SQI по отдельности, warnings. Опционально: без log_path поведение
+        не отличается от прежнего."""
         self.cfg = config or PipelineConfig()
+        self._window_logger = StructuredWindowLogger(log_path) if log_path is not None else None
         self._landmarker = FaceLandmarkerWrapper(
             model_asset_path=self.cfg.face.model_asset_path,
             num_faces=self.cfg.face.num_faces,
@@ -172,6 +180,8 @@ class RPPGPipeline:
 
     def close(self) -> None:
         self._landmarker.close()
+        if self._window_logger is not None:
+            self._window_logger.close()
 
     def __enter__(self) -> "RPPGPipeline":
         return self
@@ -291,17 +301,13 @@ class RPPGPipeline:
         raw = np.array(self._buf.rgb_by_roi[name])
         valid_mask = np.array(self._buf.valid_by_roi[name], dtype=bool)
 
-        fixed_channels = []
-        ok = True
-        for ch in range(3):
-            fixed, ch_ok = interpolate_missing(raw[:, ch], valid_mask)
-            fixed_channels.append(fixed)
-            ok = ok and ch_ok
-        rgb = np.stack(fixed_channels, axis=1)
-
-        if not ok:
+        # valid_mask одна и та же для R/G/B (окклюзия определяется на уровне
+        # кадра, а не канала) — проверяем допустимость провала ОДИН раз, а
+        # не пересчитываем длину провала 3 раза подряд (п.47 требований).
+        if not is_gap_acceptable(valid_mask):
             warnings.append(f"ROI '{name}': слишком длинный провал трекинга/окклюзии в окне.")
             return
+        rgb = np.stack([fill_gaps(raw[:, ch], valid_mask) for ch in range(3)], axis=1)
 
         window = SignalWindow(
             rgb_traces={name: rgb},
@@ -583,10 +589,24 @@ class RPPGPipeline:
                 )
 
         if not per_roi_signal:
+            no_signal_warnings = warnings + ["Ни один ROI не дал валидного сигнала в этом окне."]
+            if self._window_logger is not None:
+                # Тоже логируем (п.43) — "окно без сигнала" такой же
+                # материал для анализа failure cases, как и низкий SQI.
+                self._window_logger.log(WindowLogRecord(
+                    timestamp_ms=timestamp_ms, bpm=float("nan"), per_roi_bpm=dict(per_roi_bpm),
+                    publishable=False, method_used=self._method.name,
+                    frequency_method_used=self.cfg.frequency_method.value,
+                    sqi_overall_score=0.0, sqi_level="low",
+                    sqi_spectral_snr_db=float("-inf"), sqi_cross_roi_agreement=0.0,
+                    sqi_landmark_stability=0.0, sqi_temporal_consistency=0.0,
+                    sqi_harmonic_score=0.0, sqi_flicker_suspected=False,
+                    respiration_rate_bpm=None, warnings=no_signal_warnings,
+                ))
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
                 sqi_score=0.0, sqi_level="low", publishable=False,
-                warnings=warnings + ["Ни один ROI не дал валидного сигнала в этом окне."],
+                warnings=no_signal_warnings,
                 method_used=self._method.name,
                 frequency_method_used=self.cfg.frequency_method.value,
                 per_roi_bpm=per_roi_bpm,
@@ -598,13 +618,15 @@ class RPPGPipeline:
             )
             best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
         else:
-            # ROI с максимальным spectral SNR используется как основной источник BPM/HRV.
-            best_roi = max(
-                per_roi_signal,
-                key=lambda n: dominant_frequency_and_snr(per_roi_signal[n], fps, band)[1],
-            )
+            # ROI с максимальным spectral SNR используется как основной источник
+            # BPM/HRV. Считаем dominant_frequency_and_snr РОВНО ОДИН раз на ROI
+            # (Welch с nfft=2048 не бесплатен, а это выполняется на каждом шаге
+            # окна) и переиспользуем для выбранного best_roi, а не пересчитываем
+            # его же ещё раз после argmax (п.46 требований).
+            snr_by_roi = {n: dominant_frequency_and_snr(sig, fps, band) for n, sig in per_roi_signal.items()}
+            best_roi = max(snr_by_roi, key=lambda n: snr_by_roi[n][1])
             best_signal = per_roi_signal[best_roi]
-            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+            best_peak_freq_hz, best_snr_db = snr_by_roi[best_roi]
             current_bpm = per_roi_bpm.get(best_roi, float("nan"))
 
             # п.21: для проверки на гармоники/субгармоники нужен ДЕТРЕНДИРОВАННЫЙ,
@@ -652,6 +674,32 @@ class RPPGPipeline:
         if self.cfg.fusion.enabled:
             method_used = f"fusion({self._method.name}+head_motion)" if best_roi == "fusion" else best_roi
 
+        all_warnings = warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else [])
+
+        if self._window_logger is not None:
+            # п.43: полная разбивка SQI по компонентам (не только overall_score)
+            # — материал для анализа failure cases, доступный ЗДЕСЬ (полный
+            # sqi: SQIResult), но не в возвращаемом PTSDPulseFeatures, который
+            # наружу отдаёт только сводные sqi_score/sqi_level.
+            self._window_logger.log(WindowLogRecord(
+                timestamp_ms=timestamp_ms,
+                bpm=current_bpm,
+                per_roi_bpm=dict(per_roi_bpm),
+                publishable=sqi.is_reliable,
+                method_used=method_used,
+                frequency_method_used=self.cfg.frequency_method.value,
+                sqi_overall_score=sqi.overall_score,
+                sqi_level=sqi.level.value,
+                sqi_spectral_snr_db=sqi.spectral_snr_db,
+                sqi_cross_roi_agreement=sqi.cross_roi_agreement,
+                sqi_landmark_stability=sqi.landmark_stability,
+                sqi_temporal_consistency=sqi.temporal_consistency,
+                sqi_harmonic_score=sqi.harmonic_score,
+                sqi_flicker_suspected=sqi.flicker_suspected,
+                respiration_rate_bpm=respiration_rate_bpm,
+                warnings=list(all_warnings),
+            ))
+
         return PTSDPulseFeatures(
             timestamp_ms=timestamp_ms,
             bpm=current_bpm,
@@ -659,7 +707,7 @@ class RPPGPipeline:
             sqi_score=sqi.overall_score,
             sqi_level=sqi.level.value,
             publishable=sqi.is_reliable,
-            warnings=warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else []),
+            warnings=all_warnings,
             method_used=method_used,
             frequency_method_used=self.cfg.frequency_method.value,
             per_roi_bpm=per_roi_bpm,

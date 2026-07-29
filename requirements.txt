@@ -1,16 +1,31 @@
-# Проверено на Python 3.12.3. Версии ниже — те, что реально протестированы
-# при разработке этого модуля (см. docs/research_report.md, раздел 8).
+# Точные версии (==), а не диапазоны (>=) — п.41 требований: без этого
+# результаты (BPM/HRV/SQI, ablation/benchmark числа) невоспроизводимы, т.к.
+# разные минорные версии numpy/scipy/mediapipe/scikit-learn могут менять
+# численные детали (округление БПФ, случайную инициализацию FastICA и т.п.).
+#
+# Реально протестировано в этом репозитории на Python 3.9.6 (см.
+# venv/, `python3 --version`) — ПРЕДЫДУЩАЯ версия этого файла утверждала
+# "Python 3.12.3", что не совпадало с фактической средой разработки; это
+# было исправлено здесь, а не переиспользовано без проверки.
+# CI (.github/workflows/ci.yml) дополнительно прогоняет ЭТИ ЖЕ точные пины
+# на Python 3.10/3.11/3.12 как smoke-test кросс-версийной совместимости —
+# если для какой-то версии не окажется нужного wheel'а, CI явно покажет это
+# как провал сборки, а не будет молчаливым.
 
-numpy>=2.0
-scipy>=1.13
-opencv-python>=4.9
-mediapipe>=0.10.14        # 0.10.x — минимальная версия с Tasks API FaceLandmarker
-scikit-learn>=1.4          # PCA, FastICA
-matplotlib>=3.8             # Bland-Altman и др. графики в benchmark/
+numpy==2.0.2
+scipy==1.13.1
+opencv-python==5.0.0.93
+mediapipe==0.10.35          # 0.10.x — минимальная версия с Tasks API FaceLandmarker; см. src/rppg/face/landmarker.py
+scikit-learn==1.6.1          # PCA, FastICA
+matplotlib==3.9.4             # Bland-Altman и др. графики в benchmark/
 
 # Опционально (пайплайн работает и без них, см. соответствующие модули):
-numba>=0.59                 # ускорение POS (src/rppg/accel/fast_ops.py); без неё используется чистый numpy fallback
-onnxruntime>=1.17           # для подключения обученного (deep learning) метода извлечения сигнала, см. research_report.md #6.3
-# torch>=2.2                # только если добавляете обучаемый метод (не используется в базовом пайплайне)
+numba==0.60.0                 # ускорение POS (src/rppg/accel/fast_ops.py); без неё используется чистый numpy fallback
+onnxruntime==1.19.2           # для подключения обученного (deep learning) метода извлечения сигнала, см. research_report.md #6.3
+# torch>=2.2                  # только если добавляете обучаемый метод (не используется в базовом пайплайне)
 
-pandas>=2.2                 # benchmark/evaluate.py, скрипты
+pandas==2.3.3                 # benchmark/evaluate.py, скрипты
+PyYAML==6.0.3                  # config_io.py: один YAML/JSON-конфиг на эксперимент (п.42 требований)
+
+# Тесты (см. pytest.ini, .github/workflows/ci.yml, п.40 требований)
+pytest==8.4.2

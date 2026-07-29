@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 kaiyneee
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTE ON PROVENANCE: This codebase is an independent implementation of
+published, peer-reviewed rPPG/HRV algorithms (Balakrishnan et al., CVPR 2013;
+de Haan & Jeanne, IEEE TBME 2013; Wang et al., IEEE TBME 2016; Poh, McDuff &
+Picard, Optics Express / IEEE TBME 2010-2011; Lewandowska et al., FedCSIS
+2011; Verkruysse, Svaasand & Nelson, Optics Express 2008 — see individual
+module docstrings for per-algorithm citations). It was built using the
+MediaPipe Face Landmarker Tasks API, not any code from
+github.com/irfan798/head-pulse-track. That repository (unlicensed, all
+rights reserved by its authors) is credited in README.md /
+docs/research_report.md as the scientific inspiration that first pointed at
+Balakrishnan et al. (2013) for this problem — no source code from it is
+reused here. See README.md "Acknowledgements" for details.

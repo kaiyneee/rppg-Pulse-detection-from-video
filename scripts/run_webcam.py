@@ -3,11 +3,13 @@
 
 Использование:
     python scripts/run_webcam.py --camera 0 --method pos --freq welch
+    python scripts/run_webcam.py --camera 0 --log session.jsonl   # см. п.43
 
-Перед первым запуском один раз скачайте модель Face Landmarker:
+Перед первым запуском один раз скачайте модель Face Landmarker (версия
+зафиксирована — п.41 требований, см. src/rppg/face/landmarker.py::MODEL_URL):
     mkdir -p models
     curl -L -o models/face_landmarker.task \\
-        https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+        https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
+from rppg.config_io import load_config
 from rppg.pipeline import RPPGPipeline
 
 
@@ -52,14 +55,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="rPPG realtime demo")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--model", type=str, default="models/face_landmarker.task")
-    parser.add_argument("--method", type=str, default="pos", choices=[m.value for m in ExtractionMethod])
-    parser.add_argument("--freq", type=str, default="welch", choices=[m.value for m in FrequencyMethod])
+    parser.add_argument("--config", type=str, default=None, help="Базовый YAML/JSON-конфиг, см. rppg.config_io")
+    parser.add_argument("--method", type=str, default=None, choices=[m.value for m in ExtractionMethod])
+    parser.add_argument("--freq", type=str, default=None, choices=[m.value for m in FrequencyMethod])
+    parser.add_argument(
+        "--log", type=str, default=None,
+        help="Путь к JSONL-логу по окнам (timestamp/BPM по ROI/компоненты SQI/warnings, см. п.43)",
+    )
     args = parser.parse_args()
 
-    config = PipelineConfig()
+    config = load_config(args.config) if args.config else PipelineConfig()
     config.face.model_asset_path = args.model
-    config.method = ExtractionMethod(args.method)
-    config.frequency_method = FrequencyMethod(args.freq)
+    if args.method is not None:
+        config.method = ExtractionMethod(args.method)
+    if args.freq is not None:
+        config.frequency_method = FrequencyMethod(args.freq)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -67,7 +77,7 @@ def main() -> None:
 
     start_ms = time.time() * 1000
 
-    with RPPGPipeline(config) as pipeline:
+    with RPPGPipeline(config, log_path=args.log) as pipeline:
         last_result = None
         while True:
             ok, frame = cap.read()
