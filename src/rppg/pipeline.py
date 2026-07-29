@@ -10,8 +10,11 @@ RPPGPipeline — верхнеуровневая оркестрация всег�
                  preprocessing.preprocess_signal
                  methods.<Extraction>.extract
                  frequency.estimate_hr
-          -> quality.assess_quality (спектральный SNR + межзонное согласие
-             + стабильность landmark-точек)
+          -> quality.assess_quality (спектральный SNR со штрафом за
+             гармоники/субгармоники + межзонное согласие + стабильность
+             landmark-точек, нормированная на межзрачковое расстояние +
+             temporal consistency BPM между соседними окнами; жёсткий гейт
+             дополнительно проверяет фоновый ROI на мерцание освещения)
           -> respiration.estimate_respiration_rate (по огибающей сигнала
              лучшего по SQI ROI, на каждом шаге)
           -> _update_ibi_log: суб-сэмпловые пики лучшего по SQI ROI
@@ -45,7 +48,7 @@ from rppg.face.roi import extract_rois, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend
 from rppg.signal.methods import get_method, SignalWindow
 from rppg.signal.frequency import estimate_hr
-from rppg.signal.quality import assess_quality, dominant_frequency_and_snr
+from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
 from rppg.signal.respiration import estimate_respiration_rate
 from rppg.hrv.features import (
     detect_pulse_peaks,
@@ -87,6 +90,12 @@ class _RingBuffer:
         self.landmark_traj: deque = deque()
         self.face_valid: deque = deque()  # True, если лицо было обнаружено в кадре
         self.timestamps_ms: deque = deque()
+        # п.19: масштаб лица (межзрачковое/межугловое расстояние) за кадр,
+        # для абсолютной нормировки джиттера в landmark_stability_score.
+        self.interocular_dist: deque = deque()
+        # п.22: фоновый ROI (вне лица), для детектора мерцания освещения.
+        self.background_rgb: deque = deque()
+        self.background_valid: deque = deque()
 
     def ensure_roi(self, roi_name: str) -> None:
         if roi_name not in self.rgb_by_roi:
@@ -104,6 +113,9 @@ class _RingBuffer:
             self.timestamps_ms.popleft()
             self.landmark_traj.popleft()
             self.face_valid.popleft()
+            self.interocular_dist.popleft()
+            self.background_rgb.popleft()
+            self.background_valid.popleft()
             for dq in self.rgb_by_roi.values():
                 dq.popleft()
             for dq in self.valid_by_roi.values():
@@ -130,6 +142,12 @@ class RPPGPipeline:
 
         self._last_estimate_ms: int | None = None
         self._method = get_method(self.cfg.method.value)
+
+        # п.20: история BPM лучшего ROI по последним оценкам (перекрывающиеся
+        # окна) — для temporal_consistency_score. maxlen соответствует
+        # нескольким window.step_seconds шагам назад; не привязана к
+        # window.window_seconds, т.к. это отдельная, более короткая шкала.
+        self._recent_bpm_history: deque = deque(maxlen=6)
 
         # Накопитель IBI для HRV — ОТДЕЛЬНЫЙ от скользящего BPM-окна (см.
         # HRVConfig и hrv/features.py, п.14 требований): пополняется
@@ -186,6 +204,10 @@ class RPPGPipeline:
         self._buf.timestamps_ms.append(timestamp_ms)
         self._buf.landmark_traj.append(roi_result.stable_tracking_points)
         self._buf.face_valid.append(True)
+        self._buf.interocular_dist.append(roi_result.interocular_distance_px)
+        bg_rgb = roi_result.background_rgb
+        self._buf.background_rgb.append(bg_rgb if bg_rgb is not None else np.zeros(3))
+        self._buf.background_valid.append(bool(roi_result.background_valid))
         for roi in self.cfg.roi.enabled_rois:
             name = roi.value
             rgb = roi_result.rgb_by_roi.get(name)
@@ -200,6 +222,9 @@ class RPPGPipeline:
         last_traj = self._buf.landmark_traj[-1] if self._buf.landmark_traj else np.zeros((n_stable, 2))
         self._buf.landmark_traj.append(last_traj)  # держим позицию, не телепортируем в (0,0)
         self._buf.face_valid.append(False)
+        self._buf.interocular_dist.append(np.nan)  # нет landmark'ов -> нет масштаба лица за этот кадр
+        self._buf.background_rgb.append(np.zeros(3))
+        self._buf.background_valid.append(False)
         for roi in self.cfg.roi.enabled_rois:
             name = roi.value
             self._buf.rgb_by_roi[name].append(np.zeros(3))
@@ -250,6 +275,7 @@ class RPPGPipeline:
         per_roi_bpm: dict[str, float],
         per_roi_signal: dict[str, np.ndarray],
         warnings: list[str],
+        per_roi_raw_signal: dict[str, np.ndarray] | None = None,
     ) -> None:
         raw = np.array(self._buf.rgb_by_roi[name])
         valid_mask = np.array(self._buf.valid_by_roi[name], dtype=bool)
@@ -287,6 +313,8 @@ class RPPGPipeline:
             normalize_method=self.cfg.filt.normalize_method,
         )
         per_roi_signal[name] = processed
+        if per_roi_raw_signal is not None:
+            per_roi_raw_signal[name] = raw_signal
         per_roi_bpm[name] = self._estimate_frequency(raw_signal, valid_mask, processed, fps, band, timestamps_sec)
 
     def _estimate_head_motion(
@@ -298,6 +326,7 @@ class RPPGPipeline:
         per_roi_bpm: dict[str, float],
         per_roi_signal: dict[str, np.ndarray],
         warnings: list[str],
+        per_roi_raw_signal: dict[str, np.ndarray] | None = None,
     ) -> None:
         """HEAD_MOTION не зависит от ROI (он использует движение головы целиком),
         поэтому считается один раз на окно, а не по разу на каждый ROI —
@@ -329,6 +358,8 @@ class RPPGPipeline:
             normalize_method=self.cfg.filt.normalize_method,
         )
         per_roi_signal["face"] = processed
+        if per_roi_raw_signal is not None:
+            per_roi_raw_signal["face"] = raw_signal
         per_roi_bpm["face"] = self._estimate_frequency(raw_signal, face_valid, processed, fps, band, timestamps_sec)
 
     # ------------------------------------------------------------------ #
@@ -427,6 +458,27 @@ class RPPGPipeline:
         self._cached_hrv = hrv
         return hrv
 
+    def _estimate_background_signal(self, fps: float, band: tuple[float, float]) -> np.ndarray | None:
+        """Сигнал фонового ROI (вне лица) — для detect_illumination_flicker
+        (п.22). Берётся зелёный канал (наибольшая чувствительность к
+        яркостной модуляции, см. make_synthetic_rgb docstring в тестах) и
+        обрабатывается тем же preprocess_signal, что и лицевые ROI, чтобы
+        частоты были сравнимы напрямую."""
+        valid_mask = np.array(self._buf.background_valid, dtype=bool)
+        if valid_mask.sum() < 8:
+            return None
+        green = np.array(self._buf.background_rgb)[:, 1]
+        fixed, ok = interpolate_missing(green, valid_mask)
+        if not ok:
+            return None
+        return preprocess_signal(
+            fixed, fps, band[0], band[1],
+            order=self.cfg.filt.filter_order,
+            detrend_method=self.cfg.filt.detrend_method,
+            tarvainen_lambda=self.cfg.filt.tarvainen_lambda,
+            normalize_method=self.cfg.filt.normalize_method,
+        )
+
     def _compute_estimate(self, timestamp_ms: int) -> PTSDPulseFeatures:
         fps = self._estimate_fps()
         band = (self.cfg.filt.low_hz, self.cfg.filt.high_hz)
@@ -435,13 +487,20 @@ class RPPGPipeline:
 
         per_roi_bpm: dict[str, float] = {}
         per_roi_signal: dict[str, np.ndarray] = {}
+        per_roi_raw_signal: dict[str, np.ndarray] = {}
         warnings: list[str] = []
 
         if self._method.name == "head_motion":
-            self._estimate_head_motion(landmark_traj, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings)
+            self._estimate_head_motion(
+                landmark_traj, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings,
+                per_roi_raw_signal=per_roi_raw_signal,
+            )
         else:
             for roi in self.cfg.roi.enabled_rois:
-                self._estimate_color_roi(roi.value, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings)
+                self._estimate_color_roi(
+                    roi.value, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings,
+                    per_roi_raw_signal=per_roi_raw_signal,
+                )
 
         if not per_roi_signal:
             return PTSDPulseFeatures(
@@ -459,17 +518,43 @@ class RPPGPipeline:
             key=lambda n: dominant_frequency_and_snr(per_roi_signal[n], fps, band)[1],
         )
         best_signal = per_roi_signal[best_roi]
-        _, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+        best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+
+        # п.21: для проверки на гармоники/субгармоники нужен ДЕТРЕНДИРОВАННЫЙ,
+        # но НЕ узкополосно отфильтрованный сигнал — иначе сам bandpass в
+        # preprocess_signal обрезает 2f/f/2 ещё до того, как их можно измерить
+        # (см. harmonic_plausibility docstring в quality.py).
+        harmonic_check_signal = None
+        if best_roi in per_roi_raw_signal:
+            harmonic_check_signal = detrend(
+                per_roi_raw_signal[best_roi],
+                method=self.cfg.filt.detrend_method,
+                lam=self.cfg.filt.tarvainen_lambda,
+            )
+
+        interocular_distances_px = np.array(self._buf.interocular_dist, dtype=float)
+        background_signal = self._estimate_background_signal(fps, band)
+
+        current_bpm = per_roi_bpm.get(best_roi, float("nan"))
+        recent_bpm_history = list(self._recent_bpm_history) + [current_bpm]
 
         sqi = assess_quality(
-            spectral_snr_db=best_snr_db,
-            bpm_by_roi=per_roi_bpm,
-            landmark_trajectories=landmark_traj,
-            min_spectral_snr_db=self.cfg.quality.min_spectral_snr_db,
-            max_cross_roi_bpm_diff=self.cfg.quality.max_cross_roi_bpm_diff,
-            min_landmark_stability=self.cfg.quality.min_landmark_stability,
-            min_overall_score_to_publish=self.cfg.quality.min_overall_score_to_publish,
+            SQIInputs(
+                spectral_snr_db=best_snr_db,
+                peak_freq_hz=best_peak_freq_hz,
+                fps=fps,
+                band_hz=band,
+                bpm_by_roi=per_roi_bpm,
+                landmark_trajectories=landmark_traj,
+                interocular_distances_px=interocular_distances_px,
+                recent_bpm_history=recent_bpm_history,
+                harmonic_check_signal=harmonic_check_signal,
+                background_signal=background_signal,
+            ),
+            self.cfg.quality,
         )
+        if not np.isnan(current_bpm):
+            self._recent_bpm_history.append(current_bpm)
 
         self._update_ibi_log(best_signal, fps, self._buf.timestamps_ms)
         hrv_warnings: list[str] = []
