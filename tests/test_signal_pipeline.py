@@ -248,28 +248,255 @@ def test_white_noise_is_not_publishable():
     snr_score=0, а roi/stability при одном ROI/без landmark-точек нейтральны
     (0.5), что давало overall == 0.5 и publishable=True для сигнала без
     какой-либо пульсовой составляющей — прямая дыра в требовании ТЗ
-    "не передавать BPM при низком качестве сигнала"."""
-    print("\n=== Тест: белый шум -> publishable == False ===")
-    from rppg.signal.quality import assess_quality, dominant_frequency_and_snr
+    "не передавать BPM при низком качестве сигнала".
+
+    Это же негативный контроль (в) из п.23 требований: белый шум -> SQI
+    обязан сказать "не знаю", а не выдать правдоподобное число."""
+    print("\n=== Негативный контроль (в): белый шум -> publishable == False ===")
+    from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
     from rppg.config import QualityConfig
 
     rng = np.random.default_rng(42)
     noise = rng.normal(0, 1, int(FPS * DURATION_S))
-    _, snr_db = dominant_frequency_and_snr(noise, FPS, BAND)
+    peak_freq, snr_db = dominant_frequency_and_snr(noise, FPS, BAND)
 
     qcfg = QualityConfig()
     sqi = assess_quality(
-        spectral_snr_db=snr_db,
-        bpm_by_roi={"forehead": 75.0},  # один ROI -> нейтральный roi_score=0.5
-        landmark_trajectories=None,  # нейтральный stability_score=0.5
-        min_spectral_snr_db=qcfg.min_spectral_snr_db,
-        max_cross_roi_bpm_diff=qcfg.max_cross_roi_bpm_diff,
-        min_landmark_stability=qcfg.min_landmark_stability,
-        min_overall_score_to_publish=qcfg.min_overall_score_to_publish,
+        SQIInputs(
+            spectral_snr_db=snr_db,
+            peak_freq_hz=peak_freq,
+            fps=FPS,
+            band_hz=BAND,
+            bpm_by_roi={"forehead": 75.0},  # один ROI -> нейтральный roi_score=0.5
+            landmark_trajectories=None,  # нейтральный stability_score=0.5
+        ),
+        qcfg,
     )
     print(f"  spectral_snr_db={snr_db:.2f} dB, overall={sqi.overall_score:.3f}, "
           f"publishable={sqi.is_reliable}")
     assert not sqi.is_reliable, "Белый шум не должен быть publishable"
+
+
+def test_landmark_stability_penalizes_strong_uniform_sway():
+    """Регрессия для п.19: раньше джиттер нормировался на СОБСТВЕННУЮ медиану
+    (относительная нормировка) -> человек, равномерно и сильно раскачивающийся
+    ВЕСЬ интервал, получал стабильность 1.0, потому что весь его джиттер был
+    "типичным" относительно самого себя. Нормировка на межзрачковое (IPD)
+    расстояние обязана штрафовать такое раскачивание, а мелкий естественный
+    джиттер — по-прежнему считать стабильным."""
+    print("\n=== Тест: IPD-нормировка landmark_stability ловит сильное равномерное раскачивание ===")
+    from rppg.signal.quality import landmark_stability_score
+
+    rng = np.random.default_rng(0)
+    n_frames, n_pts = 100, 10
+    ipd = 80.0  # типичный масштаб лица в пикселях для веб-камеры
+    t = np.arange(n_frames)
+
+    strong_sway = np.zeros((n_frames, n_pts, 2))
+    for p in range(n_pts):
+        strong_sway[:, p, 0] = 100 + 12 * np.sin(0.5 * t) + rng.normal(0, 0.05, n_frames)
+        strong_sway[:, p, 1] = 100 + rng.normal(0, 0.05, n_frames)
+
+    small_jitter = np.zeros((n_frames, n_pts, 2))
+    for p in range(n_pts):
+        small_jitter[:, p, 0] = 100 + rng.normal(0, 0.3, n_frames)
+        small_jitter[:, p, 1] = 100 + rng.normal(0, 0.3, n_frames)
+
+    ipd_arr = np.full(n_frames, ipd)
+    sway_score_ipd = landmark_stability_score(strong_sway, interocular_distances_px=ipd_arr)
+    sway_score_selfnorm = landmark_stability_score(strong_sway, interocular_distances_px=None)
+    small_score_ipd = landmark_stability_score(small_jitter, interocular_distances_px=ipd_arr)
+
+    print(f"  сильное раскачивание, IPD-нормировка: {sway_score_ipd:.3f}")
+    print(f"  сильное раскачивание, старая self-median нормировка: {sway_score_selfnorm:.3f}")
+    print(f"  мелкий естественный джиттер, IPD-нормировка: {small_score_ipd:.3f}")
+
+    assert sway_score_ipd < 0.7, "IPD-нормировка должна штрафовать сильное равномерное раскачивание"
+    assert sway_score_selfnorm >= 0.99, (
+        "sanity: self-median нормировка действительно 'слепа' к равномерному раскачиванию "
+        "(это старое, ошибочное поведение, воспроизведённое намеренно для контраста)"
+    )
+    assert small_score_ipd >= 0.9, "мелкий естественный джиттер не должен штрафоваться IPD-нормировкой"
+
+
+def test_temporal_consistency_penalizes_unstable_bpm_sequence():
+    """Регрессия для п.20: temporal_consistency должна быть высокой для
+    физиологически правдоподобной (плавно меняющейся) последовательности BPM
+    между соседними окнами и низкой для скачущей последовательности —
+    именно такую нестабильность cross_roi_agreement поймать не может, если
+    все ROI ошибаются согласованно (см. docstring temporal_consistency_score)."""
+    print("\n=== Тест: temporal_consistency штрафует скачущую последовательность BPM ===")
+    from rppg.signal.quality import temporal_consistency_score
+
+    stable = temporal_consistency_score([72.0, 73.0, 71.5, 72.5, 73.5, 72.0])
+    unstable = temporal_consistency_score([72.0, 110.0, 65.0, 95.0, 60.0, 100.0])
+    too_short = temporal_consistency_score([72.0, 73.0])
+
+    print(f"  плавная последовательность: {stable:.3f}")
+    print(f"  скачущая последовательность: {unstable:.3f}")
+    print(f"  недостаточно истории (нейтрально): {too_short:.3f}")
+
+    assert stable > 0.7, "плавная физиологичная последовательность BPM должна давать высокий score"
+    assert unstable < 0.3, "резко скачущая последовательность BPM должна давать низкий score"
+    assert too_short == 0.5, "при недостаточной истории score должен быть нейтральным (0.5)"
+
+
+def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
+    """Регрессия для п.21: если заявленный пик совпадает со ВТОРОЙ гармоникой
+    реального тона (в сигнале сопоставимая энергия и на f, и на f/2), это
+    классический failure mode rPPG — детектируется 2x или x0.5 от истинного
+    пульса. Чистый одиночный тон не должен давать ложных срабатываний."""
+    print("\n=== Тест: проверка на гармоники/субгармоники (п.21) ===")
+    from rppg.signal.quality import harmonic_plausibility
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    rng = np.random.default_rng(1)
+
+    clean_tone = np.sin(2 * np.pi * 1.0 * t) + 0.05 * rng.normal(0, 1, n)
+    clean_score, clean_warnings = harmonic_plausibility(clean_tone, fps, peak_freq_hz=1.0)
+
+    # Пик ошибочно "найден" на 2 Hz, но в сигнале сопоставимая энергия на
+    # истинной частоте 1 Hz (= заявленный_пик / 2) -> подозрение на путаницу.
+    ambiguous = np.sin(2 * np.pi * 1.0 * t) + 0.9 * np.sin(2 * np.pi * 2.0 * t)
+    ambiguous_score, ambiguous_warnings = harmonic_plausibility(ambiguous, fps, peak_freq_hz=2.0)
+
+    print(f"  чистый тон на f: score={clean_score:.2f}, warnings={clean_warnings}")
+    print(f"  пик на 2f при сильной энергии на f: score={ambiguous_score:.2f}, warnings={ambiguous_warnings}")
+
+    assert clean_score >= 0.9 and not clean_warnings, "чистый одиночный тон не должен давать ложных срабатываний"
+    assert ambiguous_score < 0.7 and ambiguous_warnings, (
+        "сопоставимая энергия на f/2 относительно заявленного пика на 2f должна флагироваться"
+    )
+
+
+def test_illumination_flicker_detected_via_background_roi():
+    """Регрессия для п.22: если фоновый ROI (вне лица, например стена)
+    САМ ПО СЕБЕ показывает узкий стабильный пик на частоте, совпадающей с
+    "пульсом" на лице, это почти наверняка мерцание освещения, а не
+    сердцебиение стены — жёсткий гейт публикации. Фон, который просто шумит
+    без узкополосного пика, не должен ложно срабатывать."""
+    print("\n=== Тест: детектор мерцания освещения через фоновый ROI (п.22) ===")
+    from rppg.signal.quality import detect_illumination_flicker
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    face_peak_hz = 1.2  # 72 BPM
+
+    flicker_bg = 2.0 * np.sin(2 * np.pi * face_peak_hz * t) + 0.05 * np.random.default_rng(2).normal(0, 1, n)
+    flicker_suspected, warning = detect_illumination_flicker(flicker_bg, fps, face_peak_hz, band)
+
+    clean_bg = np.random.default_rng(3).normal(0, 1, n)
+    clean_suspected, clean_warning = detect_illumination_flicker(clean_bg, fps, face_peak_hz, band)
+
+    print(f"  фон совпадает с частотой лица: flicker_suspected={flicker_suspected}, warning={bool(warning)}")
+    print(f"  фон — просто шум: flicker_suspected={clean_suspected}, warning={bool(clean_warning)}")
+
+    assert flicker_suspected and warning, "совпадающий узкополосный пик фона должен флагироваться как мерцание"
+    assert not clean_suspected and clean_warning is None, "шумный фон без узкополосного пика не должен флагироваться"
+
+
+def test_static_photo_or_mannequin_is_not_publishable():
+    """Негативные контроли (а)/(б) из п.23 требований: статичное фото лица
+    и видео манекена/распечатки — в обоих случаях ROI-сигнал не несёт
+    физиологической пульсации: (а) буквально константа кадр к кадру,
+    (б) константа + немодулированный сенсорный шум камеры (без какой-либо
+    периодичности). Прогоняем через ПОЛНЫЙ сигнальный конвейер (извлечение
+    -> препроцессинг -> SQI), а не напрямую через assess_quality, чтобы
+    проверить оркестрацию, а не только формулу гейта."""
+    print("\n=== Негативные контроли (а,б): статичное фото / манекен -> publishable == False ===")
+    from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
+    from rppg.config import QualityConfig
+
+    n = int(FPS * DURATION_S)
+    dc = {"R": 150.0, "G": 110.0, "B": 90.0}
+    qcfg = QualityConfig()
+
+    cases = {
+        # (а) идеально статичное фото — без какого-либо шума камеры.
+        "статичное фото": np.stack([np.full(n, dc[ch]) for ch in ("R", "G", "B")], axis=1),
+        # (б) манекен/распечатка под реальным светом камеры — есть немодулированный
+        # сенсорный шум, но нет ни одной периодической составляющей в HR-полосе.
+        "манекен/распечатка": np.stack(
+            [dc[ch] + np.random.default_rng(5).normal(0, 0.5, n) for ch in ("R", "G", "B")], axis=1
+        ),
+    }
+
+    for label, rgb in cases.items():
+        window = SignalWindow(rgb_traces={"forehead": rgb}, fps=FPS, hr_band_hz=BAND)
+        method = get_method("pos")
+        raw = method.extract(window, "forehead")
+        processed = preprocess_signal(raw, FPS, *BAND, detrend_method="tarvainen", normalize_method="zscore")
+        peak_freq, snr_db = dominant_frequency_and_snr(processed, FPS, BAND)
+
+        sqi = assess_quality(
+            SQIInputs(
+                spectral_snr_db=snr_db,
+                peak_freq_hz=peak_freq,
+                fps=FPS,
+                band_hz=BAND,
+                bpm_by_roi={"forehead": 75.0},
+            ),
+            qcfg,
+        )
+        print(f"  [{label}] spectral_snr_db={snr_db:.2f} dB, overall={sqi.overall_score:.3f}, "
+              f"publishable={sqi.is_reliable}")
+        assert not sqi.is_reliable, f"{label}: не должно быть publishable (нет пульсации в сигнале)"
+
+
+def test_occluded_face_pipeline_never_publishes():
+    """Негативный контроль (г) из п.23 требований: видео с ПОЛНОСТЬЮ
+    закрытым/отсутствующим лицом (камера смотрит в стену, лицо вне кадра)
+    ни на одном окне не должно дать publishable=True — SQI обязан
+    последовательно говорить "не знаю", а не подставлять число из шума
+    интерполяции.
+
+    В отличие от остальных тестов файла, это интеграционный тест ВСЕГО
+    RPPGPipeline (реальный MediaPipe Face Landmarker + модель из models/),
+    а не только сигнального уровня — пропускается, если модель/MediaPipe
+    недоступны в текущей среде, вместо падения всего прогона."""
+    print("\n=== Негативный контроль (г): лицо отсутствует в кадре -> publishable никогда не True ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    cfg = PipelineConfig()
+    try:
+        pipe = RPPGPipeline(cfg)
+    except FileNotFoundError as exc:
+        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+        return
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+        return
+
+    try:
+        blank_frame = np.zeros((240, 320, 3), dtype=np.uint8)  # чёрный кадр -> лицо никогда не найдено
+        got_any_result = False
+        for i in range(200):  # ~6.7с при 30fps -> покрывает минимум одно BPM-окно
+            timestamp_ms = int(i * 1000 / 30)
+            result = pipe.process_frame(blank_frame, timestamp_ms)
+            if result is None:
+                continue
+            got_any_result = True
+            assert not result.publishable, (
+                f"кадр без лица в кадре дал publishable=True (bpm={result.bpm}, "
+                f"sqi={result.sqi_score:.3f})"
+            )
+    finally:
+        pipe.close()
+
+    assert got_any_result, (
+        "sanity: пайплайн должен вернуть хотя бы один PTSDPulseFeatures "
+        "(пусть и с publishable=False) за 200 кадров окна >= min_seconds_before_estimate"
+    )
+    print("  [OK] за 200 кадров без лица в кадре publishable не стал True ни разу")
 
 
 def test_subsample_peak_refinement_reduces_rmssd_quantization_error():
@@ -416,6 +643,12 @@ def run_all():
         test_detrend_removes_slow_trend,
         test_hrv_features_match_known_ibi_statistics,
         test_white_noise_is_not_publishable,
+        test_landmark_stability_penalizes_strong_uniform_sway,
+        test_temporal_consistency_penalizes_unstable_bpm_sequence,
+        test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion,
+        test_illumination_flicker_detected_via_background_roi,
+        test_static_photo_or_mannequin_is_not_publishable,
+        test_occluded_face_pipeline_never_publishes,
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,
         test_ectopic_masking_does_not_stitch_false_diff,
         test_hrv_artifact_fraction_gates_publishable,
