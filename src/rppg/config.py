@@ -24,6 +24,12 @@ class ExtractionMethod(str, Enum):
     PCA = "pca"
     ICA = "ica"
     HEAD_MOTION = "head_motion"
+    # Адаптация к разным камерам/освещению: КАЖДОЕ окно оценивает все 5
+    # цветовых методов выше по SNR и использует победителя (см.
+    # RPPGPipeline._select_auto_method в pipeline.py). Разные камеры/условия
+    # объективно благоприятствуют разным классическим методам — единого
+    # метода, лучшего всегда и везде, в rPPG-литературе нет.
+    AUTO = "auto"
 
 
 class FrequencyMethod(str, Enum):
@@ -242,6 +248,47 @@ class FusionConfig:
 
 
 @dataclass
+class BestEffortConfig:
+    """Всегда доступный, сглаженный BPM — ДОПОЛНИТЕЛЬНЫЙ к валидированной
+    паре bpm/publishable, а не замена ей (см. PTSDPulseFeatures.best_effort_bpm,
+    pipeline.py::RPPGPipeline._update_best_effort_bpm).
+
+    Назначение: этот модуль иногда интегрируется как ОДНА ИЗ ФИЧЕЙ более
+    крупной системы, которая сама не ставит диагнозов по этому конкретному
+    признаку и которой нужно значение НА КАЖДОМ шаге, а не иногда "нет
+    данных" — там, где для основной научной/клинической части пайплайна
+    принцип "лучше промолчать, чем соврать" (SQI-гейтинг, п.19-30) верен, в
+    таком интеграционном сценарии отсутствие значения — сама по себе
+    проблема (ошибка в принимающей системе), а не более безопасный исход.
+
+    best_effort_bpm НИКОГДА не NaN и не выходит за [min_plausible_bpm,
+    max_plausible_bpm]: сырые оценки вне диапазона (типичный симптом
+    слабого/шумного сигнала — октавные ошибки, гармоники, случайный пик)
+    ПОЛНОСТЬЮ игнорируются, а не сглаживаются вместе с валидными — иначе
+    даже один выброс вроде 150 при обычно 55-120 утащил бы среднее.
+    Изменение между соседними шагами дополнительно ограничено
+    max_change_per_step_bpm (slew-rate limiting) — реальный пульс физически
+    не прыгает на десятки ударов за 1с (WindowConfig.step_seconds), поэтому
+    это не искажение сигнала, а подавление именно нефизиологичных скачков.
+    """
+
+    enabled: bool = True
+    # Диапазон под ВАШИ условия использования — НЕ универсальная
+    # физиологическая константа (в общем случае взрослый пульс в покое
+    # 40-100, при нагрузке/стрессе выше). Значения по умолчанию — то, что
+    # реально наблюдалось в задаче интеграции, для которой добавлена эта
+    # фича; при другом сценарии применения переопределите под свой случай.
+    min_plausible_bpm: float = 55.0
+    max_plausible_bpm: float = 120.0
+    # Максимальное изменение best_effort_bpm за один шаг WindowConfig.step_seconds.
+    max_change_per_step_bpm: float = 5.0
+    # Значение до самой первой правдоподобной сырой оценки (типичный
+    # средний взрослый пульс покоя) — чтобы "всегда доступный BPM" был
+    # доступен буквально с первого шага, а не только после прогрева окна.
+    fallback_bpm: float = 75.0
+
+
+@dataclass
 class PipelineConfig:
     """Верхнеуровневая конфигурация — то, что передаётся в RPPGPipeline."""
 
@@ -253,6 +300,7 @@ class PipelineConfig:
     hrv: HRVConfig = field(default_factory=HRVConfig)
     accel: AccelerationConfig = field(default_factory=AccelerationConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    best_effort: BestEffortConfig = field(default_factory=BestEffortConfig)
     method: ExtractionMethod = ExtractionMethod.POS
     frequency_method: FrequencyMethod = FrequencyMethod.WELCH
 

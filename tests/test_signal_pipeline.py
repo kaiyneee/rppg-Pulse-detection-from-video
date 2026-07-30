@@ -791,6 +791,185 @@ def test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video():
     assert err < 5.0, f"сквозная оценка BPM должна быть близка к истинной (получено {err:.2f} BPM ошибки)"
 
 
+def test_auto_method_selection_avoids_specifically_corrupted_method():
+    """Регрессия для запроса пользователя "адаптировать код под разные
+    камеры (лучше и хуже)": ExtractionMethod.AUTO должен КАЖДОЕ окно
+    заново оценивать все 5 цветовых методов по SNR и не залипать на одном
+    методе, если он плохо подходит под текущие условия.
+
+    Конструируем сценарий, где ИМЕННО зелёный канал сильно зашумлён
+    (частая ситуация на некоторых камерах/условиях освещения — разные
+    сенсоры по-разному распределяют шум/усиление по каналам), а остальные
+    методы (комбинирующие все 3 канала — CHROM/POS/PCA/ICA) остаются
+    рабочими. GREEN-метод использует ИСКЛЮЧИТЕЛЬНО зелёный канал (см.
+    methods.GreenMethod.extract), поэтому AUTO обязан НИКОГДА не выбрать
+    его в этом сценарии — иначе адаптация к камере не работает."""
+    print("\n=== Тест: AUTO-выбор метода избегает специально испорченного канала ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig, ExtractionMethod
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    cfg = PipelineConfig(method=ExtractionMethod.AUTO)
+    try:
+        pipe = RPPGPipeline(cfg)
+    except FileNotFoundError as exc:
+        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+        return
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+        return
+
+    def make_frame_green_corrupted(t_sec, true_bpm, rng, h=240, w=320):
+        frame = np.full((h, w, 3), (90, 70, 60), dtype=np.uint8)
+        f_hz = true_bpm / 60.0
+        pulse = np.sin(2 * np.pi * f_hz * t_sec)
+        base_bgr = np.array([40.0, 60.0, 100.0])
+        channel_amp = np.array([9.0, 15.0, 5.0])
+        noise = rng.normal(0, 1.5, 3)
+        noise[1] += rng.normal(0, 40.0)  # BGR-индекс 1 = зелёный -> мощный шум ТОЛЬКО там
+        color = np.clip(base_bgr + channel_amp * pulse + noise, 0, 255).astype(np.uint8)
+        cy, cx = h // 2, w // 2
+        ry, rx = int(0.25 * h), int(0.18 * w)
+        yy, xx = np.ogrid[:h, :w]
+        frame[((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0] = color
+        return frame
+
+    landmarks = _make_synthetic_landmarks_for_pipeline_test()
+    synthetic_result = FaceFrameResult(
+        detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+    )
+    pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+
+    rng = np.random.default_rng(7)
+    fps = 30.0
+    n_frames = int(fps * 20.0)
+    results = []
+    try:
+        for i in range(n_frames):
+            t_sec = i / fps
+            frame = make_frame_green_corrupted(t_sec, 78.0, rng)
+            result = pipe.process_frame(frame, int(t_sec * 1000))
+            if result is not None:
+                results.append(result)
+    finally:
+        pipe.close()
+
+    assert results, "должна быть хотя бы одна оценка за 20с видео"
+    methods_used = {r.method_used for r in results}
+    print(f"  методы, выбранные AUTO по ходу сессии: {methods_used}")
+    assert all(m.startswith("auto:") for m in methods_used), "method_used должен быть помечен как auto:<метод>"
+    assert not any("green" in m for m in methods_used), (
+        "AUTO не должен выбирать метод, использующий исключительно испорченный зелёный канал"
+    )
+
+
+def test_best_effort_bpm_always_present_bounded_and_rate_limited():
+    """Регрессия для интеграционного требования: этот модуль встраивается
+    как одна из фич более крупной системы, которой на каждом шаге нужно
+    ЗНАЧЕНИЕ (не отсутствие данных) — PTSDPulseFeatures.best_effort_bpm
+    должен ВСЕГДА быть реальным числом в правдоподобном диапазоне
+    (BestEffortConfig) и меняться постепенно (slew-rate limiting), а не
+    прыгать как 'сырой' bpm до SQI-гейтинга."""
+    print("\n=== Тест: best_effort_bpm всегда доступен, в диапазоне, ограничен по скорости ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    cfg = PipelineConfig()
+    try:
+        pipe = RPPGPipeline(cfg)
+    except FileNotFoundError as exc:
+        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+        return
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+        return
+
+    try:
+        be_cfg = cfg.best_effort
+        assert pipe._best_effort_bpm == be_cfg.fallback_bpm, "до первого шага должен быть fallback_bpm"
+
+        v0 = pipe._update_best_effort_bpm(float("nan"))
+        assert v0 == be_cfg.fallback_bpm, "NaN-кандидат (нет сигнала) должен держать прежнее значение"
+
+        v1 = pipe._update_best_effort_bpm(150.0)  # типичный шумовой выброс из живой отладки
+        assert be_cfg.min_plausible_bpm <= v1 <= be_cfg.max_plausible_bpm
+        assert v1 == v0, "кандидат ВЫШЕ диапазона должен игнорироваться целиком, не сдвигать значение вообще"
+
+        v2 = pipe._update_best_effort_bpm(20.0)
+        assert v2 == v1, "кандидат НИЖЕ диапазона тоже должен игнорироваться целиком"
+
+        target = be_cfg.fallback_bpm + 20.0
+        assert be_cfg.min_plausible_bpm <= target <= be_cfg.max_plausible_bpm
+        v3 = pipe._update_best_effort_bpm(target)
+        change = abs(v3 - v2)
+        print(f"  один шаг к правдоподобной цели {target}: {v2:.1f} -> {v3:.1f} (Δ={change:.1f})")
+        assert 0 < change <= be_cfg.max_change_per_step_bpm + 1e-9, (
+            "правдоподобный кандидат должен сдвигать значение, но не больше max_change_per_step_bpm за шаг"
+        )
+
+        v_final = v3
+        for _ in range(50):
+            v_final = pipe._update_best_effort_bpm(target)
+        assert abs(v_final - target) < 1e-6, "после достаточного числа шагов значение должно сойтись к цели"
+        assert not np.isnan(v_final), "best_effort_bpm не должен становиться NaN ни на одном шаге"
+    finally:
+        pipe.close()
+
+
+def test_best_effort_bpm_stays_smooth_under_50_150_noise_pattern():
+    """Регрессия для реального инцидента с камерой пользователя: 'сырой'
+    per-window bpm скакал между ~50 и ~150+ из-за расхождения ROI на
+    слабом сигнале (см. живую отладочную сессию). best_effort_bpm должен
+    оставаться плавным под ТОЧНО ТАКИМ ЖЕ паттерном входа — иначе шум
+    всё равно доходит до принимающей системы, просто под другим именем поля."""
+    print("\n=== Тест: best_effort_bpm гасит паттерн 50<->150 из реальной сессии ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    cfg = PipelineConfig()
+    try:
+        pipe = RPPGPipeline(cfg)
+    except FileNotFoundError as exc:
+        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+        return
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+        return
+
+    try:
+        # Реальный наблюдавшийся паттерн per_roi_bpm (forehead/left_cheek/right_cheek
+        # чередующиеся победители в best_roi) из живой отладочной сессии.
+        raw_sequence = [101.0, 49.8, 74.8, 100.6, 50.7, 77.0, 66.0, 79.1, 176.7, 78.7, 126.4, 178.0, 50.3]
+        outputs = [pipe._update_best_effort_bpm(v) for v in raw_sequence]
+        print("  сырые входы:     ", [round(v, 1) for v in raw_sequence])
+        print("  best_effort_bpm: ", [round(v, 1) for v in outputs])
+
+        be_cfg = cfg.best_effort
+        assert all(be_cfg.min_plausible_bpm <= v <= be_cfg.max_plausible_bpm for v in outputs), (
+            "best_effort_bpm не должен покидать правдоподобный диапазон ни разу"
+        )
+        step_changes = [abs(b - a) for a, b in zip(outputs, outputs[1:])]
+        print(f"  максимальное изменение за шаг: {max(step_changes):.2f} (лимит {be_cfg.max_change_per_step_bpm})")
+        assert max(step_changes) <= be_cfg.max_change_per_step_bpm + 1e-9, (
+            "ни один шаг не должен превышать max_change_per_step_bpm"
+        )
+        assert not any(np.isnan(v) for v in outputs)
+    finally:
+        pipe.close()
+
+
 def test_config_yaml_json_roundtrip_preserves_non_default_values():
     """Регрессия для п.42 требований: save_config/load_config должны точно
     восстанавливать PipelineConfig, включая НЕстандартные значения (Enum-
@@ -1065,6 +1244,9 @@ def run_all():
         test_static_photo_or_mannequin_is_not_publishable,
         test_occluded_face_pipeline_never_publishes,
         test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video,
+        test_auto_method_selection_avoids_specifically_corrupted_method,
+        test_best_effort_bpm_always_present_bounded_and_rate_limited,
+        test_best_effort_bpm_stays_smooth_under_50_150_noise_pattern,
         test_config_yaml_json_roundtrip_preserves_non_default_values,
         test_structured_window_logger_writes_valid_jsonl_with_sqi_components,
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,

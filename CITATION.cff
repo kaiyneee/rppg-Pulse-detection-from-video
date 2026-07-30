@@ -5,7 +5,6 @@ type: software
 authors:
   - name: "kaiyneee"
 repository-code: "https://github.com/kaiyneee/rppg-Pulse-detection-from-video"
-license: MIT
 abstract: >
   A modular remote-photoplethysmography (rPPG) pipeline (MediaPipe Face
   Landmarker + 6 signal-extraction methods + SQI-gated quality control +

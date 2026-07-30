@@ -34,6 +34,7 @@ from rppg.config import (
     HRVConfig,
     AccelerationConfig,
     FusionConfig,
+    BestEffortConfig,
     ExtractionMethod,
     FrequencyMethod,
     ROIName,
@@ -44,7 +45,7 @@ def config_to_dict(config: PipelineConfig) -> dict:
     """PipelineConfig -> обычный dict, пригодный для YAML/JSON.
 
     dataclasses.asdict() уже рекурсивно разворачивает ВСЕ вложенные
-    dataclass'ы (face/roi/filt/window/quality/hrv/accel/fusion) в dict —
+    dataclass'ы (face/roi/filt/window/quality/hrv/accel/fusion/best_effort) в dict —
     единственное, что asdict НЕ трогает, это значения Enum (оставляет сам
     Enum-объект внутри словаря, что YAML/JSON сериализовать не умеют),
     поэтому три Enum-поля (method, frequency_method, roi.enabled_rois)
@@ -84,6 +85,7 @@ def config_from_dict(data: dict) -> PipelineConfig:
         hrv=_section(data, "hrv", HRVConfig),
         accel=_section(data, "accel", AccelerationConfig),
         fusion=_section(data, "fusion", FusionConfig),
+        best_effort=_section(data, "best_effort", BestEffortConfig),
     )
     if "method" in data:
         kwargs["method"] = ExtractionMethod(data["method"])

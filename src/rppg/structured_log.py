@@ -43,6 +43,11 @@ class WindowLogRecord:
     sqi_harmonic_score: float
     sqi_flicker_suspected: bool
     respiration_rate_bpm: float | None
+    # Всегда реальное число (никогда NaN) — см. BestEffortConfig в config.py
+    # и RPPGPipeline._update_best_effort_bpm. НЕ то же самое, что bpm/
+    # publishable выше: предназначено для интеграции как soft-фичи в
+    # более крупную систему, не для научного/клинического использования.
+    best_effort_bpm: float
     warnings: list[str] = field(default_factory=list)
 
     def to_json_line(self) -> str:

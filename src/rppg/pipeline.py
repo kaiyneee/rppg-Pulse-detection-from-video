@@ -79,6 +79,15 @@ class PTSDPulseFeatures:
     # требований) — считается на КАЖДОМ BPM-шаге (в отличие от hrv, который
     # копится и публикуется намного реже, см. HRVConfig).
     respiration_rate_bpm: float | None = None
+    # ВСЕГДА реальное число (никогда NaN), зажатое в
+    # [BestEffortConfig.min_plausible_bpm, max_plausible_bpm] и ограниченное
+    # по скорости изменения — см. RPPGPipeline._update_best_effort_bpm и
+    # docstring BestEffortConfig в config.py. НЕ валидированное измерение:
+    # предназначено для встраивания как ОДНОЙ ИЗ ФИЧЕЙ в более крупную
+    # систему, которой нужно значение на каждом шаге и которая сама не
+    # ставит диагнозов по этому конкретному признаку. Для научной/
+    # клинической части используйте bpm + publishable, а не это поле.
+    best_effort_bpm: float = 0.0
 
 
 class _RingBuffer:
@@ -157,16 +166,38 @@ class RPPGPipeline:
         # PipelineConfig было бы невозможно сделать, не трогая код). kwarg
         # передаётся только методам, которые его принимают (сейчас — только
         # POS; GreenMethod/ChromMethod/... не имеют параметров __init__).
-        method_kwargs = {}
-        if self.cfg.method == ExtractionMethod.POS:
-            method_kwargs["use_numba"] = self.cfg.accel.use_numba
-        self._method = get_method(self.cfg.method.value, **method_kwargs)
+        self._auto_mode = self.cfg.method == ExtractionMethod.AUTO
+        if self._auto_mode:
+            # Адаптация к разным камерам: не фиксируем один метод, а
+            # держим ВСЕ 5 цветовых методов наготове — какой из них
+            # использовать в конкретном окне решает _select_auto_method
+            # (см. _compute_estimate) заново каждое окно по измеренному
+            # SNR. HEAD_MOTION сюда не входит — это отдельная
+            # (motion-based, не цветовая) модальность, за неё отвечает
+            # FusionConfig.include_head_motion, а не AUTO.
+            self._auto_candidate_methods: dict[str, object] = {
+                name: get_method(name, **({"use_numba": self.cfg.accel.use_numba} if name == "pos" else {}))
+                for name in ("green", "chrom", "pos", "pca", "ica")
+            }
+            self._method = self._auto_candidate_methods["pos"]  # дефолт до первого окна
+        else:
+            self._auto_candidate_methods = {}
+            method_kwargs = {}
+            if self.cfg.method == ExtractionMethod.POS:
+                method_kwargs["use_numba"] = self.cfg.accel.use_numba
+            self._method = get_method(self.cfg.method.value, **method_kwargs)
 
         # п.20: история BPM лучшего ROI по последним оценкам (перекрывающиеся
         # окна) — для temporal_consistency_score. maxlen соответствует
         # нескольким window.step_seconds шагам назад; не привязана к
         # window.window_seconds, т.к. это отдельная, более короткая шкала.
         self._recent_bpm_history: deque = deque(maxlen=6)
+
+        # Состояние всегда-доступного сглаженного BPM (см. BestEffortConfig,
+        # PTSDPulseFeatures.best_effort_bpm) — стартует с fallback_bpm, чтобы
+        # значение было доступно буквально с первого шага, а не только
+        # после прогрева окна.
+        self._best_effort_bpm: float = self.cfg.best_effort.fallback_bpm
 
         # Накопитель IBI для HRV — ОТДЕЛЬНЫЙ от скользящего BPM-окна (см.
         # HRVConfig и hrv/features.py, п.14 требований): пополняется
@@ -286,6 +317,94 @@ class RPPGPipeline:
         ls_signal = trend_removed[valid_mask]
         ls_timestamps = timestamps_sec[valid_mask]
         return estimate_hr(ls_signal, fps, band, method="lomb_scargle", timestamps_sec=ls_timestamps).bpm
+
+    def _update_best_effort_bpm(self, candidate_bpm: float) -> float:
+        """Обновляет и возвращает всегда-доступный сглаженный BPM (см.
+        BestEffortConfig, PTSDPulseFeatures.best_effort_bpm) — вызывается
+        КАЖДЫЙ шаг, независимо от publishable/наличия сигнала.
+
+        Правило (сознательно простое и объяснимое, а не ML-сглаживание):
+        1) candidate_bpm ИГНОРИРУЕТСЯ целиком, если он NaN или вне
+           [min_plausible_bpm, max_plausible_bpm] — сырые оценки вне
+           диапазона обычно и есть источник нефизиологичного шума (октавные
+           ошибки, гармоники, случайный пик), включать их в сглаживание
+           значило бы протаскивать именно ту проблему, которую эта фича
+           должна скрыть от принимающей системы.
+        2) Даже ПРИНЯТЫЙ кандидат не заменяет текущее значение мгновенно —
+           изменение ограничено max_change_per_step_bpm за шаг
+           (WindowConfig.step_seconds), т.к. реальный пульс физически не
+           меняется на десятки ударов за секунду; отсюда "определённая
+           небольшая периодичность" в изменении выдаваемого значения.
+        3) Если кандидат отвергнут — best_effort_bpm остаётся как был
+           (holds last value), а не откатывается к fallback_bpm: fallback
+           нужен только для самого первого шага, до которого вообще не
+           было ни одной валидной оценки.
+        """
+        cfg = self.cfg.best_effort
+        if not np.isnan(candidate_bpm) and cfg.min_plausible_bpm <= candidate_bpm <= cfg.max_plausible_bpm:
+            target = candidate_bpm
+        else:
+            target = self._best_effort_bpm
+
+        delta = float(np.clip(target - self._best_effort_bpm, -cfg.max_change_per_step_bpm, cfg.max_change_per_step_bpm))
+        self._best_effort_bpm += delta
+        return self._best_effort_bpm
+
+    def _select_auto_method(self, fps: float, band: tuple[float, float]):
+        """method=AUTO: оценивает КАЖДЫЙ из 5 цветовых методов по среднему
+        spectral SNR, который он даёт на ВСЕХ включённых ROI ЭТОГО окна, и
+        возвращает метод-победитель для использования во ВСЁМ окне целиком.
+
+        Один метод на всё окно (а НЕ по отдельности на каждый ROI) —
+        осознанное решение: если бы разные ROI обрабатывались разными
+        методами, систематические межметодные различия (разный частотный/
+        фазовый отклик POS vs CHROM vs PCA) подмешивались бы в
+        cross_roi_agreement наравне с реальным шумом и портили бы этот
+        компонент SQI, а не только собственно решали задачу выбора метода.
+
+        Разные камеры/условия освещения объективно благоприятствуют разным
+        классическим методам (нет единого метода, лучшего всегда и везде —
+        см. CITATION.cff) — этот механизм подбирает метод под ТЕКУЩУЮ
+        камеру автоматически, а не требует от пользователя вручную угадывать
+        --method под своё конкретное железо.
+
+        Стоимость: до 5x compute стадии "метод + препроцессинг + SNR"
+        относительно фиксированного метода — по замерам
+        scripts/benchmark_performance.py это <2мс на ROI даже для самого
+        дорогого метода (ICA), т.е. пренебрежимо на фоне бюджета в 1с
+        между BPM-шагами (WindowConfig.step_seconds)."""
+        best_name, best_score = None, -np.inf
+        for name, method in self._auto_candidate_methods.items():
+            total_snr, n = 0.0, 0
+            for roi in self.cfg.roi.enabled_rois:
+                raw = np.array(self._buf.rgb_by_roi[roi.value])
+                valid_mask = np.array(self._buf.valid_by_roi[roi.value], dtype=bool)
+                if not is_gap_acceptable(valid_mask):
+                    continue
+                rgb = np.stack([fill_gaps(raw[:, ch], valid_mask) for ch in range(3)], axis=1)
+                window = SignalWindow(rgb_traces={roi.value: rgb}, fps=fps, valid_mask=valid_mask, hr_band_hz=band)
+                try:
+                    raw_signal = method.extract(window, roi.value)
+                except Exception:  # noqa: BLE001 - этот метод просто не участвует в голосовании
+                    continue
+                processed = preprocess_signal(
+                    raw_signal, fps, band[0], band[1],
+                    order=self.cfg.filt.filter_order, detrend_method=self.cfg.filt.detrend_method,
+                    tarvainen_lambda=self.cfg.filt.tarvainen_lambda, normalize_method=self.cfg.filt.normalize_method,
+                )
+                _, snr_db = dominant_frequency_and_snr(processed, fps, band)
+                total_snr += snr_db
+                n += 1
+            score = (total_snr / n) if n else -np.inf
+            if score > best_score:
+                best_name, best_score = name, score
+
+        if best_name is None:
+            # Ни один метод не дал сигнала ни на одном ROI — оставляем
+            # текущий self._method как есть; ниже по _compute_estimate
+            # сработает обычная ветка "нет валидного сигнала ни с одного ROI".
+            return self._method
+        return self._auto_candidate_methods[best_name]
 
     def _estimate_color_roi(
         self,
@@ -571,6 +690,13 @@ class RPPGPipeline:
         timestamps_sec = np.array(self._buf.timestamps_ms, dtype=float) / 1000.0
         landmark_traj = np.array(self._buf.landmark_traj)
 
+        if self._auto_mode:
+            # Выбираем метод-победитель ДО всего остального — все
+            # последующие self._method.name-зависимые ветки (head_motion
+            # проверка ниже, fusion в _compute_fusion) должны видеть уже
+            # актуальный для этого окна метод.
+            self._method = self._select_auto_method(fps, band)
+
         per_roi_bpm: dict[str, float] = {}
         per_roi_signal: dict[str, np.ndarray] = {}
         per_roi_raw_signal: dict[str, np.ndarray] = {}
@@ -590,26 +716,30 @@ class RPPGPipeline:
 
         if not per_roi_signal:
             no_signal_warnings = warnings + ["Ни один ROI не дал валидного сигнала в этом окне."]
+            no_signal_method = f"auto:{self._method.name}" if self._auto_mode else self._method.name
+            best_effort_bpm = self._update_best_effort_bpm(float("nan"))
             if self._window_logger is not None:
                 # Тоже логируем (п.43) — "окно без сигнала" такой же
                 # материал для анализа failure cases, как и низкий SQI.
                 self._window_logger.log(WindowLogRecord(
                     timestamp_ms=timestamp_ms, bpm=float("nan"), per_roi_bpm=dict(per_roi_bpm),
-                    publishable=False, method_used=self._method.name,
+                    publishable=False, method_used=no_signal_method,
                     frequency_method_used=self.cfg.frequency_method.value,
                     sqi_overall_score=0.0, sqi_level="low",
                     sqi_spectral_snr_db=float("-inf"), sqi_cross_roi_agreement=0.0,
                     sqi_landmark_stability=0.0, sqi_temporal_consistency=0.0,
                     sqi_harmonic_score=0.0, sqi_flicker_suspected=False,
                     respiration_rate_bpm=None, warnings=no_signal_warnings,
+                    best_effort_bpm=best_effort_bpm,
                 ))
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
                 sqi_score=0.0, sqi_level="low", publishable=False,
                 warnings=no_signal_warnings,
-                method_used=self._method.name,
+                method_used=no_signal_method,
                 frequency_method_used=self.cfg.frequency_method.value,
                 per_roi_bpm=per_roi_bpm,
+                best_effort_bpm=best_effort_bpm,
             )
 
         if self.cfg.fusion.enabled:
@@ -670,11 +800,17 @@ class RPPGPipeline:
 
         respiration_rate_bpm, _ = estimate_respiration_rate(best_signal, fps)
 
-        method_used = self._method.name
+        method_used = f"auto:{self._method.name}" if self._auto_mode else self._method.name
         if self.cfg.fusion.enabled:
             method_used = f"fusion({self._method.name}+head_motion)" if best_roi == "fusion" else best_roi
 
         all_warnings = warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else [])
+
+        # Обновляется ВСЕГДА, независимо от sqi.is_reliable — сама функция
+        # уже отбрасывает неправдоподобные (вне диапазона) значения, так
+        # что пропускать неопубликованные окна целиком не нужно: это просто
+        # уменьшило бы доступность best_effort_bpm без дополнительной пользы.
+        best_effort_bpm = self._update_best_effort_bpm(current_bpm)
 
         if self._window_logger is not None:
             # п.43: полная разбивка SQI по компонентам (не только overall_score)
@@ -698,6 +834,7 @@ class RPPGPipeline:
                 sqi_flicker_suspected=sqi.flicker_suspected,
                 respiration_rate_bpm=respiration_rate_bpm,
                 warnings=list(all_warnings),
+                best_effort_bpm=best_effort_bpm,
             ))
 
         return PTSDPulseFeatures(
@@ -712,4 +849,5 @@ class RPPGPipeline:
             frequency_method_used=self.cfg.frequency_method.value,
             per_roi_bpm=per_roi_bpm,
             respiration_rate_bpm=respiration_rate_bpm,
+            best_effort_bpm=best_effort_bpm,
         )
