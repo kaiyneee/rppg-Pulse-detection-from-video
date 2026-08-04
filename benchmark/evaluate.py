@@ -627,30 +627,56 @@ class UBFCrPPGLoader(DatasetLoader):
 
 @dataclass
 class DatasetEvaluationResult:
-    """Результат DatasetEvaluator.run() — намеренно возвращает ОБА варианта
-    агрегации, чтобы контраст между ними был виден в самом коде, а не только
-    в докстрингах (п.28 требований):
+    """Результат DatasetEvaluator.run() — намеренно возвращает ЧЕТЫРЕ отчёта
+    (не один), чтобы ДВА независимых контраста были видны в самом коде, а не
+    только в докстрингах:
 
-    * pooled_report      — псевдореплицированный пулинг всех окон всех людей
-                            (см. предупреждение в EvaluationReport). НЕ
-                            использовать как основную метрику статьи.
-    * subject_report     — корректная агрегация по испытуемым (см.
-                            aggregate_per_subject). Основная метрика.
-    * window_records     — ВСЕ окна (публикуемые и нет, с их sqi_score) —
-                            вход для coverage_vs_error_curve (п.30) и
-                            stratified_report (п.29).
+    (1) пулинг по окнам (псевдореплицировано, п.28) vs агрегация по
+        испытуемым (корректно) — см. EvaluationReport/SubjectAggregateReport;
+    (2) ВСЕ окна (включая отвергнутые SQI) vs ТОЛЬКО publishable=True —
+        задача 3а: "то же самое отдельно для окон с publishable=True". Это
+        ЕДИНСТВЕННЫЙ способ увидеть, реально ли SQI-гейтинг УЛУЧШАЕТ
+        точность на референсных данных, а не просто "выглядит разумно" по
+        своей внутренней конструкции (ту же мысль показывает
+        coverage_vs_error_curve, но для одной конкретной пары точек — "весь
+        диапазон" vs "текущий порог" — это самый прямой, наглядный разрез).
+
+    * all_windows_pooled_report/all_windows_subject_report   — ВСЕ окна
+      (включая publishable=False), т.е. "что выдал бы пайплайн без
+      SQI-гейтинга вообще".
+    * published_pooled_report/published_subject_report       — ТОЛЬКО
+      publishable=True, т.е. "что реально уходит в систему ПТСР сейчас".
+    * window_records — ВСЕ окна (публикуемые и нет, с их sqi_score) — вход
+      для coverage_vs_error_curve (п.30) и stratified_report (п.29).
+
+    Основная метрика статьи — published_subject_report (агрегация по
+    испытуемым, только публикуемые окна); *_pooled_report оставлены только
+    для контраста, см. предупреждение в EvaluationReport.
     """
 
     dataset_name: str
-    pooled_report: EvaluationReport
-    subject_report: SubjectAggregateReport
+    all_windows_pooled_report: EvaluationReport
+    all_windows_subject_report: SubjectAggregateReport
+    published_pooled_report: EvaluationReport
+    published_subject_report: SubjectAggregateReport
     window_records: list[WindowRecord]
 
     def summary(self) -> str:
+        n_total = len(self.window_records)
+        n_published = sum(1 for r in self.window_records if r.publishable)
+        coverage = n_published / n_total if n_total else float("nan")
         return (
-            f"{self.subject_report.summary()}\n"
-            f"  [для контраста, НЕ использовать как основной результат — псевдореплицировано] "
-            f"{self.pooled_report.summary()}"
+            f"=== ВСЕ окна ({n_total}), включая отвергнутые SQI ===\n"
+            f"{self.all_windows_subject_report.summary()}\n"
+            f"  [для контраста, НЕ основной результат — псевдореплицировано] "
+            f"{self.all_windows_pooled_report.summary()}\n"
+            f"=== ТОЛЬКО publishable=True ({n_published}, покрытие {coverage * 100:.1f}%) ===\n"
+            f"{self.published_subject_report.summary()}\n"
+            f"  [для контраста, НЕ основной результат — псевдореплицировано] "
+            f"{self.published_pooled_report.summary()}\n"
+            f"=== Итог: SQI-гейтинг {'СНИЖАЕТ' if self.published_subject_report.mae_mean < self.all_windows_subject_report.mae_mean else 'НЕ снижает'} "
+            f"MAE ({self.all_windows_subject_report.mae_mean:.2f} -> {self.published_subject_report.mae_mean:.2f} BPM) "
+            f"ценой покрытия ({coverage * 100:.1f}% окон остаются) ==="
         )
 
 
@@ -667,7 +693,8 @@ class DatasetEvaluator:
         evaluator = DatasetEvaluator(loader, PipelineConfig())
         result = evaluator.run(Path("/data/UBFC-rPPG/DATASET_2"))
         print(result.summary())
-        plot_bland_altman(result.pooled_report.bland_altman, "ubfc_bland_altman.png")
+        plot_bland_altman(result.all_windows_pooled_report.bland_altman, "ubfc_bland_altman_all.png")
+        plot_bland_altman(result.published_pooled_report.bland_altman, "ubfc_bland_altman_published.png")
 
         curve = coverage_vs_error_curve(result.window_records, dataset_name=loader.name)
         plot_coverage_vs_error(curve, "ubfc_coverage_vs_error.png")
@@ -676,6 +703,12 @@ class DatasetEvaluator:
         # в GroundTruthSample.metadata, например через benchmark/skin_tone.py.
         metadata_by_subject = {s.subject_id: s.metadata for s in loader.list_samples(root)}
         by_skin_tone = stratified_report(result.window_records, metadata_by_subject, "skin_tone")
+
+    Тот же прогон доступен из командной строки (см. `if __name__` внизу
+    файла), без необходимости писать этот код руками:
+
+        python3 benchmark/evaluate.py --dataset ubfc-rppg --root /data/UBFC-rPPG/DATASET_2 \\
+            --model models/face_landmarker.task --out-dir results/ubfc_run1
     """
 
     def __init__(self, loader: DatasetLoader, pipeline_config):
@@ -731,24 +764,109 @@ class DatasetEvaluator:
         published = [r for r in window_records if r.publishable]
         metadata_by_subject = {s.subject_id: s.metadata for s in samples}
 
-        pooled_report = evaluate(
+        # Задача 3а: считаем ОБА разреза — все окна и только publishable —
+        # чтобы вклад SQI-гейтинга был виден как измеримое сравнение чисел,
+        # а не как утверждение "кажется, стало лучше".
+        all_windows_pooled_report = evaluate(
+            np.array([r.true_bpm for r in window_records]),
+            np.array([r.pred_bpm for r in window_records]),
+            dataset_name=f"{self.loader.name} (все окна)",
+        )
+        all_windows_subject_report = aggregate_per_subject(
+            window_records, dataset_name=f"{self.loader.name} (все окна)", metadata_by_subject=metadata_by_subject
+        )
+        published_pooled_report = evaluate(
             np.array([r.true_bpm for r in published]),
             np.array([r.pred_bpm for r in published]),
-            dataset_name=self.loader.name,
+            dataset_name=f"{self.loader.name} (publishable=True)",
         )
-        subject_report = aggregate_per_subject(
-            published, dataset_name=self.loader.name, metadata_by_subject=metadata_by_subject
+        published_subject_report = aggregate_per_subject(
+            published, dataset_name=f"{self.loader.name} (publishable=True)", metadata_by_subject=metadata_by_subject
         )
 
         return DatasetEvaluationResult(
             dataset_name=self.loader.name,
-            pooled_report=pooled_report,
-            subject_report=subject_report,
+            all_windows_pooled_report=all_windows_pooled_report,
+            all_windows_subject_report=all_windows_subject_report,
+            published_pooled_report=published_pooled_report,
+            published_subject_report=published_subject_report,
             window_records=window_records,
         )
 
 
-if __name__ == "__main__":
-    import doctest
+def _run_cli() -> None:
+    """CLI-обёртка над DatasetEvaluator (задача 3а): скачать сам датасет
+    нужно самостоятельно (UBFC-rPPG распространяется по data use agreement,
+    см. честную оговорку вверху этого файла — в среде разработки нет ни
+    сети, ни доступа к датасету), но прогнать пайплайн, посчитать
+    MAE/RMSE/Pearson/CCC/Bland-Altman ОТДЕЛЬНО по всем окнам и отдельно по
+    publishable=True, и сохранить графики — можно одной командой:
 
-    doctest.testmod(verbose=True)
+        python3 benchmark/evaluate.py --dataset ubfc-rppg \\
+            --root /data/UBFC-rPPG/DATASET_2 --out-dir results/ubfc_run1
+
+    Без --root запускает doctest-примеры метрик (старое поведение модуля,
+    полностью рабочее без всякого датасета) — см. `python3 -m doctest`.
+    """
+    import argparse
+    import sys as _sys
+
+    parser = argparse.ArgumentParser(
+        description="Прогон RPPGPipeline на датасете с ground truth (задача 3а) "
+                     "и подсчёт MAE/RMSE/Pearson/CCC/Bland-Altman — отдельно по ВСЕМ окнам "
+                     "и отдельно по publishable=True.",
+    )
+    parser.add_argument("--dataset", type=str, default="ubfc-rppg", choices=["ubfc-rppg"],
+                         help="Какой загрузчик использовать (сейчас реализован только UBFC-rPPG DATASET_2).")
+    parser.add_argument("--root", type=str, default=None,
+                         help="Путь к корню датасета (например, .../UBFC-rPPG/DATASET_2). "
+                              "Без этого флага запускаются только doctest-примеры метрик.")
+    parser.add_argument("--model", type=str, default="models/face_landmarker.task",
+                         help="Путь к модели Face Landmarker (см. src/rppg/face/landmarker.py).")
+    parser.add_argument("--config", type=str, default=None, help="Базовый YAML/JSON PipelineConfig.")
+    parser.add_argument("--max-subjects", type=int, default=None, help="Ограничить число испытуемых (для быстрой проверки).")
+    parser.add_argument("--out-dir", type=str, default="benchmark_results", help="Куда сохранить графики.")
+    args = parser.parse_args()
+
+    if args.root is None:
+        import doctest
+        print("--root не задан: запускаю только doctest-примеры метрик (без реального датасета).\n")
+        results = doctest.testmod(verbose=True)
+        _sys.exit(1 if results.failed else 0)
+
+    from rppg.config_io import load_config
+    from rppg.config import PipelineConfig
+
+    config = load_config(args.config) if args.config else PipelineConfig()
+    config.face.model_asset_path = args.model
+
+    loaders = {"ubfc-rppg": UBFCrPPGLoader}
+    loader = loaders[args.dataset]()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Загружаю сэмплы {loader.name} из {args.root} ...")
+    evaluator = DatasetEvaluator(loader, config)
+    result = evaluator.run(Path(args.root), max_subjects=args.max_subjects)
+
+    print()
+    print(result.summary())
+
+    plot_bland_altman(
+        result.all_windows_pooled_report.bland_altman, str(out_dir / "bland_altman_all_windows.png"),
+        title=f"{loader.name}: Bland-Altman, все окна",
+    )
+    plot_bland_altman(
+        result.published_pooled_report.bland_altman, str(out_dir / "bland_altman_published.png"),
+        title=f"{loader.name}: Bland-Altman, только publishable=True",
+    )
+    curve = coverage_vs_error_curve(result.window_records, dataset_name=loader.name)
+    plot_coverage_vs_error(curve, str(out_dir / "coverage_vs_error.png"))
+    print(f"\nГрафики сохранены в {out_dir}/")
+    print(f"Кривая покрытие-vs-ошибка монотонна: {curve.is_monotonic_nonincreasing()} "
+          "(см. CoverageErrorCurve.is_monotonic_nonincreasing — задача 30/10)")
+
+
+if __name__ == "__main__":
+    _run_cli()
