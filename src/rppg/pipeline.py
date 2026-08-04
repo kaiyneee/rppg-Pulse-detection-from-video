@@ -43,13 +43,13 @@ from pathlib import Path
 
 import numpy as np
 
-from rppg.config import PipelineConfig, ExtractionMethod
+from rppg.config import PipelineConfig, ExtractionMethod, QualityConfig
 from rppg.face.landmarker import FaceLandmarkerWrapper
-from rppg.face.roi import extract_rois, STABLE_TRACKING_IDX
+from rppg.face.roi import extract_rois, ROIExtractionResult, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
 from rppg.signal.methods import get_method, SignalWindow
 from rppg.signal.frequency import estimate_hr
-from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
+from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, compute_psd, SQIInputs, SQIResult
 from rppg.signal.fusion import fuse_signals_by_sqi, snr_db_to_weight
 from rppg.signal.respiration import estimate_respiration_rate
 from rppg.structured_log import StructuredWindowLogger, WindowLogRecord
@@ -59,6 +59,27 @@ from rppg.hrv.features import (
     extract_hrv_features_from_ibi,
     HRVFeatures,
 )
+
+
+@dataclass
+class DebugInfo:
+    """Данные для отладочного оверлея (scripts/run_webcam.py --debug),
+    п.44 требований: "глядя на экран 10с, видно, какая компонента мешает
+    публикации прямо сейчас, без логов".
+
+    Собирается ТОЛЬКО когда RPPGPipeline создан с debug=True — Welch PSD
+    здесь пересчитывать не нужно (est.assess_quality её уже считает
+    внутри dominant_frequency_and_snr), но ХРАНИТЬ freqs/psd массив на
+    каждый шаг ради оверлея, который никто не смотрит в обычном режиме,
+    было бы неоправданным по памяти для длинных офлайн-прогонов видео."""
+
+    sqi: SQIResult
+    qcfg: QualityConfig
+    band_hz: tuple[float, float]
+    best_source: str
+    peak_freq_hz: float
+    psd_freqs: np.ndarray | None
+    psd_values: np.ndarray | None
 
 
 @dataclass
@@ -79,15 +100,27 @@ class PTSDPulseFeatures:
     # требований) — считается на КАЖДОМ BPM-шаге (в отличие от hrv, который
     # копится и публикуется намного реже, см. HRVConfig).
     respiration_rate_bpm: float | None = None
-    # ВСЕГДА реальное число (никогда NaN), зажатое в
-    # [BestEffortConfig.min_plausible_bpm, max_plausible_bpm] и ограниченное
-    # по скорости изменения — см. RPPGPipeline._update_best_effort_bpm и
-    # docstring BestEffortConfig в config.py. НЕ валидированное измерение:
-    # предназначено для встраивания как ОДНОЙ ИЗ ФИЧЕЙ в более крупную
-    # систему, которой нужно значение на каждом шаге и которая сама не
-    # ставит диагнозов по этому конкретному признаку. Для научной/
-    # клинической части используйте bpm + publishable, а не это поле.
-    best_effort_bpm: float = 0.0
+    # Задача 8, вариант А: раньше здесь было best_effort_bpm — сглаженное
+    # значение, которое ВСЕГДА было реальным числом в правдоподобном
+    # диапазоне, даже при полном отсутствии сигнала (стартовало с
+    # fallback_bpm=75 и медленно "уплывало" на шуме). Проблема не в точности
+    # — это было НЕ измерение, а генератор правдоподобного числа человеческого
+    # пульса по требованию, что на экране/в интеграции неотличимо от
+    # настоящего измерения. См. историю в git log за "best_effort_bpm" и
+    # обсуждение в задаче 8.
+    #
+    # Вместо этого наружу отдаётся ЧЕСТНАЯ пара: последнее РЕАЛЬНО
+    # измеренное (т.е. publishable=True, прошедшее SQI-гейт — см.
+    # _compute_estimate) значение BPM и его возраст в секундах. Оба None,
+    # если ни одного publishable-окна ещё не было. Принимающая система
+    # получает значение на каждом шаге (как и раньше), но решение "не
+    # слишком ли оно устарело" принимает САМА по last_valid_bpm_age_s, а не
+    # получает фальшивое число, замаскированное под непрерывный поток данных.
+    last_valid_bpm: float | None = None
+    last_valid_bpm_age_s: float | None = None
+    # Только при RPPGPipeline(debug=True) — см. DebugInfo. None в обычном
+    # режиме, чтобы не тащить лишние массивы/объекты по умолчанию.
+    debug: DebugInfo | None = None
 
 
 class _RingBuffer:
@@ -135,14 +168,32 @@ class _RingBuffer:
 
 
 class RPPGPipeline:
-    def __init__(self, config: PipelineConfig | None = None, log_path: str | Path | None = None):
+    def __init__(
+        self,
+        config: PipelineConfig | None = None,
+        log_path: str | Path | None = None,
+        debug: bool = False,
+    ):
         """log_path: если задан, каждое оценённое окно дополнительно
         пишется структурированной JSONL-строкой (см. structured_log.py,
         п.43 требований) — timestamp, BPM по каждому ROI, ВСЕ компоненты
         SQI по отдельности, warnings. Опционально: без log_path поведение
-        не отличается от прежнего."""
+        не отличается от прежнего.
+
+        debug: если True, PTSDPulseFeatures.debug и last_roi_result
+        дополнительно заполняются (полный SQIResult, Welch-спектр лучшего
+        источника, landmark-точки текущего кадра) — материал для
+        отладочного оверлея scripts/run_webcam.py --debug (п.44
+        требований). По умолчанию False — эти данные никому не нужны в
+        обычном режиме и стоят лишних вычислений/памяти."""
         self.cfg = config or PipelineConfig()
+        self._debug = debug
         self._window_logger = StructuredWindowLogger(log_path) if log_path is not None else None
+        # Только для --debug оверлея: полный ROIExtractionResult ТЕКУЩЕГО
+        # кадра (landmarks_px и т.п.), чтобы отрисовать контуры ROI на
+        # экране КАЖДЫЙ кадр — независимо от того, готова ли уже
+        # BPM-оценка (см. WindowConfig.step_seconds, она реже кадров).
+        self.last_roi_result: ROIExtractionResult | None = None
         self._landmarker = FaceLandmarkerWrapper(
             model_asset_path=self.cfg.face.model_asset_path,
             num_faces=self.cfg.face.num_faces,
@@ -193,11 +244,19 @@ class RPPGPipeline:
         # window.window_seconds, т.к. это отдельная, более короткая шкала.
         self._recent_bpm_history: deque = deque(maxlen=6)
 
-        # Состояние всегда-доступного сглаженного BPM (см. BestEffortConfig,
-        # PTSDPulseFeatures.best_effort_bpm) — стартует с fallback_bpm, чтобы
-        # значение было доступно буквально с первого шага, а не только
-        # после прогрева окна.
-        self._best_effort_bpm: float = self.cfg.best_effort.fallback_bpm
+        # Задача 8: последнее РЕАЛЬНО измеренное (publishable=True) значение
+        # BPM и время его получения — см. PTSDPulseFeatures.last_valid_bpm/
+        # last_valid_bpm_age_s. Оба None, пока не было ни одного publishable
+        # окна (никакого fallback-числа, в отличие от прежнего best_effort_bpm).
+        self._last_valid_bpm: float | None = None
+        self._last_valid_bpm_timestamp_ms: int | None = None
+
+        # Задача 7: история ОДНОконных candidate-флагов detect_illumination_
+        # flicker с предыдущих окон — требование устойчивости во времени
+        # (см. quality.assess_quality, SQIInputs.recent_flicker_candidates).
+        # maxlen с запасом над QualityConfig.flicker_min_consecutive_windows,
+        # чтобы смена конфига не требовала менять этот buffer.
+        self._recent_flicker_candidates: deque = deque(maxlen=10)
 
         # Накопитель IBI для HRV — ОТДЕЛЬНЫЙ от скользящего BPM-окна (см.
         # HRVConfig и hrv/features.py, п.14 требований): пополняется
@@ -208,6 +267,20 @@ class RPPGPipeline:
         self._last_peak_time_ms: float | None = None
         self._last_hrv_ms: int | None = None
         self._cached_hrv: HRVFeatures | None = None
+
+    @property
+    def buffered_seconds(self) -> float:
+        """Сколько секунд реального времени сейчас накоплено в скользящем
+        окне — п.6 требований (задача 6): с тех пор как
+        min_seconds_before_estimate по умолчанию равен window_seconds,
+        process_frame() возвращает None (без обратной связи) всю
+        буферизацию/прогрев целиком. Это единственный способ для UI
+        (scripts/run_webcam.py) показать прогресс ("буферизация 6.2 / 10.0
+        с") вместо того, чтобы отсутствие числа в первые секунды выглядело
+        как поломка."""
+        if len(self._buf.timestamps_ms) < 2:
+            return 0.0
+        return (self._buf.timestamps_ms[-1] - self._buf.timestamps_ms[0]) / 1000.0
 
     def close(self) -> None:
         self._landmarker.close()
@@ -226,6 +299,8 @@ class RPPGPipeline:
 
         if not face.detected:
             self._push_invalid_frame(timestamp_ms)
+            if self._debug:
+                self.last_roi_result = None
         else:
             roi_result = extract_rois(
                 frame_bgr,
@@ -235,6 +310,8 @@ class RPPGPipeline:
                 min_valid_fraction=self.cfg.roi.min_valid_pixel_fraction,
             )
             self._push_frame(timestamp_ms, roi_result)
+            if self._debug:
+                self.last_roi_result = roi_result
 
         if len(self._buf) < 2:
             return None
@@ -318,37 +395,20 @@ class RPPGPipeline:
         ls_timestamps = timestamps_sec[valid_mask]
         return estimate_hr(ls_signal, fps, band, method="lomb_scargle", timestamps_sec=ls_timestamps).bpm
 
-    def _update_best_effort_bpm(self, candidate_bpm: float) -> float:
-        """Обновляет и возвращает всегда-доступный сглаженный BPM (см.
-        BestEffortConfig, PTSDPulseFeatures.best_effort_bpm) — вызывается
-        КАЖДЫЙ шаг, независимо от publishable/наличия сигнала.
+    def _update_last_valid_bpm(self, timestamp_ms: int, current_bpm: float, is_reliable: bool) -> None:
+        """Задача 8: обновляет last_valid_bpm/age ТОЛЬКО когда окно реально
+        прошло SQI-гейт (is_reliable=True) — в отличие от старого
+        _update_best_effort_bpm, здесь принципиально нет "правдоподобного
+        диапазона" для сырых кандидатов и нет fallback-значения: либо это
+        настоящее измерение, либо состояние не меняется вообще."""
+        if is_reliable and not np.isnan(current_bpm):
+            self._last_valid_bpm = current_bpm
+            self._last_valid_bpm_timestamp_ms = timestamp_ms
 
-        Правило (сознательно простое и объяснимое, а не ML-сглаживание):
-        1) candidate_bpm ИГНОРИРУЕТСЯ целиком, если он NaN или вне
-           [min_plausible_bpm, max_plausible_bpm] — сырые оценки вне
-           диапазона обычно и есть источник нефизиологичного шума (октавные
-           ошибки, гармоники, случайный пик), включать их в сглаживание
-           значило бы протаскивать именно ту проблему, которую эта фича
-           должна скрыть от принимающей системы.
-        2) Даже ПРИНЯТЫЙ кандидат не заменяет текущее значение мгновенно —
-           изменение ограничено max_change_per_step_bpm за шаг
-           (WindowConfig.step_seconds), т.к. реальный пульс физически не
-           меняется на десятки ударов за секунду; отсюда "определённая
-           небольшая периодичность" в изменении выдаваемого значения.
-        3) Если кандидат отвергнут — best_effort_bpm остаётся как был
-           (holds last value), а не откатывается к fallback_bpm: fallback
-           нужен только для самого первого шага, до которого вообще не
-           было ни одной валидной оценки.
-        """
-        cfg = self.cfg.best_effort
-        if not np.isnan(candidate_bpm) and cfg.min_plausible_bpm <= candidate_bpm <= cfg.max_plausible_bpm:
-            target = candidate_bpm
-        else:
-            target = self._best_effort_bpm
-
-        delta = float(np.clip(target - self._best_effort_bpm, -cfg.max_change_per_step_bpm, cfg.max_change_per_step_bpm))
-        self._best_effort_bpm += delta
-        return self._best_effort_bpm
+    def _last_valid_bpm_age_s(self, timestamp_ms: int) -> float | None:
+        if self._last_valid_bpm_timestamp_ms is None:
+            return None
+        return max(0.0, (timestamp_ms - self._last_valid_bpm_timestamp_ms) / 1000.0)
 
     def _select_auto_method(self, fps: float, band: tuple[float, float]):
         """method=AUTO: оценивает КАЖДЫЙ из 5 цветовых методов по среднему
@@ -599,7 +659,16 @@ class RPPGPipeline:
         (п.22). Берётся зелёный канал (наибольшая чувствительность к
         яркостной модуляции, см. make_synthetic_rgb docstring в тестах) и
         обрабатывается тем же preprocess_signal, что и лицевые ROI, чтобы
-        частоты были сравнимы напрямую."""
+        частоты были сравнимы напрямую.
+
+        Задача 7: дисперсия проверяется на СЫРОМ (ДО preprocess_signal)
+        сигнале — preprocess_signal нормализует через z-score, который
+        растягивает К ЕДИНИЧНОЙ дисперсии ЛЮБОЙ сигнал, даже почти
+        постоянный (ровная стена + шум квантования камеры). Если проверять
+        дисперсию уже ПОСЛЕ normalize, разница между "реальным сигналом" и
+        "усиленным шумом квантования" стирается по построению — детектор
+        мерцания увидел бы обычный на вид сигнал и мог бы дать ложное
+        срабатывание на ровном участке без какой-либо реальной модуляции."""
         valid_mask = np.array(self._buf.background_valid, dtype=bool)
         if valid_mask.sum() < 8:
             return None
@@ -607,6 +676,8 @@ class RPPGPipeline:
         fixed, ok = interpolate_missing(green, valid_mask)
         if not ok:
             return None
+        if float(np.std(fixed)) < self.cfg.quality.flicker_min_raw_std:
+            return None  # почти постоянный фон -> "нет данных", а не усиленный шум квантования
         return preprocess_signal(
             fixed, fps, band[0], band[1],
             order=self.cfg.filt.filter_order,
@@ -717,7 +788,6 @@ class RPPGPipeline:
         if not per_roi_signal:
             no_signal_warnings = warnings + ["Ни один ROI не дал валидного сигнала в этом окне."]
             no_signal_method = f"auto:{self._method.name}" if self._auto_mode else self._method.name
-            best_effort_bpm = self._update_best_effort_bpm(float("nan"))
             if self._window_logger is not None:
                 # Тоже логируем (п.43) — "окно без сигнала" такой же
                 # материал для анализа failure cases, как и низкий SQI.
@@ -729,8 +799,9 @@ class RPPGPipeline:
                     sqi_spectral_snr_db=float("-inf"), sqi_cross_roi_agreement=0.0,
                     sqi_landmark_stability=0.0, sqi_temporal_consistency=0.0,
                     sqi_harmonic_score=0.0, sqi_flicker_suspected=False,
+                    sqi_flicker_background_freq_hz=0.0, sqi_flicker_background_snr_db=float("-inf"),
+                    sqi_subharmonic_check_informative=True,
                     respiration_rate_bpm=None, warnings=no_signal_warnings,
-                    best_effort_bpm=best_effort_bpm,
                 ))
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
@@ -739,7 +810,8 @@ class RPPGPipeline:
                 method_used=no_signal_method,
                 frequency_method_used=self.cfg.frequency_method.value,
                 per_roi_bpm=per_roi_bpm,
-                best_effort_bpm=best_effort_bpm,
+                last_valid_bpm=self._last_valid_bpm,
+                last_valid_bpm_age_s=self._last_valid_bpm_age_s(timestamp_ms),
             )
 
         if self.cfg.fusion.enabled:
@@ -788,11 +860,30 @@ class RPPGPipeline:
                 recent_bpm_history=recent_bpm_history,
                 harmonic_check_signal=harmonic_check_signal,
                 background_signal=background_signal,
+                recent_flicker_candidates=list(self._recent_flicker_candidates),
             ),
             self.cfg.quality,
         )
         if not np.isnan(current_bpm):
             self._recent_bpm_history.append(current_bpm)
+        # Задача 7: пополняем историю ОДНОконных кандидатов ПОСЛЕ вызова
+        # (см. SQIInputs.recent_flicker_candidates — история должна
+        # содержать только ПРЕДЫДУЩИЕ окна, текущее assess_quality уже
+        # учла сама).
+        self._recent_flicker_candidates.append(sqi.flicker_candidate)
+
+        debug_info: DebugInfo | None = None
+        if self._debug:
+            psd_freqs, psd_values = compute_psd(best_signal, fps)
+            debug_info = DebugInfo(
+                sqi=sqi,
+                qcfg=self.cfg.quality,
+                band_hz=band,
+                best_source=best_roi,
+                peak_freq_hz=best_peak_freq_hz,
+                psd_freqs=psd_freqs,
+                psd_values=psd_values,
+            )
 
         self._update_ibi_log(best_signal, fps, self._buf.timestamps_ms)
         hrv_warnings: list[str] = []
@@ -806,11 +897,10 @@ class RPPGPipeline:
 
         all_warnings = warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else [])
 
-        # Обновляется ВСЕГДА, независимо от sqi.is_reliable — сама функция
-        # уже отбрасывает неправдоподобные (вне диапазона) значения, так
-        # что пропускать неопубликованные окна целиком не нужно: это просто
-        # уменьшило бы доступность best_effort_bpm без дополнительной пользы.
-        best_effort_bpm = self._update_best_effort_bpm(current_bpm)
+        # Задача 8: обновляется ТОЛЬКО когда окно реально прошло SQI-гейт —
+        # см. _update_last_valid_bpm. В отличие от прежнего best_effort_bpm,
+        # здесь принципиально нет обновления на непубликуемых окнах.
+        self._update_last_valid_bpm(timestamp_ms, current_bpm, sqi.is_reliable)
 
         if self._window_logger is not None:
             # п.43: полная разбивка SQI по компонентам (не только overall_score)
@@ -832,9 +922,11 @@ class RPPGPipeline:
                 sqi_temporal_consistency=sqi.temporal_consistency,
                 sqi_harmonic_score=sqi.harmonic_score,
                 sqi_flicker_suspected=sqi.flicker_suspected,
+                sqi_flicker_background_freq_hz=sqi.flicker_background_freq_hz,
+                sqi_flicker_background_snr_db=sqi.flicker_background_snr_db,
+                sqi_subharmonic_check_informative=sqi.subharmonic_check_informative,
                 respiration_rate_bpm=respiration_rate_bpm,
                 warnings=list(all_warnings),
-                best_effort_bpm=best_effort_bpm,
             ))
 
         return PTSDPulseFeatures(
@@ -849,5 +941,7 @@ class RPPGPipeline:
             frequency_method_used=self.cfg.frequency_method.value,
             per_roi_bpm=per_roi_bpm,
             respiration_rate_bpm=respiration_rate_bpm,
-            best_effort_bpm=best_effort_bpm,
+            last_valid_bpm=self._last_valid_bpm,
+            last_valid_bpm_age_s=self._last_valid_bpm_age_s(timestamp_ms),
+            debug=debug_info,
         )
