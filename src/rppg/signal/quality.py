@@ -68,22 +68,37 @@ def _band_mask(freqs: np.ndarray, band_hz: tuple[float, float]) -> np.ndarray:
     return (freqs >= band_hz[0]) & (freqs <= band_hz[1])
 
 
-def _compute_psd(signal: np.ndarray, fps: float) -> tuple[np.ndarray | None, np.ndarray | None]:
+def compute_psd(signal: np.ndarray, fps: float) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Welch PSD на ПОЛНОМ спектре (без обрезки по band_hz) — общий шаг для
     dominant_frequency_and_snr (там результат маскируется по band_hz) и
     harmonic_plausibility (там нужен доступ к 2f/f/2, которые часто лежат
-    ВНЕ band_hz)."""
+    ВНЕ band_hz). Публичная (не приватная) — переиспользуется отладочным
+    оверлеем scripts/run_webcam.py --debug для отрисовки того же самого
+    спектра, который реально видит assess_quality, а не пересчитанного
+    заново с другими параметрами Welch.
+
+    ИСПРАВЛЕНИЕ (задача 5, п.4): раньше nperseg=min(len(signal), 256) при
+    типичных len(signal)=300 (10с окно @ 30fps) давал nperseg=256 и, с
+    noverlap по умолчанию (nperseg//2=128), РОВНО ОДИН сегмент
+    (1 + (300-256)//128 = 1) — то есть усреднения Уэлча ФАКТИЧЕСКИ НЕ
+    происходило, и получившаяся оценка PSD (а значит и spectral_snr_db, и
+    порог на нём) имела дисперсию одиночной периодограммы, а не Welch.
+    nperseg = len(signal)//2 (с explicit noverlap=nperseg//2) даёт 2-3
+    перекрывающихся сегмента на типичном 10-секундном окне ценой частотного
+    разрешения (короче сегмент -> шире главный лепесток) — для оценки SNR
+    это выгодный обмен: ниже дисперсия оценки, стабильнее порог гейтинга."""
     signal = np.asarray(signal, dtype=float)
     if len(signal) < 8 or np.std(signal) < 1e-10:
         return None, None
-    nperseg = min(len(signal), 256)
+    nperseg = min(len(signal), max(64, len(signal) // 2))
+    noverlap = nperseg // 2
     nfft = max(2048, int(2 ** np.ceil(np.log2(nperseg))) * 4)
-    freqs, psd = welch(signal, fs=fps, nperseg=nperseg, nfft=nfft)
+    freqs, psd = welch(signal, fs=fps, nperseg=nperseg, noverlap=noverlap, nfft=nfft)
     return freqs, psd
 
 
 def dominant_frequency_and_snr(
-    signal: np.ndarray, fps: float, band_hz: tuple[float, float]
+    signal: np.ndarray, fps: float, band_hz: tuple[float, float], include_second_harmonic: bool = False,
 ) -> tuple[float, float]:
     """
     Возвращает (доминирующая_частота_Hz, spectral_snr_dB).
@@ -93,8 +108,24 @@ def dominant_frequency_and_snr(
     как критерий периодичности для выбора PCA/ICA/head-motion компоненты
     (select_best_component_by_periodicity ниже) — общий инвариант: "хорошая"
     пульсовая компонента должна быть узкополосной.
+
+    include_second_harmonic (задача 5, п.2): по умолчанию False — сохраняет
+    исходное определение (энергия только на f). Wang et al. (2016, POS)
+    определяют SNR ИНАЧЕ: в энергию сигнала входит и узкая полоса вокруг 2-й
+    гармоники 2f — систолический подъём делает пульсовую волну
+    несинусоидальной, и 2-я гармоника несёт реальную физиологическую
+    энергию, а не шум. Наше определение по умолчанию строже литературного
+    (не засчитывает 2f как "сигнал"), что даёт систематически более низкий
+    snr_db при том же реальном качестве сигнала. include_second_harmonic=True
+    включает альтернативный (Wang et al.) режим — ТОЛЬКО для сравнения
+    "наших" порогов с литературными числами (см. scripts/analyze_log.py,
+    задача 5), не используется по умолчанию нигде в пайплайне. См. также
+    benchmark/evaluate.py::reference_relative_snr_db — то же определение с
+    2-й гармоникой, но относительно ИЗВЕСТНОЙ референсной частоты (для
+    валидации на датасете с ground truth), а не найденного здесь пика (для
+    онлайн-гейтинга без ground truth).
     """
-    freqs, psd = _compute_psd(signal, fps)
+    freqs, psd = compute_psd(signal, fps)
     if freqs is None:
         return 0.0, -np.inf
 
@@ -108,6 +139,9 @@ def dominant_frequency_and_snr(
 
     narrow_mask = np.abs(band_freqs - peak_freq) <= 0.15
     signal_power = np.sum(band_psd[narrow_mask])
+    if include_second_harmonic:
+        second_harmonic_mask = np.abs(band_freqs - 2.0 * peak_freq) <= 0.15
+        signal_power = signal_power + np.sum(band_psd[second_harmonic_mask])
     total_power = np.sum(band_psd)
     noise_power = max(total_power - signal_power, 1e-12)
 
@@ -234,12 +268,56 @@ def temporal_consistency_score(
     return float(np.clip(1.0 - mean_diff / max_expected_change_bpm, 0.0, 1.0))
 
 
+def _local_bump_ratio(
+    freqs: np.ndarray, psd: np.ndarray, center_hz: float, tol_hz: float, floor_half_width_hz: float,
+) -> tuple[float, bool]:
+    """Проверяет, есть ли на center_hz РЕАЛЬНЫЙ локальный горб спектра, а не
+    просто точка на монотонно убывающем склоне 1/f-шума (задача 4).
+
+    Сравнивает среднюю мощность в узкой полосе вокруг center_hz (±tol_hz) с
+    мощностью в ДВУХ непосредственно прилегающих полосах — слева и справа
+    (каждая шириной floor_half_width_hz, сразу за пределами ±tol_hz).
+    В детрендированном rPPG-сигнале спектральная плотность круто падает с
+    частотой (остаточный дрейф освещения/дыхание/микродвижения) — на чисто
+    убывающем склоне мощность СЛЕВА (на более низкой частоте) всегда выше,
+    чем на center_hz, поэтому условие "выше ОБОИХ соседей" истинно только
+    на настоящем локальном горбе (реальной гармонике/движении на этой
+    частоте), а не на любой точке склона 1/f. Отдельно возвращает
+    (мощность_на_center / медиана_мощности_в_обеих_соседних_полосах) —
+    оценку "во сколько раз пик выступает над локальным шумовым фоном".
+
+    Возвращает (0.0, False), если по краю сетки не хватает данных для
+    одной из соседних полос (например, center_hz слишком близко к 0 Hz).
+    """
+    peak_mask = np.abs(freqs - center_hz) <= tol_hz
+    if not peak_mask.any():
+        return 0.0, False
+    p_peak = float(np.mean(psd[peak_mask]))
+
+    left_mask = (freqs < center_hz - tol_hz) & (freqs >= center_hz - tol_hz - floor_half_width_hz)
+    right_mask = (freqs > center_hz + tol_hz) & (freqs <= center_hz + tol_hz + floor_half_width_hz)
+    if not left_mask.any() or not right_mask.any():
+        return 0.0, False
+    p_left = float(np.mean(psd[left_mask]))
+    p_right = float(np.mean(psd[right_mask]))
+
+    floor = float(np.median(np.concatenate([psd[left_mask], psd[right_mask]])))
+    if floor <= 1e-15:
+        return 0.0, False
+
+    is_local_bump = p_peak > p_left and p_peak > p_right
+    return p_peak / floor, is_local_bump
+
+
 def harmonic_plausibility(
     raw_signal_detrended: np.ndarray | None,
     fps: float,
     peak_freq_hz: float,
-    ratio_threshold: float = 0.7,
+    band_hz: tuple[float, float],
+    significance_ratio: float = 3.0,
     tol_hz: float = 0.15,
+    floor_half_width_hz: float = 0.3,
+    max_penalty: float = 0.4,
 ) -> tuple[float, list[str]]:
     """
     Проверка на гармоники/субгармоники (п.21 требований) — классический
@@ -255,6 +333,44 @@ def harmonic_plausibility(
     для любого f < 1.4 Hz, т.е. < 84 BPM; 2f > 4.0 Hz для любого f > 2.0 Hz,
     т.е. > 120 BPM). См. pipeline.py::_compute_estimate.
 
+    ИСПРАВЛЕНИЕ (задача 4): раньше сравнивалась ДОЛЯ мощности p_2f/p_f (или
+    p_half/p_f) с фиксированным порогом 0.7. Это ломалось именно там, где
+    сигнал ЧИЩЕ всего: в детрендированном rPPG-сигнале спектральная
+    плотность круто падает с частотой (остаточный дрейф освещения/дыхание/
+    микродвижения — форма 1/f, "красный шум"). При пульсе 60-72 BPM
+    субгармоника f/2 попадает в 0.5-0.6 Hz, где этой низкочастотной энергии
+    заведомо больше, чем на самой пульсовой частоте f — p_half/p_f > 0.7
+    срабатывало почти всегда НЕ из-за реальной субгармоники, а просто
+    потому что рядом с DC мощность 1/f-шума всегда выше. Вместо доли
+    мощности от пика на f теперь используется два независимых условия
+    (см. _local_bump_ratio), которые 1/f-спад по построению не может
+    удовлетворить:
+      1) мощность на 2f/f/2 минимум в significance_ratio раз выше ЛОКАЛЬНОГО
+         шумового фона рядом с этой же частотой (а не глобальной оценки по
+         всей полосе, которая для 1/f-спектра плохо описывает локальный
+         уровень шума и на низких, и на высоких частотах сразу);
+      2) это настоящий ЛОКАЛЬНЫЙ МАКСИМУМ (горб), а не точка на монотонно
+         убывающем склоне — на чистом 1/f-спаде мощность слева ВСЕГДА выше,
+         чем в кандидатной точке, поэтому спад никогда не пройдёт этот тест.
+
+    Субгармоника (f/2) проверяется, только если f/2 >= band_hz[0] (нижний
+    край рабочей полосы) — иначе кандидатная частота лежит в зоне, где
+    остаточный дрейф освещения физически доминирует над чем угодно, и
+    проверка не может быть информативной ни при каком её исходе (обычно
+    это BPM < ~84, т.е. f < 1.4 Hz -> f/2 < 0.7 Hz при типичной полосе
+    0.7-4.0 Hz). В этом случае функция возвращает нейтральный score=1.0 по
+    субгармонике молча (не как штраф и не как предупреждение об аномалии,
+    см. assess_quality: сам факт пропуска проверки логируется отдельным
+    булевым полем SQIResult, а не текстом в warnings, иначе на любой
+    записи в состоянии покоя (< 84 BPM) эта нейтральная заметка забила бы
+    собой топ warnings в scripts/analyze_log.py).
+
+    Максимальный штраф ОГРАНИЧЕН max_penalty (по умолчанию 0.4, то есть
+    score не падает ниже 0.6) — раньше множитель мог упасть до 0.4, что при
+    и без того жёстком SNR-гейте (см. min_spectral_snr_db) почти
+    гарантировало отказ в публикации за одно только гармоническое
+    подозрение, даже не самое уверенное.
+
     Возвращает (score, warnings): score in [0,1], где 1.0 = гармоническая
     структура спектра чистая (заметной конкурирующей энергии на 2f/f/2 нет),
     ниже — тем более вероятна путаница. score используется как штрафующий
@@ -266,40 +382,39 @@ def harmonic_plausibility(
     if raw_signal_detrended is None or peak_freq_hz <= 0:
         return 1.0, warnings
 
-    freqs, psd = _compute_psd(raw_signal_detrended, fps)
+    freqs, psd = compute_psd(raw_signal_detrended, fps)
     if freqs is None:
         return 1.0, warnings
 
-    def _power_near(f0: float) -> float:
-        m = np.abs(freqs - f0) <= tol_hz
-        return float(np.sum(psd[m])) if m.any() else 0.0
-
-    p_f = _power_near(peak_freq_hz)
-    if p_f <= 1e-12:
-        return 1.0, warnings
-
-    p_2f = _power_near(2.0 * peak_freq_hz)
-    p_half = _power_near(peak_freq_hz / 2.0)
-
-    r2 = p_2f / p_f
-    rsub = p_half / p_f
-
     score = 1.0
-    if r2 >= ratio_threshold:
-        score = min(score, 1.0 - min(r2, 1.0) * 0.6)
+
+    ratio_2f, is_bump_2f = _local_bump_ratio(freqs, psd, 2.0 * peak_freq_hz, tol_hz, floor_half_width_hz)
+    if is_bump_2f and ratio_2f >= significance_ratio:
+        excess = min((ratio_2f - significance_ratio) / significance_ratio, 1.0)  # 0 на пороге -> 1 при 2x порога и выше
+        score = min(score, 1.0 - max_penalty * excess)
         warnings.append(
-            f"Энергия на предполагаемой 2-й гармонике (~{2 * peak_freq_hz * 60:.0f} BPM) "
-            f"сопоставима с энергией на обнаруженном пике (~{peak_freq_hz * 60:.0f} BPM, "
-            f"отношение мощностей {r2:.2f}) — возможна путаница истинной частоты пульса "
+            f"Локальный горб спектра на предполагаемой 2-й гармонике "
+            f"(~{2 * peak_freq_hz * 60:.0f} BPM) в {ratio_2f:.1f}x выше локального шумового фона "
+            f"(порог {significance_ratio:.1f}x) — возможна путаница истинной частоты пульса "
             "и её 2-й гармоники."
         )
-    if rsub >= ratio_threshold:
-        score = min(score, 1.0 - min(rsub, 1.0) * 0.6)
-        warnings.append(
-            f"Энергия на предполагаемой субгармонике f/2 (~{peak_freq_hz * 30:.0f} BPM) "
-            f"сопоставима с энергией на обнаруженном пике (отношение мощностей {rsub:.2f}) "
-            "— возможен двигательный/иной артефакт на частоте вдвое ниже обнаруженной."
-        )
+
+    subharmonic_hz = peak_freq_hz / 2.0
+    if subharmonic_hz >= band_hz[0]:
+        ratio_half, is_bump_half = _local_bump_ratio(freqs, psd, subharmonic_hz, tol_hz, floor_half_width_hz)
+        if is_bump_half and ratio_half >= significance_ratio:
+            excess = min((ratio_half - significance_ratio) / significance_ratio, 1.0)
+            score = min(score, 1.0 - max_penalty * excess)
+            warnings.append(
+                f"Локальный горб спектра на предполагаемой субгармонике f/2 "
+                f"(~{peak_freq_hz * 30:.0f} BPM) в {ratio_half:.1f}x выше локального шумового фона "
+                f"(порог {significance_ratio:.1f}x) — возможен двигательный/иной артефакт на "
+                "частоте вдвое ниже обнаруженной."
+            )
+    # else: f/2 ниже рабочей полосы -> проверка неинформативна, см. докстринг
+    # выше. Молча пропускается (не штраф, не warning) — см. assess_quality
+    # про sqi_subharmonic_check_informative.
+
     return float(np.clip(score, 0.0, 1.0)), warnings
 
 
@@ -310,7 +425,7 @@ def detect_illumination_flicker(
     band_hz: tuple[float, float],
     freq_tolerance_hz: float = 0.15,
     min_background_snr_db: float = 3.0,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, float, float]:
     """
     Дешёвый детектор мерцания освещения (п.22 требований). Люминесцентное/
     светодиодное освещение с частотой сети 50/60 Гц при частоте кадров ~30
@@ -326,25 +441,39 @@ def detect_illumination_flicker(
     в её яркости объясняется только внешним источником (мерцание, PWM
     подсветки и т.п.), который в равной мере модулирует и лицо.
 
-    Возвращает (flicker_suspected, warning|None) — жёсткий гейт: при
-    flicker_suspected=True результат окна не публикуется (см. assess_quality).
+    ИЗМЕНЕНИЕ (задача 7): раньше эта функция сама возвращала ФИНАЛЬНОЕ
+    flicker_suspected по ОДНОМУ окну — жёсткий гейт срабатывал от единственного
+    случайного совпадения. Два риска с этим: (а) фоновый ROI расположен по
+    bounding box'у лица с небольшим отступом (см. face/roi.py::
+    build_background_roi_mask) — если он задевает волосы/плечи/одежду,
+    которые двигаются ВМЕСТЕ с человеком, совпадение по построению
+    коррелирует с лицом; (б) вызывающий код (см. assess_quality) нормирует
+    background_signal через preprocess_signal с z-score ДО того, как эта
+    функция его увидит — z-score растягивает ЛЮБОЙ, даже почти постоянный,
+    сигнал к единичной дисперсии, после чего усиленный шум квантования может
+    случайно дать узкополосный на вид пик где угодно в рабочей полосе.
+
+    Поэтому эта функция теперь возвращает только ОДНОКОННЫЙ "кандидат"
+    (candidate_this_window, bg_freq_hz, bg_snr_db) — реальное решение
+    flicker_suspected принимает assess_quality, требуя, чтобы кандидат
+    подтвердился НЕСКОЛЬКО последовательных окон подряд (мерцание — стабильное
+    во времени явление, см. SQIInputs.recent_flicker_candidates и
+    QualityConfig.flicker_min_consecutive_windows), а не одно случайное окно.
+    bg_freq_hz/bg_snr_db возвращаются ВСЕГДА (даже когда кандидат=False), а
+    не только при совпадении — п.4 задачи 7: "логировать частоту и SNR
+    фонового пика в каждое окно", чтобы scripts/analyze_log.py могло
+    показать, насколько обоснованно срабатывает детектор, а не только факт
+    срабатывания.
     """
     if background_signal is None or face_peak_freq_hz <= 0:
-        return False, None
+        return False, 0.0, float("-inf")
 
     bg_freq, bg_snr_db = dominant_frequency_and_snr(background_signal, fps, band_hz)
     if bg_snr_db < min_background_snr_db:
-        return False, None  # фон сам по себе не узкополосен — ничего подозрительного
+        return False, bg_freq, bg_snr_db  # фон сам по себе не узкополосен — ничего подозрительного
 
-    if abs(bg_freq - face_peak_freq_hz) <= freq_tolerance_hz:
-        warning = (
-            f"Подозрение на мерцание освещения: фоновый ROI (вне лица) даёт узкий "
-            f"стабильный пик на {bg_freq * 60:.1f} BPM (SNR {bg_snr_db:.1f} дБ), "
-            f"совпадающий с частотой, обнаруженной на лице ({face_peak_freq_hz * 60:.1f} "
-            "BPM). Результат за это окно не публикуется."
-        )
-        return True, warning
-    return False, None
+    candidate = abs(bg_freq - face_peak_freq_hz) <= freq_tolerance_hz
+    return candidate, bg_freq, bg_snr_db
 
 
 @dataclass
@@ -363,8 +492,16 @@ class SQIInputs:
     # только для harmonic_plausibility, см. её docstring.
     harmonic_check_signal: np.ndarray | None = None
     # Сигнал фонового ROI (вне лица), preprocess_signal-обработанный тем же
-    # способом, что и лицевые ROI — для detect_illumination_flicker.
+    # способом, что и лицевые ROI — для detect_illumination_flicker. None,
+    # если фон недоступен ИЛИ его сырая (до z-score) дисперсия неотличима
+    # от шума квантования — см. RPPGPipeline._estimate_background_signal.
     background_signal: np.ndarray | None = None
+    # Задача 7: candidate-флаги detect_illumination_flicker с ПРЕДЫДУЩИХ
+    # окон (самый свежий — последним, ТЕКУЩЕЕ окно сюда не входит) — для
+    # требования устойчивости во времени (мерцание — стабильное явление,
+    # разовое совпадение гораздо вероятнее случайный шумовой пик). См.
+    # QualityConfig.flicker_min_consecutive_windows.
+    recent_flicker_candidates: list[bool] | None = None
 
 
 @dataclass
@@ -377,7 +514,20 @@ class SQIResult:
     landmark_stability: float
     temporal_consistency: float
     harmonic_score: float
+    # Финальное, персистентное решение (см. assess_quality) — жёсткий гейт
+    # публикации. flicker_candidate ниже — сырое ОДНОконное совпадение ДО
+    # требования устойчивости, используется RPPGPipeline только чтобы
+    # обновить свою историю recent_flicker_candidates для следующего окна.
     flicker_suspected: bool
+    flicker_candidate: bool = False
+    flicker_background_freq_hz: float = 0.0
+    flicker_background_snr_db: float = float("-inf")
+    # Задача 4, п.3: False, если f/2 < band_hz[0] и проверка субгармоники
+    # была ПРОПУЩЕНА как физически неинформативная (а не "пройдена чисто").
+    # Отдельное булево поле, а не текст в warnings — иначе на любой записи
+    # в покое (< ~84 BPM, обычный случай) эта нейтральная заметка забила бы
+    # собой топ warnings в scripts/analyze_log.py на каждом окне.
+    subharmonic_check_informative: bool = True
     warnings: list[str] = field(default_factory=list)
 
 
@@ -397,8 +547,10 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
         inputs.harmonic_check_signal,
         inputs.fps,
         inputs.peak_freq_hz,
-        ratio_threshold=qcfg.harmonic_ratio_threshold,
+        inputs.band_hz,
+        significance_ratio=qcfg.harmonic_floor_ratio_threshold,
     )
+    subharmonic_informative = (inputs.peak_freq_hz / 2.0) >= inputs.band_hz[0] if inputs.peak_freq_hz > 0 else True
     warnings.extend(harmonic_warnings)
     # Гармоническая путаница напрямую подрывает доверие к тому, что
     # обнаруженная частота — это сам пульс, а не его кратная/дольная копия,
@@ -436,7 +588,7 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
             "может обнаружить."
         )
 
-    flicker_suspected, flicker_warning = detect_illumination_flicker(
+    flicker_candidate, bg_freq_hz, bg_snr_db = detect_illumination_flicker(
         inputs.background_signal,
         inputs.fps,
         inputs.peak_freq_hz,
@@ -444,8 +596,31 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
         freq_tolerance_hz=qcfg.flicker_freq_tolerance_hz,
         min_background_snr_db=qcfg.flicker_min_background_snr_db,
     )
-    if flicker_warning:
-        warnings.append(flicker_warning)
+    # Задача 7: устойчивость во времени — мерцание физически стабильно,
+    # разовое совпадение на одном окне гораздо правдоподобнее объясняется
+    # случайным шумовым пиком (усиленным z-score нормализацией фона), чем
+    # реальным мерцанием. Требуем, чтобы кандидат подтвердился в
+    # flicker_min_consecutive_windows окон ПОДРЯД (включая текущее), иначе
+    # это остаётся незавершённым подозрением (см. ниже), а не жёстким гейтом.
+    candidate_streak = (list(inputs.recent_flicker_candidates or []) + [flicker_candidate])[
+        -qcfg.flicker_min_consecutive_windows:
+    ]
+    flicker_suspected = (
+        len(candidate_streak) >= qcfg.flicker_min_consecutive_windows and all(candidate_streak)
+    )
+    if flicker_suspected:
+        warnings.append(
+            f"Мерцание освещения ПОДТВЕРЖДЕНО {qcfg.flicker_min_consecutive_windows} окнами подряд: "
+            f"фоновый ROI (вне лица) даёт узкий стабильный пик на {bg_freq_hz * 60:.1f} BPM "
+            f"(SNR {bg_snr_db:.1f} дБ), совпадающий с частотой на лице "
+            f"({inputs.peak_freq_hz * 60:.1f} BPM). Результат за это окно не публикуется."
+        )
+    elif flicker_candidate:
+        warnings.append(
+            f"Разовое совпадение фона с частотой лица на {bg_freq_hz * 60:.1f} BPM "
+            f"(SNR {bg_snr_db:.1f} дБ) — ПОКА не подтверждено несколькими окнами подряд, "
+            "публикация не заблокирована этим одним совпадением."
+        )
 
     overall = float(
         np.clip(
@@ -499,5 +674,9 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
         temporal_consistency=temporal_score,
         harmonic_score=harmonic_score,
         flicker_suspected=flicker_suspected,
+        flicker_candidate=flicker_candidate,
+        flicker_background_freq_hz=bg_freq_hz,
+        flicker_background_snr_db=bg_snr_db,
+        subharmonic_check_informative=subharmonic_informative,
         warnings=warnings,
     )

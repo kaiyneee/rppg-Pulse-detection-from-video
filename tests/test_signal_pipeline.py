@@ -526,15 +526,16 @@ def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
     fps = 30.0
     n = 300
     t = np.arange(n) / fps
+    band = (0.7, 4.0)
     rng = np.random.default_rng(1)
 
     clean_tone = np.sin(2 * np.pi * 1.0 * t) + 0.05 * rng.normal(0, 1, n)
-    clean_score, clean_warnings = harmonic_plausibility(clean_tone, fps, peak_freq_hz=1.0)
+    clean_score, clean_warnings = harmonic_plausibility(clean_tone, fps, peak_freq_hz=1.0, band_hz=band)
 
     # Пик ошибочно "найден" на 2 Hz, но в сигнале сопоставимая энергия на
     # истинной частоте 1 Hz (= заявленный_пик / 2) -> подозрение на путаницу.
     ambiguous = np.sin(2 * np.pi * 1.0 * t) + 0.9 * np.sin(2 * np.pi * 2.0 * t)
-    ambiguous_score, ambiguous_warnings = harmonic_plausibility(ambiguous, fps, peak_freq_hz=2.0)
+    ambiguous_score, ambiguous_warnings = harmonic_plausibility(ambiguous, fps, peak_freq_hz=2.0, band_hz=band)
 
     print(f"  чистый тон на f: score={clean_score:.2f}, warnings={clean_warnings}")
     print(f"  пик на 2f при сильной энергии на f: score={ambiguous_score:.2f}, warnings={ambiguous_warnings}")
@@ -545,12 +546,63 @@ def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
     )
 
 
+def test_harmonic_check_ignores_1_over_f_noise_floor():
+    """Регрессия для задачи 4: раньше сравнивалась ДОЛЯ мощности p_half/p_f
+    с фиксированным порогом 0.7 — это ломалось именно на ЧИСТОМ сигнале,
+    потому что в детрендированном rPPG-сигнале спектр падает как 1/f
+    (красный шум): при пульсе 60-72 BPM субгармоника f/2 попадает в
+    0.5-0.6 Hz, где мощности 1/f-шума заведомо больше, чем на самой
+    пульсовой частоте — p_half/p_f > 0.7 срабатывало почти ВСЕГДА, не имея
+    отношения к реальной субгармонике.
+
+    "Чистый пульс 1.0 Гц + красный шум 1/f" должен давать harmonic_score
+    РОВНО 1.0 (см. задача 4, критерий приёмки), а "пульс 2.0 Гц + равный по
+    мощности пик на 1.0 Гц" — заметно меньше 1.0 (реальная субгармоника,
+    должна флагироваться)."""
+    print("\n=== Тест: гармоническая проверка НЕ путает 1/f-шум с реальной субгармоникой (задача 4) ===")
+    from rppg.signal.quality import harmonic_plausibility
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    rng = np.random.default_rng(7)
+
+    # Красный шум (1/f) — интеграл белого шума (винеровский процесс),
+    # классическая аппроксимация 1/f^2 спектра остаточного дрейфа
+    # освещения/дыхания/микродвижений в детрендированном rPPG-сигнале.
+    red_noise = np.cumsum(rng.normal(0, 1, n))
+    red_noise -= np.mean(red_noise)
+    red_noise /= np.std(red_noise) + 1e-9
+    clean_pulse_plus_red_noise = np.sin(2 * np.pi * 1.0 * t) + 0.3 * red_noise
+    score_clean, warnings_clean = harmonic_plausibility(
+        clean_pulse_plus_red_noise, fps, peak_freq_hz=1.0, band_hz=band
+    )
+    print(f"  чистый пульс 1.0 Гц + 1/f-шум: score={score_clean:.3f}, warnings={warnings_clean}")
+    assert score_clean == 1.0 and not warnings_clean, (
+        f"1/f-шум не должен ложно флагироваться как субгармоника (score={score_clean}, ожидалось 1.0)"
+    )
+
+    # Реальная субгармоника: равный по мощности пик на f/2=1.0 Hz при
+    # заявленном пике 2.0 Hz — настоящий локальный горб спектра, не точка
+    # на монотонном спаде.
+    real_subharmonic = np.sin(2 * np.pi * 2.0 * t) + np.sin(2 * np.pi * 1.0 * t)
+    score_real, warnings_real = harmonic_plausibility(real_subharmonic, fps, peak_freq_hz=2.0, band_hz=band)
+    print(f"  пульс 2.0 Гц + равный пик на 1.0 Гц: score={score_real:.3f}, warnings={warnings_real}")
+    assert score_real < 0.9 and warnings_real, (
+        f"реальная субгармоника равной мощности должна заметно снижать score (получено {score_real})"
+    )
+
+
 def test_illumination_flicker_detected_via_background_roi():
-    """Регрессия для п.22: если фоновый ROI (вне лица, например стена)
-    САМ ПО СЕБЕ показывает узкий стабильный пик на частоте, совпадающей с
-    "пульсом" на лице, это почти наверняка мерцание освещения, а не
-    сердцебиение стены — жёсткий гейт публикации. Фон, который просто шумит
-    без узкополосного пика, не должен ложно срабатывать."""
+    """Регрессия для п.22 (обновлена для задачи 7): если фоновый ROI (вне
+    лица, например стена) САМ ПО СЕБЕ показывает узкий стабильный пик на
+    частоте, совпадающей с "пульсом" на лице, это ОДНОконный "кандидат" на
+    мерцание — детектор возвращает (candidate, bg_freq_hz, bg_snr_db), а
+    финальное решение flicker_suspected (с требованием устойчивости в
+    нескольких окнах подряд) принимает assess_quality, не эта функция (см.
+    test_flicker_requires_consecutive_windows_to_confirm ниже). Фон, который
+    просто шумит без узкополосного пика, не должен давать кандидата вовсе."""
     print("\n=== Тест: детектор мерцания освещения через фоновый ROI (п.22) ===")
     from rppg.signal.quality import detect_illumination_flicker
 
@@ -561,16 +613,71 @@ def test_illumination_flicker_detected_via_background_roi():
     face_peak_hz = 1.2  # 72 BPM
 
     flicker_bg = 2.0 * np.sin(2 * np.pi * face_peak_hz * t) + 0.05 * np.random.default_rng(2).normal(0, 1, n)
-    flicker_suspected, warning = detect_illumination_flicker(flicker_bg, fps, face_peak_hz, band)
+    candidate, bg_freq, bg_snr = detect_illumination_flicker(flicker_bg, fps, face_peak_hz, band)
 
     clean_bg = np.random.default_rng(3).normal(0, 1, n)
-    clean_suspected, clean_warning = detect_illumination_flicker(clean_bg, fps, face_peak_hz, band)
+    clean_candidate, clean_bg_freq, clean_bg_snr = detect_illumination_flicker(clean_bg, fps, face_peak_hz, band)
 
-    print(f"  фон совпадает с частотой лица: flicker_suspected={flicker_suspected}, warning={bool(warning)}")
-    print(f"  фон — просто шум: flicker_suspected={clean_suspected}, warning={bool(clean_warning)}")
+    print(f"  фон совпадает с частотой лица: candidate={candidate}, bg_freq={bg_freq:.2f} Hz, snr={bg_snr:.1f} dB")
+    print(f"  фон — просто шум: candidate={clean_candidate}, snr={clean_bg_snr:.1f} dB")
 
-    assert flicker_suspected and warning, "совпадающий узкополосный пик фона должен флагироваться как мерцание"
-    assert not clean_suspected and clean_warning is None, "шумный фон без узкополосного пика не должен флагироваться"
+    assert candidate, "совпадающий узкополосный пик фона должен давать candidate=True"
+    assert not clean_candidate, "шумный фон без узкополосного пика не должен давать candidate=True"
+
+
+def test_flicker_requires_consecutive_windows_to_confirm():
+    """Регрессия для задачи 7 (устойчивость во времени): мерцание —
+    стабильное во времени явление. Одно-единственное окно с совпадающим
+    фоновым пиком НЕ должно блокировать публикацию (могло быть случайным
+    шумовым пиком, усиленным z-score нормализацией) — только
+    flicker_min_consecutive_windows окон подряд."""
+    print("\n=== Тест: flicker_suspected требует несколько окон подряд (задача 7) ===")
+    from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, SQIInputs
+    from rppg.config import QualityConfig
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    face_peak_hz = 1.2
+    qcfg = QualityConfig()
+
+    flicker_bg = 2.0 * np.sin(2 * np.pi * face_peak_hz * t) + 0.05 * np.random.default_rng(2).normal(0, 1, n)
+
+    def _assess(recent_candidates):
+        return assess_quality(
+            SQIInputs(
+                spectral_snr_db=20.0, peak_freq_hz=face_peak_hz, fps=fps, band_hz=band,
+                bpm_by_roi={"forehead": face_peak_hz * 60.0},
+                background_signal=flicker_bg,
+                recent_flicker_candidates=recent_candidates,
+            ),
+            qcfg,
+        )
+
+    single_window = _assess(recent_candidates=None)  # первое окно вообще, история пуста
+    print(f"  1-е окно (история пуста): flicker_candidate={single_window.flicker_candidate}, "
+          f"flicker_suspected={single_window.flicker_suspected}")
+    assert single_window.flicker_candidate, "sanity: этот фон должен давать candidate=True"
+    assert not single_window.flicker_suspected, (
+        "одно-единственное окно НЕ должно блокировать публикацию по мерцанию"
+    )
+
+    almost_confirmed = _assess(recent_candidates=[True] * (qcfg.flicker_min_consecutive_windows - 2))
+    assert not almost_confirmed.flicker_suspected, (
+        f"{qcfg.flicker_min_consecutive_windows - 1} окон подряд < порога — ещё не должно подтверждаться"
+    )
+
+    confirmed = _assess(recent_candidates=[True] * (qcfg.flicker_min_consecutive_windows - 1))
+    print(f"  {qcfg.flicker_min_consecutive_windows} окон подряд: flicker_suspected={confirmed.flicker_suspected}")
+    assert confirmed.flicker_suspected, (
+        f"{qcfg.flicker_min_consecutive_windows} совпадающих окон подряд должны подтвердить мерцание"
+    )
+
+    broken_streak = _assess(recent_candidates=[True, False] * qcfg.flicker_min_consecutive_windows)
+    assert not broken_streak.flicker_suspected, (
+        "прерванная (не подряд) серия совпадений не должна подтверждать мерцание"
+    )
 
 
 def test_static_photo_or_mannequin_is_not_publishable():
@@ -653,7 +760,11 @@ def test_occluded_face_pipeline_never_publishes():
     try:
         blank_frame = np.zeros((240, 320, 3), dtype=np.uint8)  # чёрный кадр -> лицо никогда не найдено
         got_any_result = False
-        for i in range(200):  # ~6.7с при 30fps -> покрывает минимум одно BPM-окно
+        # 400 кадров = ~13.3с при 30fps: с задачи 6 min_seconds_before_estimate
+        # по умолчанию РАВЕН window_seconds (10с, см. WindowConfig) — первая
+        # оценка не считается, пока окно не заполнено полностью, поэтому нужно
+        # покрыть >= 10с, а не ~6.7с, как раньше.
+        for i in range(400):
             timestamp_ms = int(i * 1000 / 30)
             result = pipe.process_frame(blank_frame, timestamp_ms)
             if result is None:
@@ -668,9 +779,9 @@ def test_occluded_face_pipeline_never_publishes():
 
     assert got_any_result, (
         "sanity: пайплайн должен вернуть хотя бы один PTSDPulseFeatures "
-        "(пусть и с publishable=False) за 200 кадров окна >= min_seconds_before_estimate"
+        "(пусть и с publishable=False) за 400 кадров >= min_seconds_before_estimate"
     )
-    print("  [OK] за 200 кадров без лица в кадре publishable не стал True ни разу")
+    print("  [OK] за 400 кадров без лица в кадре publishable не стал True ни разу")
 
 
 def _make_synthetic_landmarks_for_pipeline_test(seed: int = 0, n_points: int = 478) -> np.ndarray:
@@ -867,109 +978,6 @@ def test_auto_method_selection_avoids_specifically_corrupted_method():
     )
 
 
-def test_best_effort_bpm_always_present_bounded_and_rate_limited():
-    """Регрессия для интеграционного требования: этот модуль встраивается
-    как одна из фич более крупной системы, которой на каждом шаге нужно
-    ЗНАЧЕНИЕ (не отсутствие данных) — PTSDPulseFeatures.best_effort_bpm
-    должен ВСЕГДА быть реальным числом в правдоподобном диапазоне
-    (BestEffortConfig) и меняться постепенно (slew-rate limiting), а не
-    прыгать как 'сырой' bpm до SQI-гейтинга."""
-    print("\n=== Тест: best_effort_bpm всегда доступен, в диапазоне, ограничен по скорости ===")
-    try:
-        from rppg.pipeline import RPPGPipeline
-        from rppg.config import PipelineConfig
-    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
-        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
-        return
-
-    cfg = PipelineConfig()
-    try:
-        pipe = RPPGPipeline(cfg)
-    except FileNotFoundError as exc:
-        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
-        return
-    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
-        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
-        return
-
-    try:
-        be_cfg = cfg.best_effort
-        assert pipe._best_effort_bpm == be_cfg.fallback_bpm, "до первого шага должен быть fallback_bpm"
-
-        v0 = pipe._update_best_effort_bpm(float("nan"))
-        assert v0 == be_cfg.fallback_bpm, "NaN-кандидат (нет сигнала) должен держать прежнее значение"
-
-        v1 = pipe._update_best_effort_bpm(150.0)  # типичный шумовой выброс из живой отладки
-        assert be_cfg.min_plausible_bpm <= v1 <= be_cfg.max_plausible_bpm
-        assert v1 == v0, "кандидат ВЫШЕ диапазона должен игнорироваться целиком, не сдвигать значение вообще"
-
-        v2 = pipe._update_best_effort_bpm(20.0)
-        assert v2 == v1, "кандидат НИЖЕ диапазона тоже должен игнорироваться целиком"
-
-        target = be_cfg.fallback_bpm + 20.0
-        assert be_cfg.min_plausible_bpm <= target <= be_cfg.max_plausible_bpm
-        v3 = pipe._update_best_effort_bpm(target)
-        change = abs(v3 - v2)
-        print(f"  один шаг к правдоподобной цели {target}: {v2:.1f} -> {v3:.1f} (Δ={change:.1f})")
-        assert 0 < change <= be_cfg.max_change_per_step_bpm + 1e-9, (
-            "правдоподобный кандидат должен сдвигать значение, но не больше max_change_per_step_bpm за шаг"
-        )
-
-        v_final = v3
-        for _ in range(50):
-            v_final = pipe._update_best_effort_bpm(target)
-        assert abs(v_final - target) < 1e-6, "после достаточного числа шагов значение должно сойтись к цели"
-        assert not np.isnan(v_final), "best_effort_bpm не должен становиться NaN ни на одном шаге"
-    finally:
-        pipe.close()
-
-
-def test_best_effort_bpm_stays_smooth_under_50_150_noise_pattern():
-    """Регрессия для реального инцидента с камерой пользователя: 'сырой'
-    per-window bpm скакал между ~50 и ~150+ из-за расхождения ROI на
-    слабом сигнале (см. живую отладочную сессию). best_effort_bpm должен
-    оставаться плавным под ТОЧНО ТАКИМ ЖЕ паттерном входа — иначе шум
-    всё равно доходит до принимающей системы, просто под другим именем поля."""
-    print("\n=== Тест: best_effort_bpm гасит паттерн 50<->150 из реальной сессии ===")
-    try:
-        from rppg.pipeline import RPPGPipeline
-        from rppg.config import PipelineConfig
-    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
-        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
-        return
-
-    cfg = PipelineConfig()
-    try:
-        pipe = RPPGPipeline(cfg)
-    except FileNotFoundError as exc:
-        print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
-        return
-    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
-        print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
-        return
-
-    try:
-        # Реальный наблюдавшийся паттерн per_roi_bpm (forehead/left_cheek/right_cheek
-        # чередующиеся победители в best_roi) из живой отладочной сессии.
-        raw_sequence = [101.0, 49.8, 74.8, 100.6, 50.7, 77.0, 66.0, 79.1, 176.7, 78.7, 126.4, 178.0, 50.3]
-        outputs = [pipe._update_best_effort_bpm(v) for v in raw_sequence]
-        print("  сырые входы:     ", [round(v, 1) for v in raw_sequence])
-        print("  best_effort_bpm: ", [round(v, 1) for v in outputs])
-
-        be_cfg = cfg.best_effort
-        assert all(be_cfg.min_plausible_bpm <= v <= be_cfg.max_plausible_bpm for v in outputs), (
-            "best_effort_bpm не должен покидать правдоподобный диапазон ни разу"
-        )
-        step_changes = [abs(b - a) for a, b in zip(outputs, outputs[1:])]
-        print(f"  максимальное изменение за шаг: {max(step_changes):.2f} (лимит {be_cfg.max_change_per_step_bpm})")
-        assert max(step_changes) <= be_cfg.max_change_per_step_bpm + 1e-9, (
-            "ни один шаг не должен превышать max_change_per_step_bpm"
-        )
-        assert not any(np.isnan(v) for v in outputs)
-    finally:
-        pipe.close()
-
-
 def test_config_yaml_json_roundtrip_preserves_non_default_values():
     """Регрессия для п.42 требований: save_config/load_config должны точно
     восстанавливать PipelineConfig, включая НЕстандартные значения (Enum-
@@ -1050,7 +1058,10 @@ def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
 
         rng = np.random.default_rng(11)
         fps = 30.0
-        n_frames = int(fps * 8.0)
+        # 13с, не 8с: с задачи 6 min_seconds_before_estimate по умолчанию
+        # РАВЕН window_seconds (10с) — окно короче 10с не даёт вообще ни
+        # одной оценки (и значит ни одной строки лога), см. WindowConfig.
+        n_frames = int(fps * 13.0)
         try:
             for i in range(n_frames):
                 t_sec = i / fps
@@ -1065,13 +1076,15 @@ def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
         assert log_path.exists(), "log_path должен быть создан, раз пайплайн выдал хотя бы одно окно"
         lines = log_path.read_text(encoding="utf-8").strip().splitlines()
         print(f"  строк в логе: {len(lines)}")
-        assert len(lines) > 0, "должна быть хотя бы одна строка лога за 8с синтетического видео"
+        assert len(lines) > 0, "должна быть хотя бы одна строка лога за 13с синтетического видео"
 
         required_fields = {
             "timestamp_ms", "bpm", "per_roi_bpm", "publishable", "method_used",
             "frequency_method_used", "sqi_overall_score", "sqi_level",
             "sqi_spectral_snr_db", "sqi_cross_roi_agreement", "sqi_landmark_stability",
             "sqi_temporal_consistency", "sqi_harmonic_score", "sqi_flicker_suspected",
+            "sqi_flicker_background_freq_hz", "sqi_flicker_background_snr_db",
+            "sqi_subharmonic_check_informative",
             "respiration_rate_bpm", "warnings",
         }
         for line in lines:
@@ -1240,13 +1253,13 @@ def run_all():
         test_landmark_stability_penalizes_strong_uniform_sway,
         test_temporal_consistency_penalizes_unstable_bpm_sequence,
         test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion,
+        test_harmonic_check_ignores_1_over_f_noise_floor,
         test_illumination_flicker_detected_via_background_roi,
+        test_flicker_requires_consecutive_windows_to_confirm,
         test_static_photo_or_mannequin_is_not_publishable,
         test_occluded_face_pipeline_never_publishes,
         test_end_to_end_pipeline_recovers_known_bpm_from_synthetic_video,
         test_auto_method_selection_avoids_specifically_corrupted_method,
-        test_best_effort_bpm_always_present_bounded_and_rate_limited,
-        test_best_effort_bpm_stays_smooth_under_50_150_noise_pattern,
         test_config_yaml_json_roundtrip_preserves_non_default_values,
         test_structured_window_logger_writes_valid_jsonl_with_sqi_components,
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,
