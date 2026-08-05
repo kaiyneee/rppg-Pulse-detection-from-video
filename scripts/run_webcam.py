@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -26,78 +25,122 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
+from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod, TrackerConfig
 from rppg.config_io import load_config
 from rppg.pipeline import RPPGPipeline
+from rppg.signal.tracker import PulseTracker, TrackerOutput
 from rppg.face.roi import build_roi_mask, build_background_roi_mask, ROI_LANDMARK_INDICES
 
-# Сколько последних ПУБЛИКУЕМЫХ (SQI ok) оценок усредняем для отображаемого
-# числа. Даже среди publishable=True окон отдельные оценки могут скакать —
-# медиана нескольких последних сглаживает это для живого демо, не трогая
-# сам pipeline/SQI (это чисто отображение, см. draw_overlay).
-DISPLAY_SMOOTHING_WINDOW = 5
-# Если дольше этого не было ни одной publishable-оценки — считаем
-# сглаженное число устаревшим и не показываем его (человек мог отойти,
-# сменить освещение и т.п.), а не морозим старое значение на экране.
-STALE_AFTER_MS = 10_000
+# Задача 14: три уровня доверия для цвета/толщины числа на экране. HIGH
+# совпадает с порогом QualityLevel.HIGH в quality.py::assess_quality (тот
+# же литерал 0.75, задокументированный там же) — не отдельная калиброванная
+# константа, а переиспользование уже существующей границы. MEDIUM — порог
+# публикации из живого QualityConfig (qcfg.min_overall_score_to_publish),
+# передаётся в draw_overlay, а не дублируется здесь числом.
+_CONFIDENCE_HIGH_THRESHOLD = 0.75
+_COLOR_HIGH = (0, 200, 0)      # зелёный
+_COLOR_MEDIUM = (0, 210, 210)  # жёлтый
+_COLOR_LOW = (160, 160, 160)   # серый
+_COLOR_STALE = (120, 120, 120)  # серый, чуть темнее LOW — визуально "ещё дальше" от доверенного
 
 
-def draw_overlay(frame, result, smoothed_bpm: float | None,
+def _confidence_style(confidence: float, min_publish_threshold: float) -> tuple[tuple[int, int, int], int]:
+    """(цвет BGR, толщина линии) по confidence — задача 14: зелёный/жёлтый/
+    серый, а не бинарный publishable=True/False, который читается как
+    поломка при False."""
+    if confidence >= _CONFIDENCE_HIGH_THRESHOLD:
+        return _COLOR_HIGH, 3
+    if confidence >= min_publish_threshold:
+        return _COLOR_MEDIUM, 2
+    return _COLOR_LOW, 1
+
+
+def draw_overlay(frame, result, tracker_output: TrackerOutput, qcfg,
                   buffered_seconds: float = 0.0, target_seconds: float = 0.0) -> None:
+    """Задача 14: BPM показывается ВСЕГДА (крупно), цвет/толщина — по
+    confidence, а не бинарный "хорошо/плохо". Пустого экрана нет никогда
+    ПОСЛЕ прогрева — единственное исключение (текст вместо числа) это
+    status="no_signal" И тracker ещё ни разу не видел ни одного реального
+    измерения (см. ниже), что честно, а не результат недосмотра."""
     if result is None:
-        # Задача 6: раньше это было просто "Buffering..." без чисел —
-        # с тех пор как min_seconds_before_estimate по умолчанию равен
-        # window_seconds, process_frame() возвращает None ВСЮ буферизацию
-        # целиком (несколько секунд), и голая надпись без прогресса легко
-        # читается как "программа зависла", а не "ждёт заполнения окна".
+        # Задача 6: process_frame() возвращает None ВСЮ буферизацию целиком
+        # (несколько секунд, см. min_seconds_before_estimate==window_seconds)
+        # — голая надпись без прогресса легко читается как "программа
+        # зависла", а не "ждёт заполнения окна".
         cv2.putText(frame, f"Buffering... {buffered_seconds:.1f} / {target_seconds:.1f} c",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         return
 
-    # ВАЖНО: показываем число ТОЛЬКО когда SQI ему доверяет (smoothed_bpm
-    # приходит из окон с publishable=True, см. main()). Раньше здесь
-    # показывался result.bpm ЛЮБОГО окна (просто другим цветом, если
-    # publishable=False) — визуально выглядело как "пульс скачет 50<->150",
-    # хотя на самом деле система КОРРЕКТНО не доверяла этим числам, просто
-    # всё равно их печатала. Не публикуемые, но реально существующие числа
-    # ещё сильнее шумят, чем можно было бы подумать по (относительно
-    # спокойному) SQI-скору — сам SQI не гарантирует, что НЕОПУБЛИКОВАННОЕ
-    # число близко к истине, гарантия действует только для publishable=True.
-    if smoothed_bpm is not None:
-        cv2.putText(frame, f"BPM: {smoothed_bpm:.0f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 0), 2)
+    # --- Главное число: ВСЕГДА что-то показываем после прогрева ---
+    if tracker_output.bpm is not None:
+        color, thickness = (
+            (_COLOR_STALE, 2) if not tracker_output.is_fresh
+            else _confidence_style(result.confidence, qcfg.min_overall_score_to_publish)
+        )
+        cv2.putText(frame, f"BPM: {tracker_output.bpm:.0f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, thickness)
+        if not tracker_output.is_fresh:
+            age = tracker_output.age_seconds or 0.0
+            cv2.putText(frame, f"({age:.0f}s ago)", (200, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _COLOR_STALE, 1)
+        elif result.confidence < qcfg.min_overall_score_to_publish:
+            cv2.putText(frame, "низкая достоверность", (200, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLOR_LOW, 1)
+    elif result.status == "ok":
+        # Трекер ещё не набрал НИ ОДНОГО валидного (confidence>0) окна, но
+        # ТЕКУЩЕЕ окно уже дало реальную (просто ненадёжную) спектральную
+        # оценку (см. задачу 11: bpm всегда реален при status="ok") —
+        # показываем её напрямую, серым, а не молчим до первого "хорошего" окна.
+        cv2.putText(frame, f"BPM: {result.bpm:.0f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, _COLOR_LOW, 1)
+        cv2.putText(frame, "низкая достоверность", (200, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLOR_LOW, 1)
     else:
-        cv2.putText(frame, "Измеряю пульс... (нужно больше света, лицо ближе, поменьше движения)",
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+        # status="no_signal" И ни одного реального измерения ещё не было —
+        # честно нечего показать вместо числа (не тот же случай, что
+        # "нет доступа к камере": лицо есть, но НИ ОДИН ROI не дал сигнала).
+        cv2.putText(frame, "нет сигнала (нужно больше света, лицо ближе, поменьше движения)",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _COLOR_LOW, 1)
 
-    color = (0, 200, 0) if result.publishable else (0, 165, 255)
-    cv2.putText(frame, f"SQI: {result.sqi_level} ({result.sqi_score:.2f})", (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-    cv2.putText(frame, f"method: {result.method_used}/{result.frequency_method_used}", (20, 85),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    # Задача 8: раньше здесь был best_effort_bpm — ВСЕГДА реальное число
-    # (даже без сигнала, стартуя с fallback=75), неотличимое на глаз от
-    # настоящего измерения. last_valid_bpm — ЧЕСТНАЯ альтернатива: либо
-    # последнее РЕАЛЬНО измеренное значение с его возрастом (человек сам
-    # видит, насколько оно устарело), либо явное "измерений ещё не было" —
-    # ни то, ни другое НИКОГДА не рисуется зелёным (тем же цветом, что и
-    # доверенный BPM выше), чтобы их нельзя было спутать на экране.
+    # --- Полоска уверенности ТЕКУЩЕГO окна (не сглаженного bpm выше) ---
+    bar_x0, bar_y0, bar_w, bar_h = 20, 55, 200, 10
+    cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + bar_w, bar_y0 + bar_h), (90, 90, 90), 1)
+    conf_color, _ = _confidence_style(result.confidence, qcfg.min_overall_score_to_publish)
+    filled = int(bar_w * float(np.clip(result.confidence, 0.0, 1.0)))
+    cv2.rectangle(frame, (bar_x0 + 1, bar_y0 + 1), (bar_x0 + max(1, filled), bar_y0 + bar_h - 1), conf_color, -1)
+    cv2.putText(frame, f"confidence: {result.confidence:.2f}", (bar_x0 + bar_w + 10, bar_y0 + bar_h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, conf_color, 1)
+
+    cv2.putText(frame, f"method: {result.method_used}/{result.frequency_method_used}", (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+    # Задача 8/14: последнее измерение с доверием ВЫШЕ порога передачи и
+    # его возраст — ЧЕСТНАЯ альтернатива прежнему best_effort_bpm (никогда
+    # не рисуется тем же зелёным, что и доверенное число выше).
     if result.last_valid_bpm is not None:
         last_valid_text = (
-            f"last valid measurement: {result.last_valid_bpm:.0f} BPM "
+            f"last measurement above threshold: {result.last_valid_bpm:.0f} BPM "
             f"({result.last_valid_bpm_age_s:.0f}s ago)"
         )
     else:
-        last_valid_text = "last valid measurement: ещё не было ни одного измерения"
-    cv2.putText(frame, last_valid_text, (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+        last_valid_text = "last measurement above threshold: ещё не было ни одного"
+    cv2.putText(frame, last_valid_text, (20, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
 
     if result.hrv is not None and result.publishable:
         cv2.putText(frame, f"SDNN: {result.hrv.sdnn_ms:.0f}ms  RMSSD: {result.hrv.rmssd_ms:.0f}ms  "
                             f"pNN50: {result.hrv.pnn50_pct:.0f}%",
-                    (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+                    (20, 134), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _COLOR_HIGH, 1)
 
-    if not result.publishable:
-        cv2.putText(frame, "LOW QUALITY - not sent to PTSD pipeline", (20, 155),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    # Задача 14: убрана формулировка "LOW QUALITY - not sent to PTSD
+    # pipeline" — читается как поломка системы, а не как честная оценка
+    # качества сигнала ПРЯМО СЕЙЧАС. Вместо бинарного статуса — конкретное
+    # число и порог, ВСЕГДА видимые (не только когда всё плохо), чтобы
+    # "0.48 против порога 0.50" не выглядело принципиально иначе, чем
+    # "0.05 против порога 0.50".
+    status_color, _ = _confidence_style(result.confidence, qcfg.min_overall_score_to_publish)
+    if result.publishable:
+        status_text = f"достоверность {result.confidence:.2f} — публикуется (порог {qcfg.min_overall_score_to_publish:.2f})"
+    else:
+        status_text = (
+            f"достоверность {result.confidence:.2f} — ниже порога передачи "
+            f"{qcfg.min_overall_score_to_publish:.2f}"
+        )
+    cv2.putText(frame, status_text, (20, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1)
 
 
 # Цвета контуров ROI на кадре в --debug (см. draw_roi_contours). Отдельные
@@ -327,11 +370,23 @@ def main() -> None:
 
     start_ms = time.time() * 1000
 
-    published_bpm_history: deque = deque(maxlen=DISPLAY_SMOOTHING_WINDOW)
-    last_published_ms: int | None = None
+    # Задача 12/14: PulseTracker заменяет прежнее ручное сглаживание
+    # (deque + медиана только по publishable=True окнам, с отдельным
+    # STALE_AFTER_MS) — трекер сам взвешивает окна по confidence (нулевой
+    # вес вместо исключения из выборки) и сам отдаёт (last_valid_bpm, age)
+    # вместо "устарело -> показываем None". Диапазон — физиологическая
+    # полоса ИЗ ЭТОГО КОНКРЕТНОГО конфига (а не константа модуля).
+    tracker_cfg = TrackerConfig()
+    tracker = PulseTracker(
+        window_size=tracker_cfg.window_size,
+        min_bpm=config.filt.low_hz * 60.0,
+        max_bpm=config.filt.high_hz * 60.0,
+        max_change_per_step_bpm=tracker_cfg.max_change_per_step_bpm,
+    )
 
     with RPPGPipeline(config, log_path=args.log, debug=args.debug) as pipeline:
         last_result = None
+        tracker_output = TrackerOutput(bpm=None, is_fresh=False, age_seconds=None)
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -341,16 +396,13 @@ def main() -> None:
             result = pipeline.process_frame(frame, timestamp_ms)
             if result is not None:
                 last_result = result
-                if result.publishable:
-                    published_bpm_history.append(result.bpm)
-                    last_published_ms = timestamp_ms
+                tracker_output = tracker.update(
+                    timestamp_s=timestamp_ms / 1000.0, bpm=result.bpm, confidence=result.confidence
+                )
                 if result.warnings:
                     print(f"[{timestamp_ms/1000:.1f}s] " + " | ".join(result.warnings))
 
-            is_stale = last_published_ms is None or timestamp_ms - last_published_ms > STALE_AFTER_MS
-            smoothed_bpm = None if is_stale or not published_bpm_history else float(np.median(published_bpm_history))
-
-            draw_overlay(frame, last_result, smoothed_bpm,
+            draw_overlay(frame, last_result, tracker_output, config.quality,
                          buffered_seconds=pipeline.buffered_seconds,
                          target_seconds=pipeline.cfg.window.min_seconds_before_estimate)
             if args.debug:
