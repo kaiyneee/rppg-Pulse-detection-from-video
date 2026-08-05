@@ -98,7 +98,7 @@ def compute_psd(signal: np.ndarray, fps: float) -> tuple[np.ndarray | None, np.n
 
 
 def dominant_frequency_and_snr(
-    signal: np.ndarray, fps: float, band_hz: tuple[float, float], include_second_harmonic: bool = False,
+    signal: np.ndarray, fps: float, band_hz: tuple[float, float], include_second_harmonic: bool = True,
 ) -> tuple[float, float]:
     """
     Возвращает (доминирующая_частота_Hz, spectral_snr_dB).
@@ -109,17 +109,20 @@ def dominant_frequency_and_snr(
     (select_best_component_by_periodicity ниже) — общий инвариант: "хорошая"
     пульсовая компонента должна быть узкополосной.
 
-    include_second_harmonic (задача 5, п.2): по умолчанию False — сохраняет
-    исходное определение (энергия только на f). Wang et al. (2016, POS)
-    определяют SNR ИНАЧЕ: в энергию сигнала входит и узкая полоса вокруг 2-й
-    гармоники 2f — систолический подъём делает пульсовую волну
-    несинусоидальной, и 2-я гармоника несёт реальную физиологическую
-    энергию, а не шум. Наше определение по умолчанию строже литературного
-    (не засчитывает 2f как "сигнал"), что даёт систематически более низкий
-    snr_db при том же реальном качестве сигнала. include_second_harmonic=True
-    включает альтернативный (Wang et al.) режим — ТОЛЬКО для сравнения
-    "наших" порогов с литературными числами (см. scripts/analyze_log.py,
-    задача 5), не используется по умолчанию нигде в пайплайне. См. также
+    include_second_harmonic (задача 13а, ранее задача 5 п.2): ПО УМОЛЧАНИЮ
+    True с задачи 13а — это определение Wang et al. (2016, POS): в энергию
+    сигнала входит и узкая полоса вокруг 2-й гармоники 2f, т.к. систолический
+    подъём делает пульсовую волну несинусоидальной, и 2-я гармоника несёт
+    реальную физиологическую энергию, а не шум. ДО задачи 13а по умолчанию
+    было False (энергия только на f) — это определение строже литературного
+    и давало систематически более низкий snr_db при том же реальном качестве
+    сигнала; ретроспективно (см. QualityConfig.include_second_harmonic_in_snr)
+    это было одной из вероятных причин заниженного покрытия при пороге 3.0 дБ.
+    include_second_harmonic=False оставлен только для воспроизведения СТАРОГО
+    (более строгого) поведения и для сравнения "наших" порогов со старыми
+    значениями (см. scripts/analyze_log.py, задача 5) — самим этим
+    параметром управляет QualityConfig.include_second_harmonic_in_snr, а не
+    жёстко закодированное значение здесь. См. также
     benchmark/evaluate.py::reference_relative_snr_db — то же определение с
     2-й гармоникой, но относительно ИЗВЕСТНОЙ референсной частоты (для
     валидации на датасете с ground truth), а не найденного здесь пика (для
@@ -171,13 +174,45 @@ def select_best_component_by_periodicity(
     return best_idx
 
 
-def cross_roi_agreement_score(bpm_by_roi: dict[str, float], max_diff: float = 8.0) -> float:
-    """1.0 = все ROI согласны, 0.0 = расхождение >= max_diff BPM."""
-    values = [v for v in bpm_by_roi.values() if v is not None and not np.isnan(v)]
+def cross_roi_agreement_score(
+    bpm_by_roi: dict[str, float],
+    snr_by_roi_db: dict[str, float] | None = None,
+    min_component_snr_db: float = 0.0,
+    max_diff: float = 15.0,
+) -> float:
+    """1.0 = ROI согласны, 0.0 = медианное абсолютное отклонение (MAD) от
+    медианы >= max_diff BPM (задача 13б).
+
+    ДВЕ правки относительно исходной версии (сравнение РАЗМАХА max-min с
+    порогом):
+
+    1. MAD вместо range. Размах утягивается ОДНИМ выбросом: если два ROI
+       согласны на 70 BPM, а третий (например, засвеченная щека) дал 150,
+       range=80 обнуляет компоненту целиком, хотя два из трёх ROI на самом
+       деле прекрасно согласны. MAD — медиана |x_i - медиана(x)| — сдвигается
+       одним выбросом гораздо меньше: медиана всей выборки [70,70,150]
+       остаётся 70, и MAD = medianOf(|70-70|, |70-70|, |150-70|) = 0, т.е.
+       компонента корректно отражает "большинство ROI согласны", а не
+       "хотя бы одно ROI не согласно".
+    2. Фильтр по СОБСТВЕННОМУ SNR ROI (snr_by_roi_db). Сравнивать оценку
+       заведомо шумного ROI (в котором нет пульсовой компоненты вообще, SNR
+       глубоко отрицательный) с оценкой хорошего ROI бессмысленно — их
+       "согласие" или "несогласие" chance, а не сигнал о качестве. Если
+       snr_by_roi_db передан, в сравнение попадают только ROI с
+       собственным SNR >= min_component_snr_db.
+
+    Если после фильтрации осталось < 2 ROI — недостаточно данных для
+    перекрёстной проверки, возвращается нейтральная оценка 0.5 (как и
+    раньше для len(values) < 2)."""
+    names = [n for n, v in bpm_by_roi.items() if v is not None and not np.isnan(v)]
+    if snr_by_roi_db is not None:
+        names = [n for n in names if snr_by_roi_db.get(n, float("-inf")) >= min_component_snr_db]
+    values = [bpm_by_roi[n] for n in names]
     if len(values) < 2:
-        return 0.5  # недостаточно ROI для перекрёстной проверки — нейтральная оценка
-    spread = max(values) - min(values)
-    return float(np.clip(1.0 - spread / max_diff, 0.0, 1.0))
+        return 0.5  # недостаточно (достаточно надёжных) ROI для перекрёстной проверки — нейтральная оценка
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(np.array(values) - median)))
+    return float(np.clip(1.0 - mad / max_diff, 0.0, 1.0))
 
 
 def landmark_stability_score(
@@ -237,9 +272,38 @@ def landmark_stability_score(
     return float(np.clip(1.0 - instability, 0.0, 1.0))
 
 
+def spectral_resolution_bpm(fps: float, n_samples: int, frequency_method: str = "welch") -> float:
+    """Шаг частотной сетки конкретного эстиматора BPM (frequency.py),
+    переведённый в BPM (задача 13в). Дрожание оценки МЕНЬШЕ этого шага между
+    соседними окнами физически неотличимо от дискретности самой сетки — это
+    НЕ признак нестабильности реального сигнала, и temporal_consistency_score
+    не должен штрафовать за него.
+
+    Зеркалит РЕАЛЬНЫЙ nfft/сетку каждого метода 1:1 с frequency.py (иначе
+    оценка нижней границы разошлась бы с тем, что метод оценки частоты
+    реально использует) — не более тонкую теоретическую оценку
+    неопределённости пика (например, по Крамеру-Рао), которая дополнительно
+    зависела бы от SNR, недоступного здесь как отдельный параметр."""
+    if frequency_method == "lomb_scargle":
+        # estimate_hr_lombscargle: n_freqs=512 точек РАВНОМЕРНО по всей
+        # рабочей полосе (не зависит от fps/n_samples) — полоса сюда не
+        # передаётся (не тащить её через весь SQIInputs ради одного частного
+        # случая), берётся типичная ширина 3.3 Гц (0.7-4.0) как ориентир.
+        band_width_hz = 3.3
+        return (band_width_hz / 512) * 60.0
+    if frequency_method == "fft":
+        n_fft = max(1024, int(2 ** np.ceil(np.log2(max(n_samples, 1)))) * 4)
+    else:  # "welch" (по умолчанию) и любой нераспознанный метод
+        nperseg = min(n_samples, max(64, int(fps * 8)))
+        n_fft = max(2048, int(2 ** np.ceil(np.log2(max(nperseg, 1)))) * 4)
+    resolution_hz = fps / n_fft
+    return resolution_hz * 60.0
+
+
 def temporal_consistency_score(
     recent_bpm_history: list[float] | None,
     max_expected_change_bpm: float = 6.0,
+    min_resolvable_bpm: float = 0.0,
 ) -> float:
     """
     Устойчивость оценки BPM между соседними перекрывающимися окнами (п.20
@@ -257,6 +321,13 @@ def temporal_consistency_score(
     соседними оценками, а нестабильный источник (артефакт, потеря трекинга,
     смена доминирующей частоты в спектре) обычно даёт заметно менее
     консистентную серию оценок.
+
+    min_resolvable_bpm (задача 13в): нижняя граница ожидаемого изменения —
+    см. spectral_resolution_bpm выше. max_expected_change_bpm сам по себе —
+    фиксированное инженерное число (см. QualityConfig, TODO(калибровка));
+    эффективный порог — БОЛЬШЕЕ из двух, чтобы формула не штрафовала за
+    дрожание, объяснимое дискретностью спектра, даже если
+    max_expected_change_bpm откалиброван слишком строго для короткого окна.
     """
     if recent_bpm_history is None:
         return 0.5
@@ -265,7 +336,8 @@ def temporal_consistency_score(
         return 0.5  # недостаточно истории (начало записи) — нейтральная оценка
     diffs = np.abs(np.diff(values))
     mean_diff = float(np.mean(diffs))
-    return float(np.clip(1.0 - mean_diff / max_expected_change_bpm, 0.0, 1.0))
+    effective_threshold = max(max_expected_change_bpm, min_resolvable_bpm)
+    return float(np.clip(1.0 - mean_diff / effective_threshold, 0.0, 1.0))
 
 
 def _local_bump_ratio(
@@ -485,6 +557,15 @@ class SQIInputs:
     fps: float
     band_hz: tuple[float, float]
     bpm_by_roi: dict[str, float]
+    # Задача 13б: собственный spectral SNR каждого ROI (дБ) — для фильтрации
+    # заведомо шумных ROI из cross_roi_agreement_score. None -> фильтрация
+    # не применяется (используются все ROI из bpm_by_roi, как раньше).
+    snr_by_roi_db: dict[str, float] | None = None
+    # Задача 13в: длина окна в отсчётах и метод оценки частоты — для
+    # spectral_resolution_bpm (нижняя граница ожидаемого дрожания BPM между
+    # окнами, объяснимая дискретностью частотной сетки, а не сигналом).
+    n_samples: int = 0
+    frequency_method: str = "welch"
     landmark_trajectories: np.ndarray | None = None
     interocular_distances_px: np.ndarray | None = None
     recent_bpm_history: list[float] | None = None
@@ -559,7 +640,12 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
     # отдельно от того, ту ли частоту мы вообще нашли).
     snr_score *= harmonic_score
 
-    roi_score = cross_roi_agreement_score(inputs.bpm_by_roi, max_diff=qcfg.max_cross_roi_bpm_diff)
+    roi_score = cross_roi_agreement_score(
+        inputs.bpm_by_roi,
+        snr_by_roi_db=inputs.snr_by_roi_db,
+        min_component_snr_db=qcfg.cross_roi_min_component_snr_db,
+        max_diff=qcfg.max_cross_roi_bpm_diff,
+    )
     if roi_score < 0.5:
         warnings.append(
             "Оценки BPM с разных ROI расходятся — вероятна частичная окклюзия "
@@ -577,8 +663,11 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
             "вероятны резкие движения головы или сбои трекинга."
         )
 
+    min_resolvable_bpm = spectral_resolution_bpm(inputs.fps, inputs.n_samples, inputs.frequency_method)
     temporal_score = temporal_consistency_score(
-        inputs.recent_bpm_history, max_expected_change_bpm=qcfg.max_expected_bpm_change_per_step
+        inputs.recent_bpm_history,
+        max_expected_change_bpm=qcfg.max_expected_bpm_change_per_step,
+        min_resolvable_bpm=min_resolvable_bpm,
     )
     if temporal_score < 0.5:
         warnings.append(
