@@ -515,6 +515,76 @@ def test_temporal_consistency_penalizes_unstable_bpm_sequence():
     assert too_short == 0.5, "при недостаточной истории score должен быть нейтральным (0.5)"
 
 
+def test_temporal_consistency_does_not_penalize_spectral_grid_jitter():
+    """Регрессия для задачи 13в: дрожание BPM МЕНЬШЕ шага частотной сетки
+    эстиматора физически неотличимо от дискретности самой сетки, а не
+    признак нестабильности сигнала — formula не должна штрафовать за него."""
+    print("\n=== Тест: temporal_consistency не штрафует дрожание в пределах разрешения спектра (13в) ===")
+    from rppg.signal.quality import temporal_consistency_score, spectral_resolution_bpm
+
+    fps, n_samples = 30.0, 300
+    resolution = spectral_resolution_bpm(fps, n_samples, "welch")
+    print(f"  spectral_resolution_bpm(fps=30, n=300, welch) = {resolution:.4f} BPM")
+    assert 0.0 < resolution < 6.0, "sanity: разрешение Welch-сетки должно быть маленьким, но не нулевым"
+
+    # Дрожание ЗАМЕТНО МЕНЬШЕ шага сетки (5%) — при жёстком max_expected_change_bpm
+    # (меньше самого шага сетки) старая формула ложно оштрафовала бы даже это.
+    tiny_jitter = [72.0, 72.0 + resolution * 0.05, 72.0, 72.0 + resolution * 0.05, 72.0, 72.0 + resolution * 0.05]
+    score_without_floor = temporal_consistency_score(tiny_jitter, max_expected_change_bpm=0.01, min_resolvable_bpm=0.0)
+    score_with_floor = temporal_consistency_score(
+        tiny_jitter, max_expected_change_bpm=0.01, min_resolvable_bpm=resolution
+    )
+    print(f"  без нижней границы: {score_without_floor:.3f}, с нижней границей: {score_with_floor:.3f}")
+    assert score_without_floor < 0.5, "sanity: без нижней границы жёсткий max_expected_change_bpm душит даже мелкое дрожание"
+    assert score_with_floor > 0.9, (
+        "дрожание в пределах разрешения спектра НЕ должно штрафоваться, если применена нижняя граница"
+    )
+
+
+def test_cross_roi_agreement_robust_to_single_outlier_roi():
+    """Регрессия для задачи 13б: раньше сравнивался РАЗМАХ (max-min) — одно
+    выпавшее ROI (например, засвеченная щека) утягивало его и обнуляло
+    компоненту целиком, даже если ОСТАЛЬНЫЕ ROI прекрасно согласны. MAD
+    (медианное абсолютное отклонение) должен быть устойчив к такому выбросу."""
+    print("\n=== Тест: cross_roi_agreement устойчив к одному выпавшему ROI (13б) ===")
+    from rppg.signal.quality import cross_roi_agreement_score
+
+    two_agree_one_outlier = {"forehead": 70.0, "left_cheek": 71.0, "right_cheek": 150.0}
+    all_disagree = {"forehead": 70.0, "left_cheek": 110.0, "right_cheek": 150.0}
+
+    score_outlier = cross_roi_agreement_score(two_agree_one_outlier)
+    score_all_disagree = cross_roi_agreement_score(all_disagree)
+    print(f"  два согласны + один выброс: {score_outlier:.3f}")
+    print(f"  все три расходятся:         {score_all_disagree:.3f}")
+
+    assert score_outlier > 0.8, "два согласных ROI из трёх должны давать высокий score несмотря на один выброс"
+    assert score_all_disagree < score_outlier, "когда РЕАЛЬНО все три расходятся, score должен быть ниже"
+
+
+def test_cross_roi_agreement_ignores_low_snr_roi():
+    """Регрессия для задачи 13б: сравнивать оценку заведомо шумного ROI
+    (SNR глубоко отрицательный — пульсовой компоненты там нет) с оценкой
+    хорошего ROI бессмысленно. Если снабдить cross_roi_agreement_score
+    собственным SNR каждого ROI, шумный ROI должен ИСКЛЮЧАТЬСЯ из сравнения,
+    а не тянуть агрегированную оценку вниз наравне с хорошими."""
+    print("\n=== Тест: cross_roi_agreement игнорирует ROI с низким собственным SNR (13б) ===")
+    from rppg.signal.quality import cross_roi_agreement_score
+
+    bpm_by_roi = {"forehead": 70.0, "left_cheek": 71.0, "right_cheek": 140.0}
+    snr_by_roi_db = {"forehead": 8.0, "left_cheek": 7.5, "right_cheek": -6.0}  # right_cheek явно шумит
+
+    score_without_filter = cross_roi_agreement_score(bpm_by_roi)
+    score_with_filter = cross_roi_agreement_score(bpm_by_roi, snr_by_roi_db=snr_by_roi_db, min_component_snr_db=0.0)
+    print(f"  без фильтра по SNR: {score_without_filter:.3f}")
+    print(f"  с фильтром по SNR:  {score_with_filter:.3f}")
+
+    assert score_with_filter > score_without_filter, (
+        "исключение заведомо шумного ROI по его собственному SNR должно повышать согласие "
+        "оставшихся (реально согласных) ROI"
+    )
+    assert score_with_filter > 0.9, "после исключения шумного ROI два оставшихся почти идентичных значения должны давать высокий score"
+
+
 def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
     """Регрессия для п.21: если заявленный пик совпадает со ВТОРОЙ гармоникой
     реального тона (в сигнале сопоставимая энергия и на f, и на f/2), это
@@ -1252,6 +1322,9 @@ def run_all():
         test_white_noise_is_not_publishable,
         test_landmark_stability_penalizes_strong_uniform_sway,
         test_temporal_consistency_penalizes_unstable_bpm_sequence,
+        test_temporal_consistency_does_not_penalize_spectral_grid_jitter,
+        test_cross_roi_agreement_robust_to_single_outlier_roi,
+        test_cross_roi_agreement_ignores_low_snr_roi,
         test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion,
         test_harmonic_check_ignores_1_over_f_noise_floor,
         test_illumination_flicker_detected_via_background_roi,
