@@ -81,14 +81,16 @@ def main() -> None:
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "timestamp_ms", "bpm", "publishable", "best_effort_bpm", "sqi_score", "sqi_level",
+            "timestamp_ms", "bpm", "publishable", "last_valid_bpm", "last_valid_bpm_age_s", "sqi_score", "sqi_level",
             "mean_hr_bpm", "sdnn_ms", "rmssd_ms", "pnn50_pct", "pnn20_pct",
             "lf_hf_ratio", "method_used", "frequency_method_used", "warnings",
         ])
         for r in rows:
             hrv = r.hrv
+            last_valid = f"{r.last_valid_bpm:.2f}" if r.last_valid_bpm is not None else ""
+            last_valid_age = f"{r.last_valid_bpm_age_s:.1f}" if r.last_valid_bpm_age_s is not None else ""
             writer.writerow([
-                r.timestamp_ms, r.bpm, r.publishable, f"{r.best_effort_bpm:.2f}",
+                r.timestamp_ms, r.bpm, r.publishable, last_valid, last_valid_age,
                 f"{r.sqi_score:.3f}", r.sqi_level,
                 hrv.mean_hr_bpm if hrv else "", hrv.sdnn_ms if hrv else "",
                 hrv.rmssd_ms if hrv else "", hrv.pnn50_pct if hrv else "",

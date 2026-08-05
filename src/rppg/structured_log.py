@@ -42,12 +42,18 @@ class WindowLogRecord:
     sqi_temporal_consistency: float
     sqi_harmonic_score: float
     sqi_flicker_suspected: bool
+    # Задача 7, п.4: частота/SNR фонового пика КАЖДОГО окна (не только когда
+    # flicker_suspected=True) — материал для scripts/analyze_log.py, чтобы
+    # показать, насколько ОБОСНОВАННО срабатывает детектор мерцания, а не
+    # только сам факт срабатывания. -inf, если фон недоступен/отфильтрован
+    # как "нет данных" (см. QualityConfig.flicker_min_raw_std).
+    sqi_flicker_background_freq_hz: float
+    sqi_flicker_background_snr_db: float
+    # Задача 4, п.3: False, если f/2 был ниже рабочей полосы и проверка
+    # субгармоники была пропущена как физически неинформативная (обычный
+    # случай при BPM покоя < ~84) — см. quality.harmonic_plausibility.
+    sqi_subharmonic_check_informative: bool
     respiration_rate_bpm: float | None
-    # Всегда реальное число (никогда NaN) — см. BestEffortConfig в config.py
-    # и RPPGPipeline._update_best_effort_bpm. НЕ то же самое, что bpm/
-    # publishable выше: предназначено для интеграции как soft-фичи в
-    # более крупную систему, не для научного/клинического использования.
-    best_effort_bpm: float
     warnings: list[str] = field(default_factory=list)
 
     def to_json_line(self) -> str:
