@@ -121,7 +121,18 @@ def process_finger_video(
 
         elapsed_s = (ts_buffer_ms[-1] - ts_buffer_ms[0]) / 1000.0 if len(ts_buffer_ms) > 1 else 0.0
         frame_idx += 1
-        if elapsed_s < window_seconds:
+        # ВАЖНО: обрезка выше жёстко поддерживает elapsed_s <= window_seconds
+        # КАЖДЫЙ кадр — из этого следует, что elapsed_s достигает window_seconds
+        # ТОЧНО только если чья-то метка времени ровно совпадёт с cutoff. При
+        # идеально равномерной сетке кадров с "некруглым" fps (типично для
+        # видеофайла с телефона, например 60.0143 — реальный случай, на
+        # котором это найдено) elapsed_s стабилизируется РОВНО на
+        # (window_seconds - один период кадра) и остаётся там НАВСЕГДА — без
+        # допуска ниже process_finger_video молча не вернул бы НИ ОДНОЙ
+        # оценки на ВЕСЬ файл, независимо от его длины (см. тот же допуск и
+        # его математическое обоснование в pipeline.py::process_frame).
+        readiness_tolerance_s = 1.5 / fps if fps > 0 else 0.0
+        if elapsed_s < window_seconds - readiness_tolerance_s:
             continue  # окно ещё не заполнено — см. задачу 6, тот же принцип: не оценивать по неполному окну
         if last_estimate_ms is not None and ts_ms - last_estimate_ms < step_seconds * 1000.0:
             continue
