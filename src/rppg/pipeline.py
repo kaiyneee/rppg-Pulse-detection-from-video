@@ -87,11 +87,54 @@ class PTSDPulseFeatures:
     """Итоговая структура, которая уходит в систему анализа ПТСР."""
 
     timestamp_ms: int
+    # Задача 11: заполняется ВСЕГДА, когда было хоть одно валидное окно
+    # (т.е. хотя бы один ROI дал сигнал) — bpm приходит НАПРЯМУЮ из спектра
+    # этого окна (см. _compute_estimate), независимо от confidence/
+    # publishable. NaN — ТОЛЬКО когда валидных окон не было вообще
+    # (status="no_signal" ниже), никогда как "тихая" замена низкой
+    # уверенности. Другими словами: bpm отвечает на вопрос "что показал
+    # спектр", а publishable/confidence — на вопрос "можно ли этому верить".
     bpm: float
     hrv: HRVFeatures | None
     sqi_score: float
     sqi_level: str
+    # Задача 11: ПРОИЗВОДНЫЙ удобный флаг для потребителя, который не хочет
+    # разбираться в компонентах SQI: publishable = confidence >=
+    # QualityConfig.min_overall_score_to_publish — простое пороговое
+    # правило, НЕ единственный интерфейс. В частности, ОНО НЕ учитывает
+    # flicker_suspected и жёсткий пол по spectral_snr_db по отдельности
+    # (см. confidence_breakdown ниже) — тот более строгий рейл, который
+    # структурный JSONL-лог (structured_log.py) логирует под тем же именем
+    # "publishable", здесь СОЗНАТЕЛЬНО не воспроизведён 1:1: цель этого поля
+    # — дать разумный дефолт с порогом "из коробки", а не заменить собой
+    # анализ confidence_breakdown для тех, кому нужна строгая семантика
+    # (см. пример строгого правила в docstring confidence_breakdown).
     publishable: bool
+    # Задача 11: непрерывная (НЕ бинарная) оценка доверия в [0, 1] — то же
+    # самое SQIResult.overall_score, что и sqi_score выше (после
+    # перекалибровки компонент, см. задачу 13), но ВСЕГДА определена: 0.0,
+    # если валидных окон не было вообще (status="no_signal"), а не просто
+    # "берётся откуда-то ещё". sqi_score оставлен для обратной совместимости
+    # (то же значение) — confidence самим именем прямо говорит, что это
+    # ответ на вопрос "насколько доверять", а не сырой служебный термин SQI.
+    confidence: float = 0.0
+    # Задача 11: ВСЕ компоненты SQI по отдельности (в дополнение к
+    # свёрнутому confidence) — чтобы потребитель мог построить СВОЁ правило,
+    # а не зависеть от того, как именно устроен publishable выше. Пример
+    # более строгого правила (эквивалент старого SQIResult.is_reliable):
+    #   confidence >= cfg.quality.min_overall_score_to_publish
+    #   and breakdown["spectral_snr_db"] >= cfg.quality.min_spectral_snr_db
+    #   and breakdown["flicker_suspected"] < 0.5
+    # Пустой словарь при status="no_signal" (компоненты SQI не считались).
+    confidence_breakdown: dict[str, float] = field(default_factory=dict)
+    # Задача 11: "ok" — было валидное окно (пусть и с низким confidence);
+    # "no_signal" — ни один ROI не дал сигнала в этом окне вообще (см.
+    # _compute_estimate). Отдельно от publishable/confidence: "низкая
+    # уверенность в реальном измерении" (status="ok", confidence=0.1) и
+    # "измерения не было" (status="no_signal", confidence=0.0) — РАЗНЫЕ
+    # ситуации, которые нельзя различить по одному только confidence=0..0.1,
+    # если не смотреть status отдельно.
+    status: str = "ok"
     warnings: list[str] = field(default_factory=list)
     method_used: str = ""
     frequency_method_used: str = ""
@@ -316,7 +359,26 @@ class RPPGPipeline:
         if len(self._buf) < 2:
             return None
         elapsed_s = (self._buf.timestamps_ms[-1] - self._buf.timestamps_ms[0]) / 1000.0
-        if elapsed_s < self.cfg.window.min_seconds_before_estimate:
+        # ВАЖНО (найдено на реальной записи телефона, fps=60.0143): _RingBuffer.
+        # trim_older_than жёстко поддерживает инвариант elapsed_s <= window_seconds
+        # (обрезает буфер до latest - window_seconds*1000 КАЖДЫЙ кадр) — из этого
+        # математически следует, что elapsed_s может достичь window_seconds
+        # ТОЧНО только если временная метка какого-то кадра ровно совпадёт с
+        # cutoff. При РЕАЛЬНОМ джиттере веб-камеры (или "круглых" fps/window в
+        # синтетических тестах, например fps=30 и window=10с, где int(300/30*1000)
+        # == 10000 ровно) такое совпадение обычно случается. Но при идеально
+        # равномерной сетке кадров с "некруглым" fps (типично для видеофайла
+        # с телефона, например 60.0143) elapsed_s стабилизируется РОВНО на
+        # (window_seconds - один период кадра) и остаётся там НАВСЕГДА — окно
+        # физически никогда не "дозаполнялось" бы без этого допуска, и
+        # process_frame молча не возвращал бы ни одной оценки ВЕСЬ файл
+        # (см. также аналогичный допуск в scripts/finger_ppg.py::process_finger_video).
+        # Доказуемая верхняя граница нехватки — РОВНО один период кадра (см.
+        # анализ инварианта trim_older_than), поэтому допуск 1.5/fps с запасом
+        # покрывает её в любом (в т.ч. наихудшем идеально равномерном) случае.
+        fps_estimate = self._estimate_fps()
+        readiness_tolerance_s = 1.5 / fps_estimate if fps_estimate > 0 else 0.0
+        if elapsed_s < self.cfg.window.min_seconds_before_estimate - readiness_tolerance_s:
             return None
 
         if (
@@ -452,7 +514,9 @@ class RPPGPipeline:
                     order=self.cfg.filt.filter_order, detrend_method=self.cfg.filt.detrend_method,
                     tarvainen_lambda=self.cfg.filt.tarvainen_lambda, normalize_method=self.cfg.filt.normalize_method,
                 )
-                _, snr_db = dominant_frequency_and_snr(processed, fps, band)
+                _, snr_db = dominant_frequency_and_snr(
+                    processed, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
+                )
                 total_snr += snr_db
                 n += 1
             score = (total_snr / n) if n else -np.inf
@@ -696,16 +760,20 @@ class RPPGPipeline:
         per_roi_signal: dict[str, np.ndarray],
         per_roi_raw_signal: dict[str, np.ndarray],
         warnings: list[str],
-    ) -> tuple[str, np.ndarray, float, np.ndarray | None]:
+    ) -> tuple[str, np.ndarray, float, np.ndarray | None, dict[str, float]]:
         """SQI-взвешенное объединение всех доступных источников (3 цветовых
         ROI + опционально head-motion канал) в ОДИН сигнал, вместо
         argmax-выбора одного ROI (п.34 требований, см. signal/fusion.py).
 
-        Возвращает (label, fused_signal, fused_bpm, harmonic_check_signal) —
-        harmonic_check_signal строится тем же fusion-объединением, но по
-        ДЕТРЕНДИРОВАННЫМ (не bandpass-отфильтрованным) исходным сигналам —
-        та же логика, что и для одиночного best_roi в _compute_estimate,
-        нужна harmonic_plausibility (см. её docstring в quality.py)."""
+        Возвращает (label, fused_signal, fused_bpm, harmonic_check_signal,
+        snr_by_roi_db) — harmonic_check_signal строится тем же
+        fusion-объединением, но по ДЕТРЕНДИРОВАННЫМ (не bandpass-
+        отфильтрованным) исходным сигналам — та же логика, что и для
+        одиночного best_roi в _compute_estimate, нужна harmonic_plausibility
+        (см. её docstring в quality.py). snr_by_roi_db — СОБСТВЕННЫЙ spectral
+        SNR каждого источника (задача 13б): cross_roi_agreement_score
+        использует его, чтобы не сравнивать оценку заведомо шумного ROI с
+        оценкой хорошего наравне."""
         fusion_sources = dict(per_roi_signal)
         if self._method.name != "head_motion" and self.cfg.fusion.include_head_motion:
             self._estimate_head_motion(
@@ -723,11 +791,21 @@ class RPPGPipeline:
                 harmonic_signal = detrend(
                     per_roi_raw_signal[only_name], method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda
                 )
-            return only_name, fusion_sources[only_name], per_roi_bpm.get(only_name, float("nan")), harmonic_signal
+            _, only_snr_db = dominant_frequency_and_snr(
+                fusion_sources[only_name], fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
+            )
+            return (
+                only_name, fusion_sources[only_name], per_roi_bpm.get(only_name, float("nan")), harmonic_signal,
+                {only_name: only_snr_db},
+            )
 
         weights: dict[str, float] = {}
+        snr_by_roi_db: dict[str, float] = {}
         for name, sig in fusion_sources.items():
-            _, snr_db = dominant_frequency_and_snr(sig, fps, band)
+            _, snr_db = dominant_frequency_and_snr(
+                sig, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
+            )
+            snr_by_roi_db[name] = snr_db
             weights[name] = snr_db_to_weight(snr_db, self.cfg.fusion.weight_floor_db, self.cfg.fusion.weight_ceil_db)
 
         fused_signal, _diag = fuse_signals_by_sqi(
@@ -753,7 +831,7 @@ class RPPGPipeline:
                 fps=fps, max_lag_seconds=self.cfg.fusion.max_lag_seconds,
             )
 
-        return "fusion", fused_signal, fused_bpm, harmonic_check_signal
+        return "fusion", fused_signal, fused_bpm, harmonic_check_signal, snr_by_roi_db
 
     def _compute_estimate(self, timestamp_ms: int) -> PTSDPulseFeatures:
         fps = self._estimate_fps()
@@ -806,6 +884,7 @@ class RPPGPipeline:
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
                 sqi_score=0.0, sqi_level="low", publishable=False,
+                confidence=0.0, confidence_breakdown={}, status="no_signal",
                 warnings=no_signal_warnings,
                 method_used=no_signal_method,
                 frequency_method_used=self.cfg.frequency_method.value,
@@ -815,21 +894,28 @@ class RPPGPipeline:
             )
 
         if self.cfg.fusion.enabled:
-            best_roi, best_signal, current_bpm, harmonic_check_signal = self._compute_fusion(
+            best_roi, best_signal, current_bpm, harmonic_check_signal, snr_by_roi_db = self._compute_fusion(
                 fps, band, timestamps_sec, landmark_traj, per_roi_bpm, per_roi_signal, per_roi_raw_signal, warnings,
             )
-            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(best_signal, fps, band)
+            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(
+                best_signal, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
+            )
         else:
             # ROI с максимальным spectral SNR используется как основной источник
             # BPM/HRV. Считаем dominant_frequency_and_snr РОВНО ОДИН раз на ROI
             # (Welch с nfft=2048 не бесплатен, а это выполняется на каждом шаге
             # окна) и переиспользуем для выбранного best_roi, а не пересчитываем
             # его же ещё раз после argmax (п.46 требований).
-            snr_by_roi = {n: dominant_frequency_and_snr(sig, fps, band) for n, sig in per_roi_signal.items()}
+            snr_by_roi = {
+                n: dominant_frequency_and_snr(sig, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr)
+                for n, sig in per_roi_signal.items()
+            }
             best_roi = max(snr_by_roi, key=lambda n: snr_by_roi[n][1])
             best_signal = per_roi_signal[best_roi]
             best_peak_freq_hz, best_snr_db = snr_by_roi[best_roi]
             current_bpm = per_roi_bpm.get(best_roi, float("nan"))
+            # Задача 13б: собственный SNR каждого ROI — для cross_roi_agreement_score.
+            snr_by_roi_db = {n: v[1] for n, v in snr_by_roi.items()}
 
             # п.21: для проверки на гармоники/субгармоники нужен ДЕТРЕНДИРОВАННЫЙ,
             # но НЕ узкополосно отфильтрованный сигнал — иначе сам bandpass в
@@ -855,6 +941,9 @@ class RPPGPipeline:
                 fps=fps,
                 band_hz=band,
                 bpm_by_roi=per_roi_bpm,
+                snr_by_roi_db=snr_by_roi_db,
+                n_samples=len(best_signal),
+                frequency_method=self.cfg.frequency_method.value,
                 landmark_trajectories=landmark_traj,
                 interocular_distances_px=interocular_distances_px,
                 recent_bpm_history=recent_bpm_history,
@@ -897,10 +986,18 @@ class RPPGPipeline:
 
         all_warnings = warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else [])
 
-        # Задача 8: обновляется ТОЛЬКО когда окно реально прошло SQI-гейт —
-        # см. _update_last_valid_bpm. В отличие от прежнего best_effort_bpm,
+        # Задача 11: confidence/publishable считаются здесь (а не только в
+        # return ниже), т.к. _update_last_valid_bpm тоже должен видеть НОВОЕ
+        # (простое, пороговое) значение publishable — оно и есть контракт,
+        # который реально виден потребителю на PTSDPulseFeatures, а не
+        # скрытый от него sqi.is_reliable.
+        confidence = sqi.overall_score
+        is_publishable = confidence >= self.cfg.quality.min_overall_score_to_publish
+
+        # Задача 8: обновляется ТОЛЬКО когда окно реально прошло гейт — см.
+        # _update_last_valid_bpm. В отличие от прежнего best_effort_bpm,
         # здесь принципиально нет обновления на непубликуемых окнах.
-        self._update_last_valid_bpm(timestamp_ms, current_bpm, sqi.is_reliable)
+        self._update_last_valid_bpm(timestamp_ms, current_bpm, is_publishable)
 
         if self._window_logger is not None:
             # п.43: полная разбивка SQI по компонентам (не только overall_score)
@@ -929,13 +1026,29 @@ class RPPGPipeline:
                 warnings=list(all_warnings),
             ))
 
+        # confidence/is_publishable уже посчитаны выше (перед _update_last_valid_bpm).
+        # confidence_breakdown — ВСЕ компоненты по отдельности (см. docstring
+        # PTSDPulseFeatures.confidence_breakdown); НЕ то же самое, что
+        # sqi.is_reliable (логируется как есть в JSONL выше — тот учитывает
+        # ещё и flicker_suspected/жёсткий пол SNR по отдельности как AND).
+        confidence_breakdown = {
+            "spectral_snr_db": sqi.spectral_snr_db,
+            "harmonic_score": sqi.harmonic_score,
+            "cross_roi_agreement": sqi.cross_roi_agreement,
+            "landmark_stability": sqi.landmark_stability,
+            "temporal_consistency": sqi.temporal_consistency,
+            "flicker_suspected": 1.0 if sqi.flicker_suspected else 0.0,
+        }
         return PTSDPulseFeatures(
             timestamp_ms=timestamp_ms,
             bpm=current_bpm,
             hrv=hrv,
             sqi_score=sqi.overall_score,
             sqi_level=sqi.level.value,
-            publishable=sqi.is_reliable,
+            publishable=is_publishable,
+            confidence=confidence,
+            confidence_breakdown=confidence_breakdown,
+            status="ok",
             warnings=all_warnings,
             method_used=method_used,
             frequency_method_used=self.cfg.frequency_method.value,
