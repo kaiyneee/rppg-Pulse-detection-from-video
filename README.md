@@ -5,13 +5,8 @@
 Независимая, модульная реализация классических алгоритмов rPPG/HRV
 (Balakrishnan et al., CVPR 2013; de Haan & Jeanne, IEEE TBME 2013; Wang et
 al., IEEE TBME 2016; и др. — полный список в [CITATION.cff](CITATION.cff)),
-построенная на MediaPipe Face Landmarker (Tasks API). Научной отправной
-точкой послужил [irfan798/head-pulse-track](https://github.com/irfan798/head-pulse-track)
-— он первым в этой цепочке указал на Balakrishnan et al. (2013) для этой
-задачи; тот репозиторий не имеет лицензии (все права защищены его
-авторами), и код из него здесь не переиспользуется — см. раздел
-"Acknowledgements" ниже. Полный разбор архитектурных решений, научная
-новизна и экспериментальный протокол — в
+построенная на MediaPipe Face Landmarker (Tasks API). Полный разбор
+архитектурных решений, научная новизна и экспериментальный протокол — в
 **[docs/research_report.md](docs/research_report.md)**. Этот README —
 только установка, быстрый старт и обзор того, что реально есть в коде на
 сегодня. См. также [CITATION.cff](CITATION.cff) для цитирования.
@@ -204,19 +199,13 @@ docs/research_report.md    полный анализ, архитектура, э
 
 ## Acknowledgements
 
-Научной отправной точкой для этого проекта послужил
-[irfan798/head-pulse-track](https://github.com/irfan798/head-pulse-track) —
-он первым в этой цепочке указал на классическую работу Balakrishnan,
-Durand & Guttag (CVPR 2013, "Detecting Pulse from Head Motions in Video")
-как на подход к задаче. Этот код построен независимо: MediaPipe Face
-Landmarker (Tasks API) вместо legacy Face Mesh, все 6 методов извлечения
-сигнала реализованы напрямую по первоисточникам (см. полный список в
-[CITATION.cff](CITATION.cff)), без переиспользования кода irfan798/head-pulse-track.
-Тот репозиторий не несёт лицензии (все права на него защищены его
-авторами по умолчанию) — соответственно, здесь нет никакого его кода, а
-есть только признание научного приоритета указания на нужный алгоритм.
+Этот код — независимая реализация на MediaPipe Face Landmarker (Tasks
+API): все 6 методов извлечения сигнала реализованы напрямую по
+первоисточникам (полный список в [CITATION.cff](CITATION.cff)), включая
+Balakrishnan, Durand & Guttag (CVPR 2013, "Detecting Pulse from Head
+Motions in Video") для head-motion метода.
 
-Дополнительные алгоритмические источники: de Haan & Jeanne (2013, CHROM),
+Алгоритмические источники: de Haan & Jeanne (2013, CHROM),
 Wang et al. (2016, POS), Poh, McDuff & Picard (2010-2011, ICA),
 Lewandowska et al. (2011, PCA), Verkruysse, Svaasand & Nelson (2008,
 GREEN), Tarvainen, Ranta-aho & Karjalainen (2002, detrending) — точные

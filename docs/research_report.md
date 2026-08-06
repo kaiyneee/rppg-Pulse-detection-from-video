@@ -1,7 +1,9 @@
 # Research Report: модернизация rPPG-модуля для системы анализа физиологических маркеров ПТСР
 
-**Дата:** июль 2026. **Базовый репозиторий:** [irfan798/head-pulse-track](https://github.com/irfan798/head-pulse-track)
-(реализация Balakrishnan, Durand, Guttag, *"Detecting Pulse from Head Motions in Video"*, CVPR 2013).
+**Дата:** июль 2026. **Отправная точка:** учебная одно-алгоритмическая
+реализация Balakrishnan, Durand, Guttag, *"Detecting Pulse from Head
+Motions in Video"* (CVPR 2013), не связанная с текущей кодовой базой и не
+переиспользованная в ней.
 
 ---
 

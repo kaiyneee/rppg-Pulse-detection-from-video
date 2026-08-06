@@ -98,14 +98,3 @@ references:
     year: 2002
     journal: "IEEE Transactions on Biomedical Engineering"
     notes: "Smoothness-priors detrending; lambda recalibrated for 30 fps in this project, see scripts/analyze_tarvainen_lambda.py."
-  - type: software
-    title: "head-pulse-track"
-    authors:
-      - name: "irfan798"
-    repository-code: "https://github.com/irfan798/head-pulse-track"
-    notes: >
-      Scientific inspiration that first pointed at Balakrishnan et al. (2013)
-      for this problem. That repository carries no license (all rights
-      reserved by its authors); no source code from it is reused in this
-      project, which is an independent implementation built on the
-      MediaPipe Face Landmarker Tasks API. See README.md "Acknowledgements".
