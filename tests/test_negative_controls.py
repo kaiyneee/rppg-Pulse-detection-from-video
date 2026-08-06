@@ -255,6 +255,52 @@ def test_background_flicker_is_detected():
     print("  [OK] flicker_suspected стал True хотя бы на одном окне")
 
 
+def test_confidence_and_status_invariants():
+    """Задача 11, критерий приёмки: bpm не NaN во всех окнах, где status="ok"
+    (т.е. был хотя бы один валидный ROI) — bpm получен ИСКЛЮЧИТЕЛЬНО из
+    спектра реального окна, никогда как побочный эффект низкого confidence.
+    Дополнительно проверяет базовые инварианты новых полей: confidence
+    всегда в [0,1], status="no_signal" <=> bpm=NaN и confidence==0.0 и
+    confidence_breakdown пуст, publishable — простое пороговое правило от
+    confidence (см. docstring PTSDPulseFeatures.publishable)."""
+    print("\n=== Задача 11: bpm/confidence/status инварианты на чистой синтетике ===")
+    pipe, skip_reason = _try_init_pipeline()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    _mock_face_detected(pipe)
+
+    threshold = pipe.cfg.quality.min_overall_score_to_publish
+    rng = np.random.default_rng(50)
+    n_ok, n_no_signal = 0, 0
+    try:
+        for i in range(int(FPS * 20.0)):
+            t_sec = i / FPS
+            frame = _make_pulsating_frame(t_sec, 72.0, rng, h=480, w=640)
+            result = pipe.process_frame(frame, int(t_sec * 1000))
+            if result is None:
+                continue
+            assert result.status in ("ok", "no_signal"), f"неизвестный status={result.status!r}"
+            assert 0.0 <= result.confidence <= 1.0, f"confidence вне [0,1]: {result.confidence}"
+            assert result.publishable == (result.confidence >= threshold), (
+                "publishable должен быть ровно confidence >= min_overall_score_to_publish"
+            )
+            if result.status == "ok":
+                n_ok += 1
+                assert not np.isnan(result.bpm), "status=ok, но bpm=NaN — bpm обязан быть реальной оценкой спектра"
+                assert result.confidence_breakdown, "status=ok должен нести непустой confidence_breakdown"
+            else:
+                n_no_signal += 1
+                assert np.isnan(result.bpm), "status=no_signal, но bpm не NaN — bpm не должен подставляться"
+                assert result.confidence == 0.0, "status=no_signal должен давать confidence=0.0, без исключений"
+                assert result.confidence_breakdown == {}, "status=no_signal -> компоненты SQI не считались вообще"
+    finally:
+        pipe.close()
+
+    assert n_ok > 0, "sanity: чистая синтетика должна дать хотя бы одно status=ok окно"
+    print(f"  [OK] {n_ok} окон status=ok (bpm всегда реален), {n_no_signal} окон status=no_signal (bpm всегда NaN)")
+
+
 def test_no_estimate_computed_before_window_is_full():
     """Задача 6, критерий приёмки: _ibi_log и _recent_bpm_history НЕ должны
     содержать значений, полученных до заполнения окна. _compute_estimate —
@@ -298,10 +344,65 @@ def test_no_estimate_computed_before_window_is_full():
           "(_recent_bpm_history/_ibi_log не могли получить 'прогревочные' значения)")
 
 
+def test_uniform_non_round_fps_still_produces_estimates():
+    """Регрессия: найдено на РЕАЛЬНОЙ записи с телефона (fps=60.0143) при
+    прогоне через scripts/finger_ppg.py (задача 15) — process_frame молча
+    не давал НИ ОДНОЙ оценки за всё 150-секундное видео.
+
+    Причина: _RingBuffer.trim_older_than жёстко поддерживает инвариант
+    elapsed_s <= window_seconds (обрезает буфер КАЖДЫЙ кадр) — elapsed_s
+    достигает window_seconds ТОЧНО только если метка времени какого-то
+    кадра ровно совпадёт с cutoff. Для "круглых" fps/window (fps=30,
+    window=10с — как в остальных тестах этого файла) такое совпадение
+    происходит благодаря целочисленному округлению меток в миллисекундах.
+    Но при идеально равномерной сетке кадров с "некруглым" fps (типичная
+    ситуация для видеофайла, а не живой веб-камеры с её естественным
+    джиттером тайминга) elapsed_s стабилизируется РОВНО на
+    (window_seconds - один период кадра) и остаётся там НАВСЕГДА.
+
+    Этот тест намеренно воспроизводит ИМЕННО патологический случай: подаёт
+    временные метки идеально равномерной арифметической прогрессией
+    (frame_idx / fps * 1000, БЕЗ округления до целых мс) на некруглом
+    fps=60.0143 — ровно то, что сломало реальную запись."""
+    print("\n=== Регрессия: некруглый идеально равномерный fps не должен стопорить оценки ===")
+    pipe, skip_reason = _try_init_pipeline()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    _mock_face_detected(pipe)
+
+    fps = 60.0143  # реальный fps из записи, на которой найден баг
+    duration_s = 20.0
+    rng = np.random.default_rng(6)
+    n_estimates = 0
+    try:
+        n_frames = int(fps * duration_s)
+        for i in range(n_frames):
+            t_sec = i / fps
+            frame = _make_pulsating_frame(t_sec, 72.0, rng, h=480, w=640)
+            # ВАЖНО: временная метка — ЧИСТАЯ арифметическая прогрессия без
+            # округления до целых мс (int(...)), иначе округление само
+            # внесло бы ту же "случайную" неравномерность, что и джиттер
+            # живой камеры, и замаскировало бы баг (см. докстринг выше).
+            result = pipe.process_frame(frame, t_sec * 1000.0)
+            if result is not None:
+                n_estimates += 1
+    finally:
+        pipe.close()
+
+    assert n_estimates > 0, (
+        f"за {duration_s}с идеально равномерных кадров на fps={fps} не получено НИ ОДНОЙ оценки — "
+        "buffered_seconds асимптотически не достигает window_seconds без допуска в process_frame"
+    )
+    print(f"  [OK] {n_estimates} оценок получено на некруглом равномерном fps={fps}")
+
+
 if __name__ == "__main__":
     test_static_photo_never_publishes()
     test_white_noise_frames_never_publish()
     test_clean_72bpm_pipeline_publishes_accurate_bpm()
     test_72bpm_with_strong_illumination_drift_still_publishes()
     test_background_flicker_is_detected()
+    test_confidence_and_status_invariants()
     test_no_estimate_computed_before_window_is_full()
+    test_uniform_non_round_fps_still_produces_estimates()
