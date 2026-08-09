@@ -81,7 +81,8 @@ def main() -> None:
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "timestamp_ms", "bpm", "publishable", "last_valid_bpm", "last_valid_bpm_age_s", "sqi_score", "sqi_level",
+            "timestamp_ms", "bpm", "publishable", "status", "last_valid_bpm", "last_valid_bpm_age_s",
+            "sqi_score", "sqi_level", "sqi_spectral_snr_db",
             "mean_hr_bpm", "sdnn_ms", "rmssd_ms", "pnn50_pct", "pnn20_pct",
             "lf_hf_ratio", "method_used", "frequency_method_used", "warnings",
         ])
@@ -89,9 +90,14 @@ def main() -> None:
             hrv = r.hrv
             last_valid = f"{r.last_valid_bpm:.2f}" if r.last_valid_bpm is not None else ""
             last_valid_age = f"{r.last_valid_bpm_age_s:.1f}" if r.last_valid_bpm_age_s is not None else ""
+            # Задача 16, п.4: та же величина, что решает is_reliable — рядом
+            # с колонкой publishable, чтобы расхождение между источниками
+            # (если оно когда-нибудь снова появится) было видно без сверки
+            # CSV и JSONL вручную.
+            snr_db = r.confidence_breakdown.get("spectral_snr_db", "")
             writer.writerow([
-                r.timestamp_ms, r.bpm, r.publishable, last_valid, last_valid_age,
-                f"{r.sqi_score:.3f}", r.sqi_level,
+                r.timestamp_ms, r.bpm, r.publishable, r.status, last_valid, last_valid_age,
+                f"{r.sqi_score:.3f}", r.sqi_level, snr_db,
                 hrv.mean_hr_bpm if hrv else "", hrv.sdnn_ms if hrv else "",
                 hrv.rmssd_ms if hrv else "", hrv.pnn50_pct if hrv else "",
                 hrv.pnn20_pct if hrv else "", hrv.lf_hf_ratio if hrv else "",

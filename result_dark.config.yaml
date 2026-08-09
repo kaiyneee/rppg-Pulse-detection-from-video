@@ -1,0 +1,70 @@
+face:
+  model_asset_path: models/face_landmarker.task
+  num_faces: 1
+  min_face_detection_confidence: 0.5
+  min_face_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
+  output_face_blendshapes: false
+  output_facial_transformation_matrixes: true
+  delegate: CPU
+roi:
+  enabled_rois:
+  - forehead
+  - left_cheek
+  - right_cheek
+  shrink_factor: 0.9
+  min_valid_pixel_fraction: 0.6
+filt:
+  low_hz: 0.7
+  high_hz: 4.0
+  filter_order: 4
+  detrend_method: tarvainen
+  tarvainen_lambda: 3542.0
+  normalize_method: zscore
+window:
+  window_seconds: 10.0
+  step_seconds: 1.0
+  assumed_fps: 30.0
+  min_seconds_before_estimate: 10.0
+quality:
+  include_second_harmonic_in_snr: true
+  min_spectral_snr_db: 3.0
+  max_cross_roi_bpm_diff: 15.0
+  cross_roi_min_component_snr_db: 0.0
+  min_landmark_stability: 0.5
+  min_overall_score_to_publish: 0.5
+  jitter_threshold_ipd_fraction: 0.03
+  max_expected_bpm_change_per_step: 6.0
+  harmonic_floor_ratio_threshold: 3.0
+  flicker_freq_tolerance_hz: 0.15
+  flicker_min_background_snr_db: 3.0
+  flicker_min_raw_std: 0.5
+  flicker_min_consecutive_windows: 3
+  weight_spectral_snr: 0.4
+  weight_cross_roi: 0.25
+  weight_landmark_stability: 0.15
+  weight_temporal_consistency: 0.2
+hrv:
+  pnn_threshold_ms: 50.0
+  pnn20_threshold_ms: 20.0
+  compute_frequency_domain: true
+  edge_trim_seconds: 1.0
+  max_artifact_fraction: 0.05
+  ectopic_max_relative_change: 0.4
+  min_accumulation_seconds: 120.0
+  target_accumulation_seconds: 300.0
+  step_seconds: 60.0
+  lf_min_duration_seconds: 120.0
+  hf_min_duration_seconds: 60.0
+accel:
+  use_numba: true
+  use_onnx_for_learned_method: false
+  onnx_model_path: null
+fusion:
+  enabled: false
+  include_head_motion: true
+  max_lag_seconds: 0.3
+  weight_floor_db: -5.0
+  weight_ceil_db: 15.0
+method: pos
+frequency_method: welch

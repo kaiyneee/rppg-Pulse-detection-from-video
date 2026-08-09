@@ -49,7 +49,14 @@ from rppg.face.roi import extract_rois, ROIExtractionResult, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
 from rppg.signal.methods import get_method, SignalWindow
 from rppg.signal.frequency import estimate_hr
-from rppg.signal.quality import assess_quality, dominant_frequency_and_snr, compute_psd, SQIInputs, SQIResult
+from rppg.signal.quality import (
+    assess_quality,
+    dominant_frequency_and_snr,
+    compute_psd,
+    effective_snr_peak_half_width_hz,
+    SQIInputs,
+    SQIResult,
+)
 from rppg.signal.fusion import fuse_signals_by_sqi, snr_db_to_weight
 from rppg.signal.respiration import estimate_respiration_rate
 from rppg.structured_log import StructuredWindowLogger, WindowLogRecord
@@ -98,17 +105,17 @@ class PTSDPulseFeatures:
     hrv: HRVFeatures | None
     sqi_score: float
     sqi_level: str
-    # Задача 11: ПРОИЗВОДНЫЙ удобный флаг для потребителя, который не хочет
-    # разбираться в компонентах SQI: publishable = confidence >=
-    # QualityConfig.min_overall_score_to_publish — простое пороговое
-    # правило, НЕ единственный интерфейс. В частности, ОНО НЕ учитывает
-    # flicker_suspected и жёсткий пол по spectral_snr_db по отдельности
-    # (см. confidence_breakdown ниже) — тот более строгий рейл, который
-    # структурный JSONL-лог (structured_log.py) логирует под тем же именем
-    # "publishable", здесь СОЗНАТЕЛЬНО не воспроизведён 1:1: цель этого поля
-    # — дать разумный дефолт с порогом "из коробки", а не заменить собой
-    # анализ confidence_breakdown для тех, кому нужна строгая семантика
-    # (см. пример строгого правила в docstring confidence_breakdown).
+    # Задача 16: ЕДИНСТВЕННЫЙ источник истины — SQIResult.is_reliable (см.
+    # quality.assess_quality). Раньше это поле пересчитывалось отдельно как
+    # простое пороговое правило confidence >= min_overall_score_to_publish,
+    # БЕЗ проверки spectral_snr_db и flicker_suspected — тогда как
+    # WindowLogRecord.publishable (JSONL-лог) уже использовал строгий
+    # sqi.is_reliable. Из-за этого на реальных записях с подтверждённым
+    # мерцанием освещения или SNR ниже жёсткого пола этот флаг мог быть
+    # True одновременно с publishable=False в логе того же окна — ровно та
+    # дыра, ради закрытия которой строгий гейт и вводился (см. docstring
+    # модуля выше). Теперь оба места читают ОДНО и то же sqi.is_reliable —
+    # нет двух реализаций одного решения, которые могут разойтись.
     publishable: bool
     # Задача 11: непрерывная (НЕ бинарная) оценка доверия в [0, 1] — то же
     # самое SQIResult.overall_score, что и sqi_score выше (после
@@ -119,12 +126,9 @@ class PTSDPulseFeatures:
     # ответ на вопрос "насколько доверять", а не сырой служебный термин SQI.
     confidence: float = 0.0
     # Задача 11: ВСЕ компоненты SQI по отдельности (в дополнение к
-    # свёрнутому confidence) — чтобы потребитель мог построить СВОЁ правило,
-    # а не зависеть от того, как именно устроен publishable выше. Пример
-    # более строгого правила (эквивалент старого SQIResult.is_reliable):
-    #   confidence >= cfg.quality.min_overall_score_to_publish
-    #   and breakdown["spectral_snr_db"] >= cfg.quality.min_spectral_snr_db
-    #   and breakdown["flicker_suspected"] < 0.5
+    # свёрнутому confidence) — чтобы потребитель мог построить СВОЁ,
+    # ЕЩЁ более строгое правило поверх уже принятого publishable выше
+    # (например, дополнительно требовать высокий cross_roi_agreement).
     # Пустой словарь при status="no_signal" (компоненты SQI не считались).
     confidence_breakdown: dict[str, float] = field(default_factory=dict)
     # Задача 11: "ok" — было валидное окно (пусть и с низким confidence);
@@ -433,6 +437,17 @@ class RPPGPipeline:
             return self.cfg.window.assumed_fps
         return float(1.0 / np.median(dt))
 
+    def _dominant_frequency_and_snr(self, signal: np.ndarray, fps: float, band: tuple[float, float]) -> tuple[float, float]:
+        """Задача 19: тонкая обёртка над quality.dominant_frequency_and_snr,
+        которая всегда передаёт полуширину пика, вычисленную из
+        QualityConfig (см. quality.effective_snr_peak_half_width_hz) — чтобы
+        не повторять "fps, len(signal)" на каждом из вызовов ниже."""
+        return dominant_frequency_and_snr(
+            signal, fps, band,
+            include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr,
+            peak_half_width_hz=effective_snr_peak_half_width_hz(self.cfg.quality, fps, len(signal)),
+        )
+
     def _estimate_frequency(
         self,
         raw_signal: np.ndarray,
@@ -514,9 +529,7 @@ class RPPGPipeline:
                     order=self.cfg.filt.filter_order, detrend_method=self.cfg.filt.detrend_method,
                     tarvainen_lambda=self.cfg.filt.tarvainen_lambda, normalize_method=self.cfg.filt.normalize_method,
                 )
-                _, snr_db = dominant_frequency_and_snr(
-                    processed, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
-                )
+                _, snr_db = self._dominant_frequency_and_snr(processed, fps, band)
                 total_snr += snr_db
                 n += 1
             score = (total_snr / n) if n else -np.inf
@@ -791,9 +804,7 @@ class RPPGPipeline:
                 harmonic_signal = detrend(
                     per_roi_raw_signal[only_name], method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda
                 )
-            _, only_snr_db = dominant_frequency_and_snr(
-                fusion_sources[only_name], fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
-            )
+            _, only_snr_db = self._dominant_frequency_and_snr(fusion_sources[only_name], fps, band)
             return (
                 only_name, fusion_sources[only_name], per_roi_bpm.get(only_name, float("nan")), harmonic_signal,
                 {only_name: only_snr_db},
@@ -802,9 +813,7 @@ class RPPGPipeline:
         weights: dict[str, float] = {}
         snr_by_roi_db: dict[str, float] = {}
         for name, sig in fusion_sources.items():
-            _, snr_db = dominant_frequency_and_snr(
-                sig, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
-            )
+            _, snr_db = self._dominant_frequency_and_snr(sig, fps, band)
             snr_by_roi_db[name] = snr_db
             weights[name] = snr_db_to_weight(snr_db, self.cfg.fusion.weight_floor_db, self.cfg.fusion.weight_ceil_db)
 
@@ -866,6 +875,10 @@ class RPPGPipeline:
         if not per_roi_signal:
             no_signal_warnings = warnings + ["Ни один ROI не дал валидного сигнала в этом окне."]
             no_signal_method = f"auto:{self._method.name}" if self._auto_mode else self._method.name
+            # Задача 21: различаем "лицо не было найдено вообще" от "лицо
+            # было, но, например, все ROI провалили is_gap_acceptable или
+            # метод извлечения упал" — разные failure modes, разная починка.
+            no_signal_window_status = "no_face" if not any(self._buf.face_valid) else "no_signal"
             if self._window_logger is not None:
                 # Тоже логируем (п.43) — "окно без сигнала" такой же
                 # материал для анализа failure cases, как и низкий SQI.
@@ -875,11 +888,13 @@ class RPPGPipeline:
                     frequency_method_used=self.cfg.frequency_method.value,
                     sqi_overall_score=0.0, sqi_level="low",
                     sqi_spectral_snr_db=float("-inf"), sqi_cross_roi_agreement=0.0,
+                    sqi_cross_roi_n_participants=0,
                     sqi_landmark_stability=0.0, sqi_temporal_consistency=0.0,
-                    sqi_harmonic_score=0.0, sqi_flicker_suspected=False,
+                    sqi_harmonic_score=0.0, sqi_harmonic_support=False, sqi_flicker_suspected=False,
                     sqi_flicker_background_freq_hz=0.0, sqi_flicker_background_snr_db=float("-inf"),
                     sqi_subharmonic_check_informative=True,
                     respiration_rate_bpm=None, warnings=no_signal_warnings,
+                    window_status=no_signal_window_status,
                 ))
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
@@ -897,9 +912,7 @@ class RPPGPipeline:
             best_roi, best_signal, current_bpm, harmonic_check_signal, snr_by_roi_db = self._compute_fusion(
                 fps, band, timestamps_sec, landmark_traj, per_roi_bpm, per_roi_signal, per_roi_raw_signal, warnings,
             )
-            best_peak_freq_hz, best_snr_db = dominant_frequency_and_snr(
-                best_signal, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr
-            )
+            best_peak_freq_hz, best_snr_db = self._dominant_frequency_and_snr(best_signal, fps, band)
         else:
             # ROI с максимальным spectral SNR используется как основной источник
             # BPM/HRV. Считаем dominant_frequency_and_snr РОВНО ОДИН раз на ROI
@@ -907,7 +920,7 @@ class RPPGPipeline:
             # окна) и переиспользуем для выбранного best_roi, а не пересчитываем
             # его же ещё раз после argmax (п.46 требований).
             snr_by_roi = {
-                n: dominant_frequency_and_snr(sig, fps, band, include_second_harmonic=self.cfg.quality.include_second_harmonic_in_snr)
+                n: self._dominant_frequency_and_snr(sig, fps, band)
                 for n, sig in per_roi_signal.items()
             }
             best_roi = max(snr_by_roi, key=lambda n: snr_by_roi[n][1])
@@ -928,6 +941,20 @@ class RPPGPipeline:
                     method=self.cfg.filt.detrend_method,
                     lam=self.cfg.filt.tarvainen_lambda,
                 )
+
+        # Задача 21: явная классификация вырожденных окон — раньше окно с
+        # best_snr_db=-inf (сигнал короче 8 отсчётов или std < 1e-10, см.
+        # quality.compute_psd) тихо получало status="ok" с провальным SQI и
+        # молча выпадало из перцентилей analyze_log.py ("N inf/nan
+        # исключено") без объяснения ПОЧЕМУ. window_status идёт ТОЛЬКО в
+        # WindowLogRecord (JSONL/CSV) — публичный PTSDPulseFeatures.status
+        # остаётся ok/no_signal, это отдельный документированный контракт.
+        if len(best_signal) < 8:
+            window_status = "too_short"
+        elif not np.isfinite(best_snr_db):
+            window_status = "degenerate_signal"
+        else:
+            window_status = "ok"
 
         interocular_distances_px = np.array(self._buf.interocular_dist, dtype=float)
         background_signal = self._estimate_background_signal(fps, band)
@@ -986,13 +1013,12 @@ class RPPGPipeline:
 
         all_warnings = warnings + sqi.warnings + hrv_warnings + (hrv.warnings if hrv is not None else [])
 
-        # Задача 11: confidence/publishable считаются здесь (а не только в
-        # return ниже), т.к. _update_last_valid_bpm тоже должен видеть НОВОЕ
-        # (простое, пороговое) значение publishable — оно и есть контракт,
-        # который реально виден потребителю на PTSDPulseFeatures, а не
-        # скрытый от него sqi.is_reliable.
+        # Задача 16: publishable считается здесь (а не только в return ниже),
+        # т.к. _update_last_valid_bpm тоже должен видеть тот же самый гейт —
+        # ОДНО значение sqi.is_reliable, а не отдельно пересчитанное правило
+        # (см. docstring PTSDPulseFeatures.publishable про прежнюю дыру).
         confidence = sqi.overall_score
-        is_publishable = confidence >= self.cfg.quality.min_overall_score_to_publish
+        is_publishable = sqi.is_reliable
 
         # Задача 8: обновляется ТОЛЬКО когда окно реально прошло гейт — см.
         # _update_last_valid_bpm. В отличие от прежнего best_effort_bpm,
@@ -1015,22 +1041,25 @@ class RPPGPipeline:
                 sqi_level=sqi.level.value,
                 sqi_spectral_snr_db=sqi.spectral_snr_db,
                 sqi_cross_roi_agreement=sqi.cross_roi_agreement,
+                sqi_cross_roi_n_participants=sqi.cross_roi_n_participants,
                 sqi_landmark_stability=sqi.landmark_stability,
                 sqi_temporal_consistency=sqi.temporal_consistency,
                 sqi_harmonic_score=sqi.harmonic_score,
+                sqi_harmonic_support=sqi.harmonic_support,
                 sqi_flicker_suspected=sqi.flicker_suspected,
                 sqi_flicker_background_freq_hz=sqi.flicker_background_freq_hz,
                 sqi_flicker_background_snr_db=sqi.flicker_background_snr_db,
                 sqi_subharmonic_check_informative=sqi.subharmonic_check_informative,
                 respiration_rate_bpm=respiration_rate_bpm,
                 warnings=list(all_warnings),
+                window_status=window_status,
             ))
 
         # confidence/is_publishable уже посчитаны выше (перед _update_last_valid_bpm).
-        # confidence_breakdown — ВСЕ компоненты по отдельности (см. docstring
-        # PTSDPulseFeatures.confidence_breakdown); НЕ то же самое, что
-        # sqi.is_reliable (логируется как есть в JSONL выше — тот учитывает
-        # ещё и flicker_suspected/жёсткий пол SNR по отдельности как AND).
+        # confidence_breakdown — ВСЕ компоненты SQI по отдельности (см.
+        # docstring PTSDPulseFeatures.confidence_breakdown) — континуальная
+        # раскладка ПРИЧИН, а publishable/is_reliable — уже принятое по ним
+        # бинарное решение (задача 16: одно и то же значение везде).
         confidence_breakdown = {
             "spectral_snr_db": sqi.spectral_snr_db,
             "harmonic_score": sqi.harmonic_score,
