@@ -55,6 +55,22 @@ class WindowLogRecord:
     sqi_subharmonic_check_informative: bool
     respiration_rate_bpm: float | None
     warnings: list[str] = field(default_factory=list)
+    # Задача 17: сколько ROI реально участвовало в cross_roi_agreement_score
+    # ПОСЛЕ относительной SNR-фильтрации (см. quality.cross_roi_agreement_score)
+    # — без этого поля 0.5 "недостаточно участников" неотличимо от 0.5
+    # "участники есть, но реально не согласны".
+    sqi_cross_roi_n_participants: int = 0
+    # Задача 20: горб на 2f выше локального фона — ИНФОРМАЦИОННЫЙ признак
+    # (несинусоидальность реального пульса), НЕ штраф и НЕ участвует в
+    # harmonic_score/overall (см. quality.harmonic_plausibility).
+    sqi_harmonic_support: bool = False
+    # Задача 21: детальная причина, ПОЧЕМУ окно получилось таким, каким
+    # получилось — "ok" | "no_face" | "no_signal" | "degenerate_signal" |
+    # "too_short" (см. pipeline.py::RPPGPipeline._compute_estimate). В
+    # отличие от PTSDPulseFeatures.status (только ok/no_signal, стабильный
+    # контракт для потребителя), это диагностическое поле только для
+    # JSONL/CSV-анализа failure cases (scripts/analyze_log.py).
+    window_status: str = "ok"
 
     def to_json_line(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

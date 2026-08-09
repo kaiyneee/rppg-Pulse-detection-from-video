@@ -69,6 +69,23 @@ def load_log(path: Path) -> pd.DataFrame:
     return df
 
 
+def print_status_breakdown(df: pd.DataFrame) -> None:
+    """Задача 21: явная разбивка по window_status — вместо того чтобы окна
+    с вырожденным сигналом (-inf/nan SNR) тихо выпадали из перцентилей
+    (см. "N inf/nan исключено" в print_component_percentiles ниже) без
+    объяснения причины. Сумма по всем status равна общему числу окон."""
+    print("=== Разбивка по window_status (задача 21) ===")
+    if "window_status" not in df.columns:
+        print("  (лог записан до задачи 21 — колонки window_status нет в этом файле)\n")
+        return
+    counts = df["window_status"].value_counts()
+    n_total = len(df)
+    for status, count in counts.items():
+        print(f"  {status:<20s} {count:5d} ({count / n_total * 100:5.1f}%)")
+    assert int(counts.sum()) == n_total, "сумма по status должна равняться общему числу окон"
+    print()
+
+
 def print_publishable_fraction(df: pd.DataFrame) -> None:
     frac = float(df["publishable"].mean())
     n_total = len(df)
@@ -318,6 +335,7 @@ def main() -> None:
     qcfg = QualityConfig()
 
     print(f"Лог: {log_path} ({len(df)} окон)\n")
+    print_status_breakdown(df)
     print_publishable_fraction(df)
 
     failed = failure_reason_breakdown(df, qcfg)
