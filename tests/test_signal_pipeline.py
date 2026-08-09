@@ -1600,19 +1600,25 @@ def test_respiration_rate_from_amplitude_modulation():
 
 
 def test_ranking_preserved():
-    """Регрессия для задачи 23: качественный порядок 4 реальных видео,
-    найденный при первичном анализе (см. scripts/run_benchmark.py), — это
-    готовый регрессионный тест против "починки" SQI простым ослаблением
-    порогов. "девочка" (движение в кадре) обязана оставаться ХУДШЕЙ и по
-    покрытию, и по медианному spectral_snr_db среди всех 4 видео — если
-    ранжирование схлопнулось (например, все видео дают одинаковое покрытие
-    0% или 100%), это тоже провал: значит компонента перестала различать
-    хороший и плохой сигнал.
+    """Регрессия для задачи 23: качественный порядок 6 реальных видео
+    (расширено с исходных 4 — добавлены "мужчина" и "вероника", см.
+    scripts/run_benchmark.py), найденный при анализе на min_spectral_snr_db=
+    -3.0 (задача 22) — готовый регрессионный тест против "починки" SQI
+    простым ослаблением порогов.
+
+    Два инварианта:
+    1. "девочка" (движение в кадре) — ХУДШАЯ по покрытию среди ВСЕХ 6 видео.
+    2. ЧЁТКИЙ РАЗРЫВ на две группы: "хорошая" (тётя, темнокожая
+       вертикально/горизонтально — 26-51% покрытия на момент калибровки) и
+       "проблемная" (вероника, мужчина, девочка — 0-19%) — минимум покрытия
+       хорошей группы должен оставаться СТРОГО ВЫШЕ максимума проблемной.
+       Если разрыв схлопнулся — компонента перестала различать хороший и
+       плохой сигнал, а не просто "числа немного сдвинулись".
 
     Пропускается, если видео недоступны локально (они не часть репозитория —
     см. scripts/run_benchmark.py.DEFAULT_VIDEOS) — это не CI-тест, а
     инструмент разработчика с доступом к исходным записям."""
-    print("\n=== Тест: качественный порядок 4 видео сохраняется (задача 23) ===")
+    print("\n=== Тест: качественный порядок 6 видео сохраняется (задача 23) ===")
     import sys
     from pathlib import Path
 
@@ -1639,29 +1645,35 @@ def test_ranking_preserved():
         return
 
     coverage_by_video: dict[str, float] = {}
-    median_snr_by_video: dict[str, float] = {}
     for video in videos:
         summary = run_video(str(video), model_path, PipelineConfig())
         coverage_by_video[video.stem] = summary["coverage"]
-        snr_p50 = summary["percentiles"]["spectral_snr_db"][2]  # PERCENTILES=[5,25,50,75,95] -> индекс 2 = 50%
-        median_snr_by_video[video.stem] = snr_p50
-        print(f"  {video.stem:<40s} coverage={summary['coverage'] * 100:5.1f}%  median_snr={snr_p50:6.2f} dB")
+        print(f"  {video.stem:<45s} coverage={summary['coverage'] * 100:5.1f}%")
 
-    girl_name = next(name for name in coverage_by_video if "девочк" in name.lower() or "girl" in name.lower())
-    others = [name for name in coverage_by_video if name != girl_name]
+    def _find(substrings: tuple[str, ...]) -> str:
+        return next(
+            name for name in coverage_by_video
+            if any(s in name.lower() for s in substrings)
+        )
 
-    assert coverage_by_video[girl_name] <= min(coverage_by_video[n] for n in others), (
-        f"'{girl_name}' (движение) должна оставаться ХУДШЕЙ по покрытию среди 4 видео, "
+    girl_name = _find(("девочк",))
+    good_group = [_find(("тет",)), _find(("вертикально",)), _find(("горизонтально",))]
+    problem_group = [_find(("верони",)), _find(("мужчин",)), girl_name]
+
+    assert coverage_by_video[girl_name] == min(coverage_by_video.values()), (
+        f"'{girl_name}' (движение) должна оставаться ХУДШЕЙ по покрытию среди всех 6 видео, "
         f"получено: {coverage_by_video}"
     )
-    assert median_snr_by_video[girl_name] <= min(median_snr_by_video[n] for n in others), (
-        f"'{girl_name}' (движение) должна оставаться ХУДШЕЙ по медианному spectral_snr_db, "
-        f"получено: {median_snr_by_video}"
+
+    min_good = min(coverage_by_video[n] for n in good_group)
+    max_problem = max(coverage_by_video[n] for n in problem_group)
+    assert min_good > max_problem, (
+        "разрыв между 'хорошей' (тётя/темнокожая) и 'проблемной' (вероника/мужчина/девочка) "
+        f"группами схлопнулся: min(хорошая)={min_good:.3f} <= max(проблемная)={max_problem:.3f}, "
+        f"получено: {coverage_by_video}"
     )
-    assert len(set(coverage_by_video.values())) > 1 or len(set(median_snr_by_video.values())) > 1, (
-        "ранжирование схлопнулось: все видео дают одинаковое покрытие И одинаковый медианный SNR"
-    )
-    print("  [OK] 'девочка' остаётся худшей и по покрытию, и по SNR среди 4 видео")
+    print(f"  [OK] 'девочка' худшая среди 6; разрыв хорошая/проблемная группы сохранён "
+          f"(min={min_good:.1%} > max={max_problem:.1%})")
 
 
 def run_all():
