@@ -7,3 +7,8 @@ __pycache__/
 *.png
 *.config.yaml
 *.bak_*
+*.csv
+*.jsonl
+*.png
+*.config.yaml
+*.bak_*
