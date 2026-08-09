@@ -520,12 +520,14 @@ def test_temporal_consistency_does_not_penalize_spectral_grid_jitter():
     эстиматора физически неотличимо от дискретности самой сетки, а не
     признак нестабильности сигнала — formula не должна штрафовать за него."""
     print("\n=== Тест: temporal_consistency не штрафует дрожание в пределах разрешения спектра (13в) ===")
-    from rppg.signal.quality import temporal_consistency_score, spectral_resolution_bpm
+    from rppg.signal.quality import temporal_consistency_score, resolvable_bpm_difference
 
     fps, n_samples = 30.0, 300
-    resolution = spectral_resolution_bpm(fps, n_samples, "welch")
-    print(f"  spectral_resolution_bpm(fps=30, n=300, welch) = {resolution:.4f} BPM")
-    assert 0.0 < resolution < 6.0, "sanity: разрешение Welch-сетки должно быть маленьким, но не нулевым"
+    resolution = resolvable_bpm_difference(fps, n_samples, "welch")
+    print(f"  resolvable_bpm_difference(fps=30, n=300, welch) = {resolution:.4f} BPM")
+    # Задача 18: nperseg=min(300, max(64, int(30*8)))=240 -> 1.44*30/240*60 ≈ 10.8 BPM
+    # (старая формула через zero-padded n_fft давала ошибочные ≈0.88 BPM).
+    assert 5.0 < resolution < 20.0, "sanity: реальная ширина лепестка Welch-окна на 10с/30fps — единицы-десятки BPM"
 
     # Дрожание ЗАМЕТНО МЕНЬШЕ шага сетки (5%) — при жёстком max_expected_change_bpm
     # (меньше самого шага сетки) старая формула ложно оштрафовала бы даже это.
@@ -541,6 +543,54 @@ def test_temporal_consistency_does_not_penalize_spectral_grid_jitter():
     )
 
 
+def test_resolvable_bpm_difference_reflects_main_lobe_width():
+    """Регрессия для задачи 18: resolvable_bpm_difference должна отражать
+    РЕАЛЬНУЮ разрешающую способность Welch-эстиматора (ширина главного
+    лепестка окна на СЕГМЕНТЕ nperseg), а не плотность zero-padded сетки
+    (старая формула fps/n_fft). Классический критерий разрешения: два
+    равных по амплитуде тона, отстоящие МЕНЬШЕ ширины лепестка, сливаются в
+    спектре в ОДИН горб без провала между ними; отстоящие ЗАМЕТНО БОЛЬШЕ —
+    дают ДВА различимых локальных максимума. Используется
+    frequency.estimate_hr_welch напрямую (та же nperseg/nfft сетка, которую
+    resolvable_bpm_difference("welch") зеркалит), а не quality.compute_psd,
+    у которого ДРУГАЯ (для SNR, не для локализации пика) формула nperseg."""
+    print("\n=== Тест: resolvable_bpm_difference отражает ширину лепестка окна (задача 18) ===")
+    from rppg.signal.quality import resolvable_bpm_difference
+    from rppg.signal.frequency import estimate_hr_welch
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    f0_hz = 1.2  # 72 BPM
+
+    resolution_hz = resolvable_bpm_difference(fps, n, "welch") / 60.0
+
+    def _n_local_maxima_between(delta_hz: float) -> int:
+        signal = np.sin(2 * np.pi * (f0_hz - delta_hz / 2) * t) + np.sin(2 * np.pi * (f0_hz + delta_hz / 2) * t)
+        est = estimate_hr_welch(signal, fps, band)
+        mask = (est.freqs_hz >= f0_hz - delta_hz) & (est.freqs_hz <= f0_hz + delta_hz)
+        p = est.power[mask]
+        if len(p) < 3:
+            return 0
+        return int(np.sum((p[1:-1] > p[:-2]) & (p[1:-1] > p[2:])))
+
+    n_merged = _n_local_maxima_between(delta_hz=resolution_hz * 0.3)
+    n_resolved = _n_local_maxima_between(delta_hz=resolution_hz * 4.0)
+    print(f"  resolution={resolution_hz * 60:.2f} BPM, слитые тона (Δ={resolution_hz * 0.3 * 60:.2f} BPM): "
+          f"{n_merged} локальных максимумов, разнесённые тона (Δ={resolution_hz * 4.0 * 60:.2f} BPM): "
+          f"{n_resolved} локальных максимумов")
+
+    assert n_merged <= 1, (
+        f"тона, отстоящие МЕНЬШЕ разрешающей способности, должны сливаться в спектре в один горб "
+        f"(получено {n_merged} локальных максимумов)"
+    )
+    assert n_resolved >= 2, (
+        f"тона, отстоящие ЗАМЕТНО БОЛЬШЕ разрешающей способности, должны быть различимы как два горба "
+        f"(получено {n_resolved} локальных максимумов)"
+    )
+
+
 def test_cross_roi_agreement_robust_to_single_outlier_roi():
     """Регрессия для задачи 13б: раньше сравнивался РАЗМАХ (max-min) — одно
     выпавшее ROI (например, засвеченная щека) утягивало его и обнуляло
@@ -552,37 +602,89 @@ def test_cross_roi_agreement_robust_to_single_outlier_roi():
     two_agree_one_outlier = {"forehead": 70.0, "left_cheek": 71.0, "right_cheek": 150.0}
     all_disagree = {"forehead": 70.0, "left_cheek": 110.0, "right_cheek": 150.0}
 
-    score_outlier = cross_roi_agreement_score(two_agree_one_outlier)
-    score_all_disagree = cross_roi_agreement_score(all_disagree)
-    print(f"  два согласны + один выброс: {score_outlier:.3f}")
-    print(f"  все три расходятся:         {score_all_disagree:.3f}")
+    score_outlier, n_outlier, insufficient_outlier = cross_roi_agreement_score(two_agree_one_outlier)
+    score_all_disagree, n_disagree, insufficient_disagree = cross_roi_agreement_score(all_disagree)
+    print(f"  два согласны + один выброс: {score_outlier:.3f} (n={n_outlier})")
+    print(f"  все три расходятся:         {score_all_disagree:.3f} (n={n_disagree})")
 
     assert score_outlier > 0.8, "два согласных ROI из трёх должны давать высокий score несмотря на один выброс"
     assert score_all_disagree < score_outlier, "когда РЕАЛЬНО все три расходятся, score должен быть ниже"
+    assert not insufficient_outlier and not insufficient_disagree, "3 ROI с валидным BPM -> компонента измерима"
+    assert n_outlier == 3 and n_disagree == 3, "без snr_by_roi_db фильтрация не применяется -> все ROI участвуют"
 
 
 def test_cross_roi_agreement_ignores_low_snr_roi():
-    """Регрессия для задачи 13б: сравнивать оценку заведомо шумного ROI
-    (SNR глубоко отрицательный — пульсовой компоненты там нет) с оценкой
-    хорошего ROI бессмысленно. Если снабдить cross_roi_agreement_score
-    собственным SNR каждого ROI, шумный ROI должен ИСКЛЮЧАТЬСЯ из сравнения,
-    а не тянуть агрегированную оценку вниз наравне с хорошими."""
-    print("\n=== Тест: cross_roi_agreement игнорирует ROI с низким собственным SNR (13б) ===")
+    """Регрессия для задачи 13б (порог на SNR-разрыв сделан ОТНОСИТЕЛЬНЫМ в
+    задаче 17, см. cross_roi_agreement_score): сравнивать оценку заведомо
+    шумного ROI (SNR намного ниже лучшего в этом же окне — пульсовой
+    компоненты там нет) с оценкой хорошего ROI бессмысленно. Шумный ROI
+    должен ИСКЛЮЧАТЬСЯ из сравнения, а не тянуть агрегированную оценку вниз
+    наравне с хорошими."""
+    print("\n=== Тест: cross_roi_agreement игнорирует ROI с низким собственным SNR (13б/17) ===")
     from rppg.signal.quality import cross_roi_agreement_score
 
     bpm_by_roi = {"forehead": 70.0, "left_cheek": 71.0, "right_cheek": 140.0}
-    snr_by_roi_db = {"forehead": 8.0, "left_cheek": 7.5, "right_cheek": -6.0}  # right_cheek явно шумит
+    # right_cheek отстаёт от лучшего (forehead, 8.0 дБ) на 14 дБ — намного
+    # больше стандартного max_snr_gap_db=6.0, должен быть исключён.
+    snr_by_roi_db = {"forehead": 8.0, "left_cheek": 7.5, "right_cheek": -6.0}
 
-    score_without_filter = cross_roi_agreement_score(bpm_by_roi)
-    score_with_filter = cross_roi_agreement_score(bpm_by_roi, snr_by_roi_db=snr_by_roi_db, min_component_snr_db=0.0)
-    print(f"  без фильтра по SNR: {score_without_filter:.3f}")
-    print(f"  с фильтром по SNR:  {score_with_filter:.3f}")
+    score_without_filter, n_without, _ = cross_roi_agreement_score(bpm_by_roi)
+    score_with_filter, n_with, _ = cross_roi_agreement_score(
+        bpm_by_roi, snr_by_roi_db=snr_by_roi_db, max_snr_gap_db=6.0
+    )
+    print(f"  без фильтра по SNR: {score_without_filter:.3f} (n={n_without})")
+    print(f"  с фильтром по SNR:  {score_with_filter:.3f} (n={n_with})")
 
     assert score_with_filter > score_without_filter, (
         "исключение заведомо шумного ROI по его собственному SNR должно повышать согласие "
         "оставшихся (реально согласных) ROI"
     )
     assert score_with_filter > 0.9, "после исключения шумного ROI два оставшихся почти идентичных значения должны давать высокий score"
+    assert n_with == 2, "right_cheek должен быть исключён относительным SNR-фильтром"
+
+
+def test_cross_roi_agreement_guarantees_minimum_two_participants():
+    """Регрессия для задачи 17: раньше абсолютный SNR-фильтр мог отсечь
+    ВСЕ ROI до < 2 участников, даже если формально было доступно 3 —
+    компонента тогда молча вырождалась в нейтральную 0.5 при каждом окне
+    реальной записи (см. cross_roi_agreement_score). Теперь минимум 2
+    участника гарантируется явно: если относительный gap-фильтр оставил
+    только 1 ROI, второй по величине собственного SNR добавляется
+    принудительно — компонента остаётся ИЗМЕРИМОЙ, а не "недостаточно
+    данных", даже когда реально хорош только один источник."""
+    print("\n=== Тест: cross_roi_agreement гарантирует минимум 2 участника (задача 17) ===")
+    from rppg.signal.quality import cross_roi_agreement_score
+
+    bpm_by_roi = {"forehead": 72.0, "left_cheek": 73.0, "right_cheek": 110.0}
+    # Только forehead проходит стандартный gap=6.0 дБ от лучшего; left_cheek
+    # и right_cheek оба отстают намного больше — но left_cheek отстаёт МЕНЬШЕ
+    # right_cheek, поэтому должен быть добавлен вторым принудительно.
+    snr_by_roi_db = {"forehead": 10.0, "left_cheek": -20.0, "right_cheek": -25.0}
+
+    score, n_participants, insufficient = cross_roi_agreement_score(
+        bpm_by_roi, snr_by_roi_db=snr_by_roi_db, max_snr_gap_db=6.0
+    )
+    print(f"  score={score:.3f}, n_participants={n_participants}, insufficient_in_principle={insufficient}")
+
+    assert n_participants >= 2, "минимум 2 участника должен быть гарантирован, даже если gap-фильтр оставил 1"
+    assert not insufficient, "3 ROI с валидным BPM доступны -> компонента в принципе измерима"
+
+
+def test_cross_roi_agreement_single_source_is_insufficient_in_principle():
+    """Регрессия для задачи 17: когда исходно доступен ТОЛЬКО ОДИН ROI с
+    валидным BPM (например, method=head_motion — источник ровно один),
+    компонента в принципе НЕ МОЖЕТ быть измерена — это отдельный случай от
+    "измерена и оказалась низкой", и должен различаться отдельным флагом,
+    а не сливаться с рабочим режимом в статистике."""
+    print("\n=== Тест: единственный источник -> insufficient_in_principle=True (задача 17) ===")
+    from rppg.signal.quality import cross_roi_agreement_score
+
+    score, n_participants, insufficient = cross_roi_agreement_score({"face": 72.0})
+    print(f"  score={score:.3f}, n_participants={n_participants}, insufficient_in_principle={insufficient}")
+
+    assert score == 0.5
+    assert n_participants == 1
+    assert insufficient, "единственный ROI -> компонента в принципе неизмерима"
 
 
 def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
@@ -600,12 +702,12 @@ def test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion():
     rng = np.random.default_rng(1)
 
     clean_tone = np.sin(2 * np.pi * 1.0 * t) + 0.05 * rng.normal(0, 1, n)
-    clean_score, clean_warnings = harmonic_plausibility(clean_tone, fps, peak_freq_hz=1.0, band_hz=band)
+    clean_score, clean_warnings, _ = harmonic_plausibility(clean_tone, fps, peak_freq_hz=1.0, band_hz=band)
 
     # Пик ошибочно "найден" на 2 Hz, но в сигнале сопоставимая энергия на
     # истинной частоте 1 Hz (= заявленный_пик / 2) -> подозрение на путаницу.
     ambiguous = np.sin(2 * np.pi * 1.0 * t) + 0.9 * np.sin(2 * np.pi * 2.0 * t)
-    ambiguous_score, ambiguous_warnings = harmonic_plausibility(ambiguous, fps, peak_freq_hz=2.0, band_hz=band)
+    ambiguous_score, ambiguous_warnings, _ = harmonic_plausibility(ambiguous, fps, peak_freq_hz=2.0, band_hz=band)
 
     print(f"  чистый тон на f: score={clean_score:.2f}, warnings={clean_warnings}")
     print(f"  пик на 2f при сильной энергии на f: score={ambiguous_score:.2f}, warnings={ambiguous_warnings}")
@@ -645,7 +747,7 @@ def test_harmonic_check_ignores_1_over_f_noise_floor():
     red_noise -= np.mean(red_noise)
     red_noise /= np.std(red_noise) + 1e-9
     clean_pulse_plus_red_noise = np.sin(2 * np.pi * 1.0 * t) + 0.3 * red_noise
-    score_clean, warnings_clean = harmonic_plausibility(
+    score_clean, warnings_clean, _ = harmonic_plausibility(
         clean_pulse_plus_red_noise, fps, peak_freq_hz=1.0, band_hz=band
     )
     print(f"  чистый пульс 1.0 Гц + 1/f-шум: score={score_clean:.3f}, warnings={warnings_clean}")
@@ -657,11 +759,42 @@ def test_harmonic_check_ignores_1_over_f_noise_floor():
     # заявленном пике 2.0 Hz — настоящий локальный горб спектра, не точка
     # на монотонном спаде.
     real_subharmonic = np.sin(2 * np.pi * 2.0 * t) + np.sin(2 * np.pi * 1.0 * t)
-    score_real, warnings_real = harmonic_plausibility(real_subharmonic, fps, peak_freq_hz=2.0, band_hz=band)
+    score_real, warnings_real, _ = harmonic_plausibility(real_subharmonic, fps, peak_freq_hz=2.0, band_hz=band)
     print(f"  пульс 2.0 Гц + равный пик на 1.0 Гц: score={score_real:.3f}, warnings={warnings_real}")
     assert score_real < 0.9 and warnings_real, (
         f"реальная субгармоника равной мощности должна заметно снижать score (получено {score_real})"
     )
+
+
+def test_second_harmonic_energy_is_not_penalized():
+    """Регрессия для задачи 20: горб на 2f — ОЖИДАЕМЫЙ признак чистого
+    несинусоидального пульса (резкий систолический подъём, пологий
+    диастолический спад), а не путаницы, и больше НЕ штрафуется (см.
+    docstring harmonic_plausibility). Раньше сигнал с сильной, физиологически
+    правдоподобной 2-й гармоникой получал предупреждение "путаница с 2-й
+    гармоникой" и штраф — ровно на том сигнале, где качество пульса самое
+    высокое (найдено на реальной записи: пик 85.5 BPM с горбом на 171 BPM).
+    f=1.2 Гц выбрана так, что f/2=0.6 Гц < band[0]=0.7 Гц — субгармонический
+    тест физически неинформативен и не мешает изолированно проверить именно
+    2f-ветку."""
+    print("\n=== Тест: энергия на 2f не штрафуется, только логируется как harmonic_support (задача 20) ===")
+    from rppg.signal.quality import harmonic_plausibility
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    f_hz = 1.2  # 72 BPM, f/2=0.6 Hz < band[0] -> субгармонический тест не сработает
+
+    clean_pulse_with_second_harmonic = np.sin(2 * np.pi * f_hz * t) + 0.8 * np.sin(2 * np.pi * 2.0 * f_hz * t)
+    score, warnings, harmonic_support = harmonic_plausibility(
+        clean_pulse_with_second_harmonic, fps, peak_freq_hz=f_hz, band_hz=band
+    )
+    print(f"  score={score:.3f}, harmonic_support={harmonic_support}, warnings={warnings}")
+
+    assert score == 1.0, f"горб на 2f не должен штрафовать score (получено {score})"
+    assert not warnings, "горб на 2f не должен генерировать warning о путанице (задача 20)"
+    assert harmonic_support, "значимый горб на 2f должен быть отражён в harmonic_support (информационно)"
 
 
 def test_illumination_flicker_detected_via_background_roi():
@@ -1170,6 +1303,168 @@ def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
               f"sqi_temporal_consistency={last['sqi_temporal_consistency']:.3f}")
 
 
+def test_publishable_matches_across_csv_and_jsonl():
+    """Регрессия для задачи 16: PTSDPulseFeatures.publishable (то, что видит
+    вызывающий код в памяти и что превращается в колонку CSV в
+    scripts/run_on_video.py) и WindowLogRecord.publishable (JSONL-лог,
+    structured_log.py) ОБЯЗАНЫ совпадать окно в окно — оба теперь читают
+    ровно SQIResult.is_reliable, а не два независимо пересчитанных правила
+    (см. docstring PTSDPulseFeatures.publishable). Раньше PTSDPulseFeatures.
+    publishable был мягче (confidence >= порога, без учёта spectral_snr_db
+    и flicker_suspected), и на реальных записях число publishable=True в
+    CSV расходилось с числом publishable=True в JSONL для тех же самых окон
+    (доказательство бага — три реальных прогона с точным совпадением "число
+    publishable в CSV == число окон, провалившихся ТОЛЬКО по SNR")."""
+    print("\n=== Тест: publishable совпадает между PTSDPulseFeatures и JSONL-логом (задача 16) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "windows.jsonl"
+        cfg = PipelineConfig()
+        try:
+            pipe = RPPGPipeline(cfg, log_path=log_path)
+        except FileNotFoundError as exc:
+            print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+            return
+        except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+            print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+            return
+
+        landmarks = _make_synthetic_landmarks_for_pipeline_test()
+        synthetic_result = FaceFrameResult(
+            detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+        )
+        pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+
+        true_bpm = 75.0
+        rng = np.random.default_rng(21)
+        fps = 30.0
+        n_frames = int(fps * 15.0)
+        results = []
+        try:
+            for i in range(n_frames):
+                t_sec = i / fps
+                frame = _make_pulsating_frame(t_sec, true_bpm, rng)
+                result = pipe.process_frame(frame, int(t_sec * 1000))
+                if result is not None:
+                    results.append(result)
+        finally:
+            pipe.close()
+
+        assert log_path.exists(), "log_path должен быть создан, раз пайплайн выдал хотя бы одно окно"
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        logged = [json.loads(line) for line in lines]
+
+        assert len(results) == len(logged), (
+            f"число окон из process_frame ({len(results)}) не совпадает с числом строк JSONL ({len(logged)})"
+        )
+
+        for i, (result, record) in enumerate(zip(results, logged)):
+            assert result.publishable == record["publishable"], (
+                f"окно #{i} (t={result.timestamp_ms}ms): PTSDPulseFeatures.publishable="
+                f"{result.publishable}, WindowLogRecord.publishable={record['publishable']} — "
+                "два источника истины разошлись (см. задачу 16)"
+            )
+
+        n_publishable_from_results = sum(1 for r in results if r.publishable)
+        n_publishable_from_jsonl = sum(1 for r in logged if r["publishable"])
+        assert n_publishable_from_results == n_publishable_from_jsonl
+        print(f"  [OK] {len(results)} окон, publishable совпадает поэлементно "
+              f"({n_publishable_from_results} publishable=True с обеих сторон)")
+
+
+def test_window_status_labels_degenerate_and_no_face_windows():
+    """Регрессия для задачи 21: window_status в JSONL-логе должен различать
+    "ok" (реальная, пусть и шумная, временная вариация ROI) от
+    "degenerate_signal" (сигнал технически посчитан, но std ~ 0 после
+    препроцессинга — dominant_frequency_and_snr возвращает -inf, см.
+    quality.compute_psd). Раньше ОБА случая молча получали одинаковый
+    status="ok" и тихо выпадали из перцентилей как "N inf/nan исключено" в
+    analyze_log.py — без объяснения причины (см. критерий приёмки задачи 21:
+    сумма окон по всем status равна общему числу окон, и причина видна)."""
+    print("\n=== Тест: window_status различает ok/degenerate_signal (задача 21) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    import json
+    import tempfile
+    from pathlib import Path
+
+    landmarks = _make_synthetic_landmarks_for_pipeline_test()
+    synthetic_result = FaceFrameResult(
+        detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+    )
+    fps = 30.0
+
+    def _run(frame_source, n_frames: int, log_path: Path) -> list[dict]:
+        cfg = PipelineConfig()
+        try:
+            pipe = RPPGPipeline(cfg, log_path=log_path)
+        except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+            print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+            return []
+        pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+        try:
+            for i in range(n_frames):
+                t_sec = i / fps
+                pipe.process_frame(frame_source(t_sec), int(t_sec * 1000))
+        finally:
+            pipe.close()
+        if not log_path.exists():
+            return []
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # true_bpm=0.0 -> нет пульсации, но per-frame шум камеры (см.
+        # _make_pulsating_frame) даёт РЕАЛЬНУЮ временную вариацию -> "ok"
+        # (низкое качество, но НЕ вырожденный сигнал).
+        rng_noise = np.random.default_rng(9)
+        noisy_records = _run(
+            lambda t_sec: _make_pulsating_frame(t_sec, 0.0, rng_noise),
+            int(fps * 13.0), Path(tmpdir) / "noisy.jsonl",
+        )
+        assert noisy_records, "sanity: шумные (но не замороженные) кадры должны дать хотя бы одну строку лога"
+        noisy_statuses = {r["window_status"] for r in noisy_records}
+        assert noisy_statuses == {"ok"}, (
+            f"кадры с реальной (пусть и шумовой) временной вариацией не должны получать "
+            f"degenerate_signal/too_short, получено: {noisy_statuses}"
+        )
+
+        # ОДИН и тот же кадр (бит в бит) на всех итерациях -> нулевая
+        # временная вариация ROI -> сигнал после препроцессинга вырождается
+        # в std ~ 0 -> degenerate_signal.
+        rng_frozen = np.random.default_rng(10)
+        frozen_frame = _make_pulsating_frame(0.0, 0.0, rng_frozen)
+        frozen_records = _run(
+            lambda t_sec: frozen_frame,
+            int(fps * 13.0), Path(tmpdir) / "frozen.jsonl",
+        )
+        assert frozen_records, "sanity: замороженный кадр должен дать хотя бы одну строку лога"
+        frozen_statuses = {r["window_status"] for r in frozen_records}
+        assert frozen_statuses == {"degenerate_signal"}, (
+            f"полностью замороженный (нулевая временная вариация) кадр должен давать "
+            f"window_status=degenerate_signal во всех окнах, получено: {frozen_statuses}"
+        )
+
+    print(f"  [OK] шумные кадры -> window_status=ok ({len(noisy_records)} окон), "
+          f"замороженный кадр -> window_status=degenerate_signal ({len(frozen_records)} окон)")
+
+
 def test_subsample_peak_refinement_reduces_rmssd_quantization_error():
     """Регрессия для п.13 (Этап C): на 30 fps шаг индекса пика = 33.3 мс,
     сопоставимый с самим RMSSD (20-50 мс у здоровых в покое). Без
@@ -1304,6 +1599,71 @@ def test_respiration_rate_from_amplitude_modulation():
     assert short_bpm is None and short_hz is None, "слишком короткий сигнал должен безопасно вернуть None"
 
 
+def test_ranking_preserved():
+    """Регрессия для задачи 23: качественный порядок 4 реальных видео,
+    найденный при первичном анализе (см. scripts/run_benchmark.py), — это
+    готовый регрессионный тест против "починки" SQI простым ослаблением
+    порогов. "девочка" (движение в кадре) обязана оставаться ХУДШЕЙ и по
+    покрытию, и по медианному spectral_snr_db среди всех 4 видео — если
+    ранжирование схлопнулось (например, все видео дают одинаковое покрытие
+    0% или 100%), это тоже провал: значит компонента перестала различать
+    хороший и плохой сигнал.
+
+    Пропускается, если видео недоступны локально (они не часть репозитория —
+    см. scripts/run_benchmark.py.DEFAULT_VIDEOS) — это не CI-тест, а
+    инструмент разработчика с доступом к исходным записям."""
+    print("\n=== Тест: качественный порядок 4 видео сохраняется (задача 23) ===")
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    sys.path.insert(0, str(scripts_dir))
+    from run_benchmark import DEFAULT_VIDEOS, run_video
+
+    videos = [Path(v) for v in DEFAULT_VIDEOS]
+    missing = [v for v in videos if not v.exists()]
+    if missing:
+        print(f"  [SKIP] видео недоступны локально ({len(missing)}/{len(videos)} не найдено) — "
+              "этот тест не часть CI, требует исходных записей задач 16-24")
+        return
+
+    try:
+        from rppg.config import PipelineConfig
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    model_path = str(Path(__file__).resolve().parents[1] / "models" / "face_landmarker.task")
+    if not Path(model_path).exists():
+        print(f"  [SKIP] модель Face Landmarker недоступна ({model_path})")
+        return
+
+    coverage_by_video: dict[str, float] = {}
+    median_snr_by_video: dict[str, float] = {}
+    for video in videos:
+        summary = run_video(str(video), model_path, PipelineConfig())
+        coverage_by_video[video.stem] = summary["coverage"]
+        snr_p50 = summary["percentiles"]["spectral_snr_db"][2]  # PERCENTILES=[5,25,50,75,95] -> индекс 2 = 50%
+        median_snr_by_video[video.stem] = snr_p50
+        print(f"  {video.stem:<40s} coverage={summary['coverage'] * 100:5.1f}%  median_snr={snr_p50:6.2f} dB")
+
+    girl_name = next(name for name in coverage_by_video if "девочк" in name.lower() or "girl" in name.lower())
+    others = [name for name in coverage_by_video if name != girl_name]
+
+    assert coverage_by_video[girl_name] <= min(coverage_by_video[n] for n in others), (
+        f"'{girl_name}' (движение) должна оставаться ХУДШЕЙ по покрытию среди 4 видео, "
+        f"получено: {coverage_by_video}"
+    )
+    assert median_snr_by_video[girl_name] <= min(median_snr_by_video[n] for n in others), (
+        f"'{girl_name}' (движение) должна оставаться ХУДШЕЙ по медианному spectral_snr_db, "
+        f"получено: {median_snr_by_video}"
+    )
+    assert len(set(coverage_by_video.values())) > 1 or len(set(median_snr_by_video.values())) > 1, (
+        "ранжирование схлопнулось: все видео дают одинаковое покрытие И одинаковый медианный SNR"
+    )
+    print("  [OK] 'девочка' остаётся худшей и по покрытию, и по SNR среди 4 видео")
+
+
 def run_all():
     tests = [
         test_color_based_methods_recover_known_bpm,
@@ -1323,10 +1683,14 @@ def run_all():
         test_landmark_stability_penalizes_strong_uniform_sway,
         test_temporal_consistency_penalizes_unstable_bpm_sequence,
         test_temporal_consistency_does_not_penalize_spectral_grid_jitter,
+        test_resolvable_bpm_difference_reflects_main_lobe_width,
         test_cross_roi_agreement_robust_to_single_outlier_roi,
         test_cross_roi_agreement_ignores_low_snr_roi,
+        test_cross_roi_agreement_guarantees_minimum_two_participants,
+        test_cross_roi_agreement_single_source_is_insufficient_in_principle,
         test_harmonic_check_flags_fundamental_vs_second_harmonic_confusion,
         test_harmonic_check_ignores_1_over_f_noise_floor,
+        test_second_harmonic_energy_is_not_penalized,
         test_illumination_flicker_detected_via_background_roi,
         test_flicker_requires_consecutive_windows_to_confirm,
         test_static_photo_or_mannequin_is_not_publishable,
@@ -1335,11 +1699,14 @@ def run_all():
         test_auto_method_selection_avoids_specifically_corrupted_method,
         test_config_yaml_json_roundtrip_preserves_non_default_values,
         test_structured_window_logger_writes_valid_jsonl_with_sqi_components,
+        test_publishable_matches_across_csv_and_jsonl,
+        test_window_status_labels_degenerate_and_no_face_windows,
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,
         test_ectopic_masking_does_not_stitch_false_diff,
         test_hrv_artifact_fraction_gates_publishable,
         test_lf_hf_require_separate_minimum_durations,
         test_respiration_rate_from_amplitude_modulation,
+        test_ranking_preserved,
     ]
     failed = []
     for test in tests:

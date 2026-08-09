@@ -261,16 +261,17 @@ def test_confidence_and_status_invariants():
     спектра реального окна, никогда как побочный эффект низкого confidence.
     Дополнительно проверяет базовые инварианты новых полей: confidence
     всегда в [0,1], status="no_signal" <=> bpm=NaN и confidence==0.0 и
-    confidence_breakdown пуст, publishable — простое пороговое правило от
-    confidence (см. docstring PTSDPulseFeatures.publishable)."""
-    print("\n=== Задача 11: bpm/confidence/status инварианты на чистой синтетике ===")
-    pipe, skip_reason = _try_init_pipeline()
+    confidence_breakdown пуст, publishable — РОВНО SQIResult.is_reliable
+    (задача 16: единственный источник истины, см. docstring
+    PTSDPulseFeatures.publishable) — используем debug=True, чтобы сравнить
+    напрямую с sqi.is_reliable, а не переизобретать пороговое правило здесь."""
+    print("\n=== Задача 11/16: bpm/confidence/status/publishable инварианты на чистой синтетике ===")
+    pipe, skip_reason = _try_init_pipeline(debug=True)
     if pipe is None:
         print(f"  [SKIP] {skip_reason}")
         return
     _mock_face_detected(pipe)
 
-    threshold = pipe.cfg.quality.min_overall_score_to_publish
     rng = np.random.default_rng(50)
     n_ok, n_no_signal = 0, 0
     try:
@@ -282,10 +283,11 @@ def test_confidence_and_status_invariants():
                 continue
             assert result.status in ("ok", "no_signal"), f"неизвестный status={result.status!r}"
             assert 0.0 <= result.confidence <= 1.0, f"confidence вне [0,1]: {result.confidence}"
-            assert result.publishable == (result.confidence >= threshold), (
-                "publishable должен быть ровно confidence >= min_overall_score_to_publish"
-            )
             if result.status == "ok":
+                assert result.publishable == result.debug.sqi.is_reliable, (
+                    "publishable должен быть ровно SQIResult.is_reliable (задача 16), "
+                    f"получено publishable={result.publishable}, is_reliable={result.debug.sqi.is_reliable}"
+                )
                 n_ok += 1
                 assert not np.isnan(result.bpm), "status=ok, но bpm=NaN — bpm обязан быть реальной оценкой спектра"
                 assert result.confidence_breakdown, "status=ok должен нести непустой confidence_breakdown"
