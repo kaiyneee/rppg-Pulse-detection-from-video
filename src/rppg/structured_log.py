@@ -71,6 +71,15 @@ class WindowLogRecord:
     # контракт для потребителя), это диагностическое поле только для
     # JSONL/CSV-анализа failure cases (scripts/analyze_log.py).
     window_status: str = "ok"
+    # Задача 25: агрегированный BPM для автоматической подачи в систему
+    # ПТСР — см. полный контракт потребителя в docstring полей bpm_aggregate*
+    # на pipeline.PTSDPulseFeatures (quality==0.0 -> нельзя использовать;
+    # status=="stale" -> НЕ новое наблюдение, не независимая точка).
+    bpm_aggregate: float = float("nan")
+    bpm_aggregate_quality: float = 0.0
+    bpm_aggregate_status: str = "no_data"
+    bpm_aggregate_n_windows: int = 0
+    bpm_aggregate_spread_bpm: float = float("nan")
 
     def to_json_line(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

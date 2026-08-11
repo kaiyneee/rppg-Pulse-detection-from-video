@@ -1599,6 +1599,301 @@ def test_respiration_rate_from_amplitude_modulation():
     assert short_bpm is None and short_hz is None, "слишком короткий сигнал должен безопасно вернуть None"
 
 
+def _make_pipeline_for_aggregate_test(cfg=None):
+    """Общий хелпер для тестов задачи 25 — RPPGPipeline с реальной моделью
+    Face Landmarker (нужна только для конструктора, process_frame НЕ
+    вызывается: тесты дёргают _compute_aggregate напрямую как white-box)."""
+    from rppg.pipeline import RPPGPipeline
+    from rppg.config import PipelineConfig
+
+    try:
+        return RPPGPipeline(cfg or PipelineConfig()), None
+    except FileNotFoundError as exc:
+        return None, f"модель Face Landmarker недоступна ({exc})"
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        return None, f"не удалось инициализировать MediaPipe ({exc})"
+
+
+def test_aggregate_median_robust_to_single_outlier():
+    """Регрессия для задачи 25: bpm_aggregate — ВЗВЕШЕННАЯ МЕДИАНА, не
+    среднее. Одна октавная ошибка (150 среди восьмидесятых) не должна
+    утягивать агрегат за собой — ровно то требование, ради которого медиана
+    и выбрана вместо среднего (среднее сдвинулось бы примерно на 13 BPM).
+
+    ВАЖНО (проверено численно): межквартильный размах (IQR) при n=5 с ОДНИМ
+    выбросом на самом краю сортировки СТРУКТУРНО не меняется — 25-й/75-й
+    перцентиль (в т.ч. в numpy) попадают строго ВНУТРЬ кластера [84,84,85,85],
+    минуя единственную крайнюю точку 150 (np.percentile([84,85,84,150,85],
+    [25,75]) == np.percentile([84,85,84,85,84], [25,75]) == (84.0, 85.0)
+    буквально). Поэтому "spread_bpm/quality заметно ниже" на ЭТОМ конкретном
+    5-точечном примере не воспроизводится ни при какой корректной реализации
+    IQR — это демонстрируется отдельно, на сценарии, где перцентильная
+    интерполяция реально задевает выброс (см.
+    test_aggregate_spread_and_quality_respond_to_dispersion)."""
+    print("\n=== Тест: агрегат устойчив к одиночному выбросу через медиану (задача 25) ===")
+    pipe_clean, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe_clean is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    pipe_outlier, _ = _make_pipeline_for_aggregate_test()
+
+    try:
+        clean_seq = [84.0, 85.0, 84.0, 85.0, 84.0]
+        outlier_seq = [84.0, 85.0, 84.0, 150.0, 85.0]
+        result_clean = result_outlier = None
+        for i, (bpm_c, bpm_o) in enumerate(zip(clean_seq, outlier_seq)):
+            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8)
+            result_outlier = pipe_outlier._compute_aggregate(i * 1000, bpm_o, confidence=0.8)
+
+        print(f"  clean:   bpm={result_clean.bpm:.1f}, spread={result_clean.spread_bpm:.2f}, "
+              f"quality={result_clean.quality:.3f}")
+        print(f"  outlier: bpm={result_outlier.bpm:.1f}, spread={result_outlier.spread_bpm:.2f}, "
+              f"quality={result_outlier.quality:.3f}")
+
+        assert result_clean.status == "measured" and result_outlier.status == "measured"
+        assert abs(result_outlier.bpm - 84.5) <= 1.5, (
+            f"выброс 150 не должен утягивать медиану за собой, получено bpm={result_outlier.bpm}"
+        )
+        assert result_outlier.bpm < 90.0, "150 явно не должно попадать в итоговый агрегат"
+        assert result_outlier.spread_bpm == result_clean.spread_bpm, (
+            "sanity: при n=5 с одним крайним выбросом IQR структурно не должен меняться"
+        )
+    finally:
+        pipe_clean.close()
+        pipe_outlier.close()
+
+
+def test_aggregate_spread_and_quality_respond_to_dispersion():
+    """Дополнение к test_aggregate_median_robust_to_single_outlier (задача
+    25): IQR ЧУВСТВИТЕЛЕН к выбросу, когда перцентильная интерполяция
+    реально его задевает (n=4, где 75-й перцентиль интерполирует МЕЖДУ
+    предпоследней и последней точками) — здесь spread_bpm заметно растёт, а
+    quality заметно падает, именно так, как качественно ожидает задача 25."""
+    print("\n=== Тест: spread_bpm/quality реагируют на реальный разброс (задача 25) ===")
+    pipe_clean, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe_clean is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    pipe_dispersed, _ = _make_pipeline_for_aggregate_test()
+
+    try:
+        clean_seq = [80.0, 82.0, 80.0, 82.0]
+        dispersed_seq = [80.0, 82.0, 80.0, 90.0]
+        result_clean = result_dispersed = None
+        for i, (bpm_c, bpm_d) in enumerate(zip(clean_seq, dispersed_seq)):
+            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8)
+            result_dispersed = pipe_dispersed._compute_aggregate(i * 1000, bpm_d, confidence=0.8)
+
+        print(f"  clean:      spread={result_clean.spread_bpm:.2f}, quality={result_clean.quality:.3f}, "
+              f"status={result_clean.status}")
+        print(f"  dispersed:  spread={result_dispersed.spread_bpm:.2f}, quality={result_dispersed.quality:.3f}, "
+              f"status={result_dispersed.status}")
+
+        assert result_clean.status == "measured" and result_dispersed.status == "measured"
+        assert result_dispersed.spread_bpm > result_clean.spread_bpm, (
+            "разброс с реальным выбросом должен давать заметно больший spread_bpm"
+        )
+        assert result_dispersed.quality < result_clean.quality, (
+            "больший разброс должен давать заметно более низкий quality"
+        )
+    finally:
+        pipe_clean.close()
+        pipe_dispersed.close()
+
+
+def test_aggregate_no_data_when_all_confidence_zero():
+    """Регрессия для задачи 25: интервал целиком из окон с confidence==0
+    (например, лицо не найдено) обязан дать bpm_aggregate=NaN,
+    quality=0.0, status='no_data' — никогда не число."""
+    print("\n=== Тест: агрегат -> no_data, когда confidence==0 весь интервал (задача 25) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+
+    try:
+        result = None
+        for i in range(5):
+            result = pipe._compute_aggregate(i * 1000, float("nan"), confidence=0.0)
+        print(f"  bpm={result.bpm}, quality={result.quality}, status={result.status}")
+        assert np.isnan(result.bpm), "bpm_aggregate должен быть NaN, когда данных нет"
+        assert result.quality == 0.0
+        assert result.status == "no_data"
+        assert result.n_windows == 0
+    finally:
+        pipe.close()
+
+
+def test_aggregate_stale_decays_then_becomes_no_data():
+    """Регрессия для задачи 25: после серии measured-окон подать серию
+    пустых интервалов (confidence=0) — status должен перейти в stale,
+    quality монотонно убывать, а по истечении max_stale_seconds — в
+    no_data. Проверяет, что удержание НЕ бесконечное."""
+    print("\n=== Тест: stale монотонно затухает и переходит в no_data (задача 25) ===")
+    from rppg.config import PipelineConfig
+
+    cfg = PipelineConfig()
+    cfg.aggregate.max_stale_seconds = 10.0  # короче — быстрее тест
+    pipe, skip_reason = _make_pipeline_for_aggregate_test(cfg)
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+
+    try:
+        t = 0
+        result = None
+        for bpm in [80.0, 81.0, 80.0, 81.0]:
+            result = pipe._compute_aggregate(t, bpm, confidence=0.8)
+            t += 1000
+        assert result.status == "measured", f"sanity: должно стать measured, получено {result.status}"
+        measured_quality = result.quality
+
+        # Шаг 2с (шире aggregate_span_seconds=5с по умолчанию) — каждый шаг
+        # гарантированно вымывает предыдущие measured-окна из истории.
+        step_ms = 2000
+        n_steps = int(cfg.aggregate.max_stale_seconds * 1000 / step_ms) + 3
+        statuses, qualities = [], []
+        for _ in range(n_steps):
+            t += step_ms
+            result = pipe._compute_aggregate(t, float("nan"), confidence=0.0)
+            statuses.append(result.status)
+            qualities.append(result.quality)
+
+        print(f"  measured quality={measured_quality:.3f}")
+        print(f"  statuses:  {statuses}")
+        print(f"  qualities: {[round(q, 3) for q in qualities]}")
+
+        assert "stale" in statuses, "должно появиться хотя бы одно stale-окно после measured"
+        assert statuses[-1] == "no_data", "удержание НЕ должно быть бесконечным — обязан наступить no_data"
+
+        stale_qualities = [q for q, s in zip(qualities, statuses) if s == "stale"]
+        assert stale_qualities, "sanity: должна быть хотя бы одна stale-точка"
+        assert stale_qualities[0] <= measured_quality
+        assert all(a >= b for a, b in zip(stale_qualities, stale_qualities[1:])), (
+            f"quality в stale-состоянии должно монотонно убывать, получено {stale_qualities}"
+        )
+    finally:
+        pipe.close()
+
+
+def test_aggregate_nan_iff_no_data():
+    """Регрессия для задачи 25: not np.isnan(bpm_aggregate) <=> status !=
+    'no_data' — инвариант обязан выполняться на КАЖДОМ окне, включая самое
+    первое (когда истории агрегата ещё нет вообще)."""
+    print("\n=== Тест: bpm_aggregate NaN <=> status=='no_data' (задача 25) ===")
+    try:
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+
+    landmarks = _make_synthetic_landmarks_for_pipeline_test()
+    synthetic_result = FaceFrameResult(
+        detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+    )
+    pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+
+    rng = np.random.default_rng(30)
+    fps = 30.0
+    n_checked = 0
+    try:
+        for i in range(int(fps * 20.0)):
+            t_sec = i / fps
+            frame = _make_pulsating_frame(t_sec, 72.0, rng, h=480, w=640)
+            result = pipe.process_frame(frame, int(t_sec * 1000))
+            if result is None:
+                continue
+            n_checked += 1
+            assert result.bpm_aggregate_status in ("measured", "stale", "no_data"), (
+                f"неизвестный bpm_aggregate_status={result.bpm_aggregate_status!r}"
+            )
+            assert np.isnan(result.bpm_aggregate) == (result.bpm_aggregate_status == "no_data"), (
+                f"инвариант нарушен: bpm_aggregate={result.bpm_aggregate}, "
+                f"status={result.bpm_aggregate_status}"
+            )
+    finally:
+        pipe.close()
+
+    assert n_checked > 0, "sanity: должно быть хотя бы одно окно за 20с"
+    print(f"  [OK] инвариант выполнен на всех {n_checked} окнах")
+
+
+def test_aggregate_matches_across_csv_and_jsonl():
+    """Регрессия для задачи 25 (тот же регрессионный подход, что и в
+    задаче 16): bpm_aggregate* в PTSDPulseFeatures (то, что превращается в
+    колонки CSV в run_on_video.py) и в WindowLogRecord (JSONL) должны
+    совпадать поокновно — единственный источник (RPPGPipeline.
+    _compute_aggregate), а не два независимо заполняемых пути."""
+    print("\n=== Тест: bpm_aggregate* совпадает между PTSDPulseFeatures и JSONL-логом (задача 25) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "windows.jsonl"
+        cfg = PipelineConfig()
+        try:
+            pipe = RPPGPipeline(cfg, log_path=log_path)
+        except FileNotFoundError as exc:
+            print(f"  [SKIP] модель Face Landmarker недоступна ({exc})")
+            return
+        except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+            print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+            return
+
+        landmarks = _make_synthetic_landmarks_for_pipeline_test()
+        synthetic_result = FaceFrameResult(
+            detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+        )
+        pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+
+        rng = np.random.default_rng(31)
+        fps = 30.0
+        results = []
+        try:
+            for i in range(int(fps * 15.0)):
+                t_sec = i / fps
+                frame = _make_pulsating_frame(t_sec, 75.0, rng)
+                result = pipe.process_frame(frame, int(t_sec * 1000))
+                if result is not None:
+                    results.append(result)
+        finally:
+            pipe.close()
+
+        assert log_path.exists()
+        logged = [json.loads(line) for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
+        assert len(results) == len(logged)
+
+        for i, (result, record) in enumerate(zip(results, logged)):
+            assert result.bpm_aggregate_status == record["bpm_aggregate_status"], (
+                f"окно #{i}: bpm_aggregate_status разошёлся ({result.bpm_aggregate_status} vs "
+                f"{record['bpm_aggregate_status']})"
+            )
+            assert result.bpm_aggregate_n_windows == record["bpm_aggregate_n_windows"], f"окно #{i}: n_windows разошёлся"
+            if np.isnan(result.bpm_aggregate):
+                assert record["bpm_aggregate"] is None or np.isnan(record["bpm_aggregate"])
+            else:
+                assert abs(result.bpm_aggregate - record["bpm_aggregate"]) < 1e-6, f"окно #{i}: bpm_aggregate разошёлся"
+            assert abs(result.bpm_aggregate_quality - record["bpm_aggregate_quality"]) < 1e-6, (
+                f"окно #{i}: bpm_aggregate_quality разошёлся"
+            )
+
+        print(f"  [OK] {len(results)} окон, bpm_aggregate* совпадает поэлементно между CSV-источником и JSONL")
+
+
 def test_ranking_preserved():
     """Регрессия для задачи 23: качественный порядок 6 реальных видео
     (расширено с исходных 4 — добавлены "мужчина" и "вероника", см.
@@ -1718,6 +2013,12 @@ def run_all():
         test_hrv_artifact_fraction_gates_publishable,
         test_lf_hf_require_separate_minimum_durations,
         test_respiration_rate_from_amplitude_modulation,
+        test_aggregate_median_robust_to_single_outlier,
+        test_aggregate_spread_and_quality_respond_to_dispersion,
+        test_aggregate_no_data_when_all_confidence_zero,
+        test_aggregate_stale_decays_then_becomes_no_data,
+        test_aggregate_nan_iff_no_data,
+        test_aggregate_matches_across_csv_and_jsonl,
         test_ranking_preserved,
     ]
     failed = []

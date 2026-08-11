@@ -51,7 +51,7 @@ DEFAULT_VIDEOS = [
     "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девушка темнокожая вертикально.mp4.mp4",
     "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девушка темнокожая горизонтально.mp4",
     "/Users/ylhjn/Desktop/проекты/статья пульс по видо/мужчина важный.mp4",
-    "/Users/ylhjn/Desktop/вероника .mov",
+    "/Users/ylhjn/Desktop/проекты/статья пульс по видо/вероника .mov",
     "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девочка.mp4",
 ]
 

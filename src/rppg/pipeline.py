@@ -43,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 
-from rppg.config import PipelineConfig, ExtractionMethod, QualityConfig
+from rppg.config import PipelineConfig, ExtractionMethod, QualityConfig, AggregateConfig
 from rppg.face.landmarker import FaceLandmarkerWrapper
 from rppg.face.roi import extract_rois, ROIExtractionResult, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
@@ -87,6 +87,22 @@ class DebugInfo:
     peak_freq_hz: float
     psd_freqs: np.ndarray | None
     psd_values: np.ndarray | None
+
+
+@dataclass
+class AggregateResult:
+    """Задача 25: результат RPPGPipeline._compute_aggregate за один шаг —
+    см. поля bpm_aggregate* в PTSDPulseFeatures ниже для контракта
+    потребителя. n_windows/spread_bpm описывают ИЗМЕРЕНИЕ, стоящее за
+    текущим bpm (для status="stale" — то же измерение, что породило
+    предыдущее "measured", не пересчитывается заново; для "no_data" — 0/NaN,
+    измерения не было вообще)."""
+
+    bpm: float
+    quality: float
+    status: str
+    n_windows: int
+    spread_bpm: float
 
 
 @dataclass
@@ -168,6 +184,37 @@ class PTSDPulseFeatures:
     # Только при RPPGPipeline(debug=True) — см. DebugInfo. None в обычном
     # режиме, чтобы не тащить лишние массивы/объекты по умолчанию.
     debug: DebugInfo | None = None
+
+    # ------------------------------------------------------------------ #
+    # Задача 25: агрегированный BPM для АВТОМАТИЧЕСКОЙ подачи в систему
+    # ПТСР (без оператора, который заметил бы выброс глазами). Считается
+    # каждый шаг по скользящему интервалу AggregateConfig.aggregate_span_
+    # seconds — см. RPPGPipeline._compute_aggregate. Отдельно от bpm/
+    # publishable выше: bpm — честный ответ "что показал спектр ЭТОГО
+    # окна"; bpm_aggregate — устойчивая к одиночным перескокам оценка по
+    # НЕСКОЛЬКИМ последним окнам, предназначенная именно для беззвучного
+    # потребления моделью.
+    #
+    # КОНТРАКТ ПОТРЕБИТЕЛЯ (обязателен к соблюдению интеграцией):
+    #   bpm_aggregate_quality == 0.0  -> значение ИСПОЛЬЗОВАТЬ НЕЛЬЗЯ ни при
+    #       каких условиях, НЕЗАВИСИМО от того, что стоит в bpm_aggregate
+    #       (может быть NaN, а может — старое число из stale-состояния).
+    #   0.0 < bpm_aggregate_quality < 1.0 -> можно использовать, но
+    #       ВЗВЕШЕННО на bpm_aggregate_quality, а не как точное измерение.
+    #   bpm_aggregate_status == "stale" -> это НЕ новое наблюдение, а
+    #       повтор ПОСЛЕДНЕГО измеренного значения. При накоплении
+    #       статистики (средних, вариабельности, любых оконных агрегатов
+    #       ВЫШЕ этого уровня) несколько подряд идущих stale-окон нельзя
+    #       считать независимыми точками — это одно и то же измерение,
+    #       повторённое N раз; их включение в выборку как независимых
+    #       наблюдений даёт ЛОЖНОЕ СУЖЕНИЕ доверительного интервала. Это
+    #       самая вероятная ошибка интеграции — она произойдёт, если явно
+    #       не проверять status при агрегации выше по стеку.
+    bpm_aggregate: float = float("nan")
+    bpm_aggregate_quality: float = 0.0
+    bpm_aggregate_status: str = "no_data"  # "measured" | "stale" | "no_data"
+    bpm_aggregate_n_windows: int = 0
+    bpm_aggregate_spread_bpm: float = float("nan")
 
 
 class _RingBuffer:
@@ -314,6 +361,17 @@ class RPPGPipeline:
         self._last_peak_time_ms: float | None = None
         self._last_hrv_ms: int | None = None
         self._cached_hrv: HRVFeatures | None = None
+
+        # Задача 25: скользящая история (timestamp_ms, bpm, confidence) для
+        # AggregateConfig.aggregate_span_seconds последних окон — ОТДЕЛЬНО
+        # от _recent_bpm_history (задача 20: та короче и хранит только BPM
+        # для temporal_consistency_score, эта хранит confidence и обрезается
+        # по РЕАЛЬНОМУ времени, а не по числу окон). _last_measured_aggregate
+        # переживает обрезку истории — нужна для stale-затухания уже ПОСЛЕ
+        # того, как породившие её окна выпали из aggregate_span_seconds.
+        self._aggregate_history: deque = deque()
+        self._last_measured_aggregate: AggregateResult | None = None
+        self._last_measured_aggregate_timestamp_ms: float | None = None
 
     @property
     def buffered_seconds(self) -> float:
@@ -486,6 +544,91 @@ class RPPGPipeline:
         if self._last_valid_bpm_timestamp_ms is None:
             return None
         return max(0.0, (timestamp_ms - self._last_valid_bpm_timestamp_ms) / 1000.0)
+
+    @staticmethod
+    def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+        """Взвешенная медиана — ПРИНЦИПИАЛЬНО не среднее (задача 25): одна
+        октавная ошибка (например, 150 среди чисел около 80) сдвигает
+        среднее заметно, но не сдвигает медиану вообще — именно перескоки
+        спектрального пика, а не гауссов шум, основной источник выбросов
+        в оконных BPM-оценках (см. AggregateConfig)."""
+        order = np.argsort(values)
+        values_sorted, weights_sorted = values[order], weights[order]
+        cum_weights = np.cumsum(weights_sorted)
+        cutoff = 0.5 * float(weights_sorted.sum())
+        idx = int(np.searchsorted(cum_weights, cutoff))
+        return float(values_sorted[min(idx, len(values_sorted) - 1)])
+
+    def _compute_aggregate(self, timestamp_ms: int, current_bpm: float, confidence: float) -> AggregateResult:
+        """Задача 25: агрегированный BPM для автоматической подачи в
+        систему ПТСР — см. AggregateConfig и контракт потребителя в
+        docstring полей bpm_aggregate* на PTSDPulseFeatures.
+
+        Пересчитывается КАЖДЫЙ шаг (не раз в aggregate_span_seconds) по
+        скользящему интервалу [t - aggregate_span_seconds, t] назад от
+        текущего окна — без этого возникло бы промежуточное состояние
+        "держим прошлый агрегат до следующей границы блока", которое
+        пришлось бы отдельно отличать от честного stale. Если потребителю
+        нужна ровно пятисекундная частота — это его дело (взять каждую
+        N-ю строку), не повод усложнять пайплайн.
+
+        Реальных независимых наблюдений внутри интервала МЕНЬШЕ, чем окон:
+        окна перекрываются на window_seconds - step_seconds (обычно 9с из
+        10), внутри пятисекундного интервала первое и последнее делят
+        половину данных — снижение случайного шума усреднением ожидается
+        около 1.4x, не 2.2x. Основная польза агрегата — отбрасывание
+        выбросов через МЕДИАНУ, а не усреднение шума."""
+        cfg = self.cfg.aggregate
+        cfg_filt = self.cfg.filt
+
+        self._aggregate_history.append((float(timestamp_ms), current_bpm, confidence))
+        cutoff_ms = timestamp_ms - cfg.aggregate_span_seconds * 1000.0
+        while self._aggregate_history and self._aggregate_history[0][0] < cutoff_ms:
+            self._aggregate_history.popleft()
+
+        if not cfg.enabled:
+            return AggregateResult(bpm=float("nan"), quality=0.0, status="no_data", n_windows=0, spread_bpm=float("nan"))
+
+        band_bpm = (cfg_filt.low_hz * 60.0, cfg_filt.high_hz * 60.0)
+        candidates = [
+            (bpm, conf) for _, bpm, conf in self._aggregate_history
+            if conf > 0.0 and not np.isnan(bpm) and band_bpm[0] <= bpm <= band_bpm[1]
+        ]
+
+        if len(candidates) >= cfg.min_windows:
+            bpm_values = np.array([c[0] for c in candidates])
+            conf_values = np.array([c[1] for c in candidates])
+            q25, q75 = np.percentile(bpm_values, [25, 75])
+            spread_bpm = float(q75 - q25)
+            mean_confidence = float(np.mean(conf_values))
+
+            if spread_bpm <= cfg.max_spread_bpm and mean_confidence >= cfg.min_confidence:
+                bpm_aggregate = self._weighted_median(bpm_values, conf_values)
+                normalized_spread = float(np.clip(1.0 - spread_bpm / cfg.max_spread_bpm, 0.0, 1.0))
+                quality = float(np.clip(normalized_spread * mean_confidence, 0.0, 1.0))
+                result = AggregateResult(
+                    bpm=bpm_aggregate, quality=quality, status="measured",
+                    n_windows=len(candidates), spread_bpm=spread_bpm,
+                )
+                self._last_measured_aggregate = result
+                self._last_measured_aggregate_timestamp_ms = float(timestamp_ms)
+                return result
+
+        # Не набралось условий на "measured" в этом окне — пробуем stale.
+        if self._last_measured_aggregate is not None and self._last_measured_aggregate_timestamp_ms is not None:
+            age_s = (timestamp_ms - self._last_measured_aggregate_timestamp_ms) / 1000.0
+            if 0.0 <= age_s <= cfg.max_stale_seconds:
+                decay = max(0.0, 1.0 - age_s / cfg.max_stale_seconds)
+                stale_quality = float(np.clip(self._last_measured_aggregate.quality * decay, 0.0, 1.0))
+                return AggregateResult(
+                    bpm=self._last_measured_aggregate.bpm,
+                    quality=stale_quality,
+                    status="stale",
+                    n_windows=self._last_measured_aggregate.n_windows,
+                    spread_bpm=self._last_measured_aggregate.spread_bpm,
+                )
+
+        return AggregateResult(bpm=float("nan"), quality=0.0, status="no_data", n_windows=0, spread_bpm=float("nan"))
 
     def _select_auto_method(self, fps: float, band: tuple[float, float]):
         """method=AUTO: оценивает КАЖДЫЙ из 5 цветовых методов по среднему
@@ -879,6 +1022,12 @@ class RPPGPipeline:
             # было, но, например, все ROI провалили is_gap_acceptable или
             # метод извлечения упал" — разные failure modes, разная починка.
             no_signal_window_status = "no_face" if not any(self._buf.face_valid) else "no_signal"
+            # Задача 25: no_signal -> confidence=0.0, bpm=NaN — тем не менее
+            # окно ДОЛЖНО попасть в скользящую историю агрегата (и тут же
+            # отфильтроваться по confidence>0), иначе агрегат не увидит
+            # разрыв в потоке измерений и будет считать интервал "гуще",
+            # чем он есть на самом деле.
+            aggregate = self._compute_aggregate(timestamp_ms, float("nan"), 0.0)
             if self._window_logger is not None:
                 # Тоже логируем (п.43) — "окно без сигнала" такой же
                 # материал для анализа failure cases, как и низкий SQI.
@@ -895,6 +1044,9 @@ class RPPGPipeline:
                     sqi_subharmonic_check_informative=True,
                     respiration_rate_bpm=None, warnings=no_signal_warnings,
                     window_status=no_signal_window_status,
+                    bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
+                    bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
+                    bpm_aggregate_spread_bpm=aggregate.spread_bpm,
                 ))
             return PTSDPulseFeatures(
                 timestamp_ms=timestamp_ms, bpm=float("nan"), hrv=None,
@@ -906,6 +1058,9 @@ class RPPGPipeline:
                 per_roi_bpm=per_roi_bpm,
                 last_valid_bpm=self._last_valid_bpm,
                 last_valid_bpm_age_s=self._last_valid_bpm_age_s(timestamp_ms),
+                bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
+                bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
+                bpm_aggregate_spread_bpm=aggregate.spread_bpm,
             )
 
         if self.cfg.fusion.enabled:
@@ -1025,6 +1180,13 @@ class RPPGPipeline:
         # здесь принципиально нет обновления на непубликуемых окнах.
         self._update_last_valid_bpm(timestamp_ms, current_bpm, is_publishable)
 
+        # Задача 25: агрегат считается по НЕПРЕРЫВНОМУ (continuous) confidence
+        # этого окна, а НЕ по бинарному is_publishable — окно с confidence=0.2
+        # (ниже порога публикации, но не ноль) всё равно может войти в пул
+        # кандидатов агрегата и быть отфильтровано там уже по min_confidence
+        # AggregateConfig, если понадобится другая, более мягкая политика.
+        aggregate = self._compute_aggregate(timestamp_ms, current_bpm, confidence)
+
         if self._window_logger is not None:
             # п.43: полная разбивка SQI по компонентам (не только overall_score)
             # — материал для анализа failure cases, доступный ЗДЕСЬ (полный
@@ -1053,6 +1215,9 @@ class RPPGPipeline:
                 respiration_rate_bpm=respiration_rate_bpm,
                 warnings=list(all_warnings),
                 window_status=window_status,
+                bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
+                bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
+                bpm_aggregate_spread_bpm=aggregate.spread_bpm,
             ))
 
         # confidence/is_publishable уже посчитаны выше (перед _update_last_valid_bpm).
@@ -1086,4 +1251,7 @@ class RPPGPipeline:
             last_valid_bpm=self._last_valid_bpm,
             last_valid_bpm_age_s=self._last_valid_bpm_age_s(timestamp_ms),
             debug=debug_info,
+            bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
+            bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
+            bpm_aggregate_spread_bpm=aggregate.spread_bpm,
         )

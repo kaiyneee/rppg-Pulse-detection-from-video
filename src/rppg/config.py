@@ -411,6 +411,36 @@ class TrackerConfig:
 
 
 @dataclass
+class AggregateConfig:
+    """Агрегированный BPM для автоматической подачи в систему ПТСР
+    (задача 25). Потребитель — код, а не оператор с глазами: пооконный
+    PTSDPulseFeatures.publishable уже достоверен, но одно окно = один
+    Welch-пик, который может перескочить на гармонику/субгармонику даже при
+    honest is_reliable=True (задача 20/21 снижают вероятность, не убирают
+    её до нуля). Агрегат по скользящему интервалу ПОСЛЕДНИХ нескольких окон
+    с медианой (не средним) устойчив именно к таким одиночным перескокам —
+    см. RPPGPipeline._compute_aggregate.
+
+    Все пороги — TODO(калибровка), назначены по инженерным соображениям и
+    подлежат уточнению после накопления большего числа эталонных сессий
+    (задача 24)."""
+
+    enabled: bool = True
+    # Длительность скользящего интервала, по которому берётся агрегат.
+    aggregate_span_seconds: float = 5.0
+    # Минимум окон с ненулевой уверенностью внутри интервала.
+    min_windows: int = 3
+    # Максимальный межквартильный размах оценок внутри интервала (BPM),
+    # выше которого агрегат считается недостоверным.
+    max_spread_bpm: float = 8.0
+    # Минимальная средняя уверенность вошедших окон.
+    min_confidence: float = 0.3
+    # Сколько секунд разрешено отдавать последнее измеренное значение с
+    # пометкой stale, прежде чем перейти в no_data.
+    max_stale_seconds: float = 30.0
+
+
+@dataclass
 class PipelineConfig:
     """Верхнеуровневая конфигурация — то, что передаётся в RPPGPipeline.
 
@@ -432,6 +462,7 @@ class PipelineConfig:
     hrv: HRVConfig = field(default_factory=HRVConfig)
     accel: AccelerationConfig = field(default_factory=AccelerationConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    aggregate: AggregateConfig = field(default_factory=AggregateConfig)
     method: ExtractionMethod = ExtractionMethod.POS
     frequency_method: FrequencyMethod = FrequencyMethod.WELCH
 
