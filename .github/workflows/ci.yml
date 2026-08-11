@@ -37,7 +37,11 @@ jobs:
           cache: pip
 
       - name: Install system dependencies for OpenCV/MediaPipe (headless Linux)
-        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0
+        # libgles2-mesa добавлена отдельно от libgl1-mesa-glx: MediaPipe на
+        # Linux инициализирует EGL/GLES-контекст (см. gl_context.cc в логах)
+        # даже при delegate=CPU — без libGLESv2.so.2 инициализация падает
+        # ДО того, как код доходит до реальных вычислений.
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-glx libgles2-mesa libglib2.0-0
 
       - name: Install Python dependencies
         run: |
