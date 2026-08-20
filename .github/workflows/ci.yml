@@ -37,13 +37,15 @@ jobs:
           cache: pip
 
       - name: Install system dependencies for OpenCV/MediaPipe (headless Linux)
-        # libgles2 отдельно от libgl1: MediaPipe на Linux инициализирует
-        # EGL/GLES-контекст (см. gl_context.cc в логах) даже при delegate=CPU
-        # — без libGLESv2.so.2 инициализация падает ДО того, как код
-        # доходит до реальных вычислений. libgl1-mesa-glx/libgles2-mesa —
-        # устаревшие transitional-пакеты, на Ubuntu 24.04 (ubuntu-latest)
-        # заменены на libgl1/libgles2.
-        run: sudo apt-get update && sudo apt-get install -y libgl1 libgles2 libglib2.0-0
+        # MediaPipe на Linux инициализирует EGL/GLES-контекст (см.
+        # gl_context.cc в логах) даже при delegate=CPU — нужны ТРИ отдельных
+        # библиотеки: libGLESv2.so.2 (libgles2), libEGL.so.1 (libegl1) и
+        # libGL.so.1 (libgl1) — отсутствие любой из них роняет инициализацию
+        # ДО того, как код доходит до реальных вычислений (libegl1 не входит
+        # в libgles2/libgl1, это отдельный пакет). libgl1-mesa-glx/
+        # libgles2-mesa — устаревшие transitional-пакеты, на Ubuntu 24.04
+        # (ubuntu-latest) заменены на libgl1/libgles2.
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libgles2 libegl1 libglib2.0-0
 
       - name: Install Python dependencies
         run: |

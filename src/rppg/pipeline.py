@@ -59,7 +59,7 @@ from rppg.signal.quality import (
 )
 from rppg.signal.fusion import fuse_signals_by_sqi, snr_db_to_weight
 from rppg.signal.respiration import estimate_respiration_rate
-from rppg.structured_log import StructuredWindowLogger, WindowLogRecord
+from rppg.structured_log import StructuredWindowLogger, WindowLogRecord, build_run_header
 from rppg.hrv.features import (
     detect_pulse_peaks,
     refine_peaks_subsample,
@@ -267,12 +267,18 @@ class RPPGPipeline:
         config: PipelineConfig | None = None,
         log_path: str | Path | None = None,
         debug: bool = False,
+        log_append: bool = False,
     ):
         """log_path: если задан, каждое оценённое окно дополнительно
         пишется структурированной JSONL-строкой (см. structured_log.py,
         п.43 требований) — timestamp, BPM по каждому ROI, ВСЕ компоненты
         SQI по отдельности, warnings. Опционально: без log_path поведение
         не отличается от прежнего.
+
+        log_append: задача 26 — по умолчанию False, файл по log_path
+        ПЕРЕЗАПИСЫВАЕТСЯ, а не дозаписывается (см. structured_log.py про
+        доказанный баг склейки записей от разных прогонов). True — явный
+        опт-ин для дозаписи в существующий файл.
 
         debug: если True, PTSDPulseFeatures.debug и last_roi_result
         дополнительно заполняются (полный SQIResult, Welch-спектр лучшего
@@ -282,7 +288,10 @@ class RPPGPipeline:
         обычном режиме и стоят лишних вычислений/памяти."""
         self.cfg = config or PipelineConfig()
         self._debug = debug
-        self._window_logger = StructuredWindowLogger(log_path) if log_path is not None else None
+        self._window_logger = (
+            StructuredWindowLogger(log_path, header=build_run_header(self.cfg), append=log_append)
+            if log_path is not None else None
+        )
         # Только для --debug оверлея: полный ROIExtractionResult ТЕКУЩЕГО
         # кадра (landmarks_px и т.п.), чтобы отрисовать контуры ROI на
         # экране КАЖДЫЙ кадр — независимо от того, готова ли уже
@@ -506,6 +515,16 @@ class RPPGPipeline:
             peak_half_width_hz=effective_snr_peak_half_width_hz(self.cfg.quality, fps, len(signal)),
         )
 
+    def _recent_median_hz(self) -> float | None:
+        """Медиана self._recent_bpm_history в Гц — для continuity-проверки
+        при выборе пика (см. frequency.py::_select_peak_with_continuity).
+        None, если continuity выключена в конфиге или истории ещё нет
+        (первые окна записи) — тогда estimate_hr ведёт себя как обычный
+        argmax, без изменений."""
+        if not self.cfg.frequency.continuity_enabled or not self._recent_bpm_history:
+            return None
+        return float(np.median(self._recent_bpm_history)) / 60.0
+
     def _estimate_frequency(
         self,
         raw_signal: np.ndarray,
@@ -522,13 +541,21 @@ class RPPGPipeline:
         filtfilt на равномерной сетке — иначе LS вырождается в обычную
         периодограмму на том же равномерном сигнале, что и FFT/Welch.
         """
+        recent_median_hz = self._recent_median_hz()
+        tolerance = self.cfg.frequency.continuity_power_tolerance
         if self.cfg.frequency_method.value != "lomb_scargle":
-            return estimate_hr(processed_signal, fps, band, method=self.cfg.frequency_method.value).bpm
+            return estimate_hr(
+                processed_signal, fps, band, method=self.cfg.frequency_method.value,
+                recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
+            ).bpm
 
         trend_removed = detrend(raw_signal, method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda)
         ls_signal = trend_removed[valid_mask]
         ls_timestamps = timestamps_sec[valid_mask]
-        return estimate_hr(ls_signal, fps, band, method="lomb_scargle", timestamps_sec=ls_timestamps).bpm
+        return estimate_hr(
+            ls_signal, fps, band, method="lomb_scargle", timestamps_sec=ls_timestamps,
+            recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
+        ).bpm
 
     def _update_last_valid_bpm(self, timestamp_ms: int, current_bpm: float, is_reliable: bool) -> None:
         """Задача 8: обновляет last_valid_bpm/age ТОЛЬКО когда окно реально
