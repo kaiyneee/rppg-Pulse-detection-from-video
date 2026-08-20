@@ -45,6 +45,11 @@ def main() -> None:
         "--log", type=str, default=None,
         help="Путь к JSONL-логу по окнам (timestamp/BPM по ROI/компоненты SQI/warnings, см. п.43)",
     )
+    parser.add_argument(
+        "--append", action="store_true",
+        help="Дозаписать в существующий --log вместо перезаписи (задача 26; по умолчанию файл "
+             "перезаписывается — прошлый баг молча склеивал записи от разных прогонов/конфигов).",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config) if args.config else PipelineConfig()
@@ -64,7 +69,7 @@ def main() -> None:
     rows = []
     frame_idx = 0
 
-    with RPPGPipeline(config, log_path=args.log) as pipeline:
+    with RPPGPipeline(config, log_path=args.log, log_append=args.append) as pipeline:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -81,23 +86,30 @@ def main() -> None:
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "timestamp_ms", "bpm", "publishable", "status", "last_valid_bpm", "last_valid_bpm_age_s",
+            "timestamp_ms", "bpm", "status",
             "sqi_score", "sqi_level", "sqi_spectral_snr_db",
+            # Задача 25 (пересмотрено 2026-08-18): контракт с моделью ПТСР —
+            # РОВНО ДВЕ колонки, не пять. bpm_aggregate — всегда реально
+            # измеренное число (или NaN); bpm_aggregate_quality — одно
+            # число [0,1], 0.0 означает "использовать нельзя". Устаревание
+            # агрегат берёт на себя через ПЛАВНО убывающее quality (см.
+            # RPPGPipeline._compute_aggregate) — отдельные last_valid_bpm/
+            # last_valid_bpm_age_s/publishable для этого больше не нужны и
+            # убраны из CSV (они дублировали более старый, ступенчатый
+            # механизм устаревания — задача 8). window_status/n_windows/
+            # spread_bpm, стоявшие за bpm_aggregate, остаются ТОЛЬКО в
+            # JSONL-логе (см. structured_log.WindowLogRecord) — это
+            # диагностика для отладки, не часть контракта потребителя.
+            "bpm_aggregate", "bpm_aggregate_quality",
             "mean_hr_bpm", "sdnn_ms", "rmssd_ms", "pnn50_pct", "pnn20_pct",
             "lf_hf_ratio", "method_used", "frequency_method_used", "warnings",
         ])
         for r in rows:
             hrv = r.hrv
-            last_valid = f"{r.last_valid_bpm:.2f}" if r.last_valid_bpm is not None else ""
-            last_valid_age = f"{r.last_valid_bpm_age_s:.1f}" if r.last_valid_bpm_age_s is not None else ""
-            # Задача 16, п.4: та же величина, что решает is_reliable — рядом
-            # с колонкой publishable, чтобы расхождение между источниками
-            # (если оно когда-нибудь снова появится) было видно без сверки
-            # CSV и JSONL вручную.
-            snr_db = r.confidence_breakdown.get("spectral_snr_db", "")
             writer.writerow([
-                r.timestamp_ms, r.bpm, r.publishable, r.status, last_valid, last_valid_age,
-                f"{r.sqi_score:.3f}", r.sqi_level, snr_db,
+                r.timestamp_ms, r.bpm, r.status,
+                f"{r.sqi_score:.3f}", r.sqi_level, r.confidence_breakdown.get("spectral_snr_db", ""),
+                r.bpm_aggregate, f"{r.bpm_aggregate_quality:.3f}",
                 hrv.mean_hr_bpm if hrv else "", hrv.sdnn_ms if hrv else "",
                 hrv.rmssd_ms if hrv else "", hrv.pnn50_pct if hrv else "",
                 hrv.pnn20_pct if hrv else "", hrv.lf_hf_ratio if hrv else "",

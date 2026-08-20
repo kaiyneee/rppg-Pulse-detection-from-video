@@ -48,6 +48,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
 from rppg.pipeline import RPPGPipeline
+from rppg.structured_log import read_jsonl_records
 from finger_ppg import process_finger_video
 from benchmark.evaluate import mae as mae_metric
 
@@ -143,7 +144,10 @@ def _load_face_bpm(face_log: str | None, face_video: str | None, model_path: str
     import pandas as pd
 
     if face_log is not None:
-        df = pd.read_json(face_log, lines=True)
+        # Задача 26: строка заголовка прогона (RUN_HEADER_MARKER) не
+        # является WindowLogRecord — read_jsonl_records её отфильтровывает.
+        _headers, records = read_jsonl_records(face_log)
+        df = pd.DataFrame(records)
         t = df["timestamp_ms"].to_numpy(dtype=float) / 1000.0
         bpm = df["bpm"].to_numpy(dtype=float)
         publishable = df["publishable"].to_numpy(dtype=bool)

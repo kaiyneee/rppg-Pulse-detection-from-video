@@ -39,15 +39,13 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from rppg.config import PipelineConfig
 from rppg.pipeline import RPPGPipeline
 
-# Видео, использованные в задачах 16-24 при поиске багов SQI (см. план) — не
-# часть репозитория (лежат рядом с ним), поэтому путь настраивается через
-# --videos для запуска в другом окружении.
-DEFAULT_VIDEOS = [
-    "/Users/ylhjn/Desktop/проекты/статья пульс по видо/видео тетя.mp4",
-    "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девушка темнокожая вертикально.mp4.mp4",
-    "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девушка темнокожая горизонтально.mp4",
-    "/Users/ylhjn/Desktop/проекты/статья пульс по видо/девочка.mp4",
-]
+# Задача 19: список видео ЕДИНЫЙ для всех сравнительных скриптов — импорт
+# из run_benchmark.py (задача 23, 6 видео: тётя/темнокожая×2/мужчина/
+# вероника/девочка), а не отдельная копия, которая могла бы разъехаться со
+# списком в run_benchmark.py/test_ranking_preserved (как уже случилось
+# однажды с путём к "вероника .mov" — см. git log).
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from run_benchmark import DEFAULT_VIDEOS
 
 FIXED_CANDIDATES_HZ = [0.10, 0.15, 0.20, 0.25]
 ADAPTIVE_K_CANDIDATES = [1.0, 1.44, 2.0]
@@ -87,7 +85,7 @@ def _variant_label(mode: str, value: float) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--videos", nargs="+", default=DEFAULT_VIDEOS, help="Пути к видео (по умолчанию — 4 видео задач 16-24)")
+    parser.add_argument("--videos", nargs="+", default=DEFAULT_VIDEOS, help="Пути к видео (по умолчанию — 6 видео из run_benchmark.DEFAULT_VIDEOS)")
     parser.add_argument("--model", type=str, default="models/face_landmarker.task")
     args = parser.parse_args()
 

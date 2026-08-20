@@ -172,9 +172,124 @@ def test_frequency_estimators_agree_on_clean_tone():
     raw = method.extract(window, "forehead")
     processed = preprocess_signal(raw, FPS, *BAND)
 
-    for fm, tol in [("fft", 2.0), ("welch", 2.5), ("lomb_scargle", 2.5)]:
+    for fm, tol in [("fft", 2.0), ("welch", 2.5), ("lomb_scargle", 2.5), ("harmonic_sum", 2.5)]:
         est = estimate_hr(processed, FPS, BAND, method=fm)
         _assert_bpm_close(est.bpm, true_bpm, tol, f"POS + {fm}")
+
+
+def test_harmonic_sum_avoids_octave_error_that_confuses_plain_argmax():
+    """Регрессия: harmonic_sum должен правильно найти истинный f0=72 BPM
+    даже когда ОДИНОЧНАЯ точка спектра на 2f0=144 BPM мощнее самого f0
+    (реалистичный случай: артефакт движения/освещения на кратной частоте) —
+    тогда как обычный argmax по PSD (welch) в ЭТОЙ ЖЕ ситуации ошибочно
+    берёт 2f0. Harmonic sum побеждает, т.к. у ложного пика на 2f0 НЕТ
+    согласованной энергии на СВОИХ гармониках (4f0, 6f0 — просто шум), а у
+    истинного f0 есть реальная физиологическая энергия сразу на 2f0 И 3f0."""
+    print("\n=== Тест: harmonic_sum устойчив к точечному выбросу на 2f, где argmax ошибается ===")
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    f0 = 1.2  # 72 BPM
+
+    rng = np.random.default_rng(2)
+    signal = (
+        0.6 * np.sin(2 * np.pi * f0 * t)
+        + 1.3 * np.sin(2 * np.pi * 2 * f0 * t)  # артефакт/2-я гармоника, точечно мощнее f0
+        + 0.2 * np.sin(2 * np.pi * 3 * f0 * t)  # 3-я гармоника — только у истинного f0
+        + 0.05 * rng.normal(0, 1, n)
+    )
+
+    welch_est = estimate_hr(signal, fps, band, method="welch")
+    harmonic_est = estimate_hr(signal, fps, band, method="harmonic_sum")
+
+    print(f"  welch: {welch_est.bpm:.1f} BPM, harmonic_sum: {harmonic_est.bpm:.1f} BPM "
+          f"(истина: {f0 * 60:.0f} BPM)")
+
+    assert abs(welch_est.bpm - 2 * f0 * 60) < 3.0, (
+        "sanity: обычный welch-argmax должен ОШИБАТЬСЯ на этом сигнале и брать 2f0 — "
+        "иначе сценарий не демонстрирует разницу методов"
+    )
+    assert abs(harmonic_est.bpm - f0 * 60) < 3.0, (
+        f"harmonic_sum должен найти истинный f0={f0 * 60:.0f} BPM, получено {harmonic_est.bpm:.1f}"
+    )
+
+
+def test_octave_error_detector_finds_errors_on_drifting_true_signal():
+    """Регрессия для задачи 28: старая метрика (задача 27) сравнивала
+    оценку с МЕДИАНОЙ ПО ВСЕМУ ВИДЕО и находила 0% ошибок на дрейфующем
+    истинном пульсе (см. докстринг scripts/compare_frequency_methods.py —
+    реальные ошибки на Веронике лежали у 2×/3× ЛОКАЛЬНОГО значения ~61.4
+    BPM, а не у 2× глобальной медианы 69.9 BPM). Здесь — синтетический
+    дрейфующий ряд (плавно 60->61 BPM за 30 окон) с тремя ИСКУССТВЕННО
+    внедрёнными ошибками (×2, ×3, ÷2 от локального окружения) — детектор
+    должен найти именно эти три окна и не более."""
+    print("\n=== Тест: детектор октавных ошибок находит их на дрейфующем сигнале (задача 28) ===")
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from compare_frequency_methods import local_median_series, octave_error_labels, _grid_step_bpm
+
+    t = np.arange(0, 30, 1.0)
+    bpm = 60.0 + 0.5 * np.sin(t / 10.0)  # плавный дрейф, БЕЗ ошибок
+
+    up_idx, down_idx, x3_idx = 15, 20, 25
+    m_at_up = float(np.median(np.delete(bpm, up_idx)))  # приближённо локальное окружение
+    bpm[up_idx] = m_at_up * 2.0
+    m_at_x3 = float(np.median(np.delete(bpm, x3_idx)))
+    bpm[x3_idx] = m_at_x3 * 3.0
+    m_at_down = float(np.median(np.delete(bpm, down_idx)))
+    bpm[down_idx] = m_at_down / 2.0
+
+    grid_step = _grid_step_bpm(30.0, 300)
+    local_medians = local_median_series(t, bpm)
+    up, down = octave_error_labels(bpm, local_medians, grid_step)
+
+    print(f"  найдено up={np.where(up)[0].tolist()}, down={np.where(down)[0].tolist()}")
+
+    assert up[up_idx] and up[x3_idx], "детектор должен найти обе внедрённые ошибки ×2 и ×3"
+    assert down[down_idx], "детектор должен найти внедрённую ошибку ÷2"
+    assert int(up.sum()) == 2, f"ложные срабатывания up на чистых окнах: {np.where(up)[0].tolist()}"
+    assert int(down.sum()) == 1, f"ложные срабатывания down на чистых окнах: {np.where(down)[0].tolist()}"
+    print("  [OK] детектор нашёл ровно 3 внедрённые ошибки, ложных срабатываний нет")
+
+
+def test_continuity_check_prefers_peak_near_recent_history_within_tolerance():
+    """Регрессия: если в полосе два локальных максимума СОПОСТАВИМОЙ
+    мощности, а один явно ближе к медиане недавних BPM-оценок — при
+    continuity_power_tolerance, покрывающем разницу их мощности, должен
+    выбираться ближний к истории, а не автоматически глобальный максимум.
+    При continuity_power_tolerance=0.0 (или без recent_median_hz) поведение
+    ДОЛЖНО остаться обычным argmax — continuity не подменяет измерение, а
+    только разрешает неоднозначность между уже существующими кандидатами."""
+    print("\n=== Тест: continuity-проверка выбирает пик ближе к истории при сопоставимой мощности ===")
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 4.0)
+    fa, fb = 1.0, 1.3  # 60 BPM vs 78 BPM, fb немного мощнее
+
+    rng = np.random.default_rng(5)
+    signal = 1.0 * np.sin(2 * np.pi * fa * t) + 1.05 * np.sin(2 * np.pi * fb * t) + 0.03 * rng.normal(0, 1, n)
+
+    plain = estimate_hr(signal, fps, band, method="welch")
+    near_a = estimate_hr(signal, fps, band, method="welch", recent_median_hz=fa, continuity_power_tolerance=0.15)
+    near_a_zero_tolerance = estimate_hr(
+        signal, fps, band, method="welch", recent_median_hz=fa, continuity_power_tolerance=0.0
+    )
+
+    print(f"  без истории: {plain.bpm:.1f} BPM")
+    print(f"  история near fa={fa * 60:.0f} BPM, tolerance=0.15: {near_a.bpm:.1f} BPM")
+    print(f"  история near fa={fa * 60:.0f} BPM, tolerance=0.0:  {near_a_zero_tolerance.bpm:.1f} BPM")
+
+    assert abs(plain.bpm - fb * 60) < 3.0, "sanity: без continuity должен побеждать чуть более мощный fb"
+    assert abs(near_a.bpm - fa * 60) < 3.0, (
+        "с историей рядом с fa и допуском, покрывающим разницу мощности, должен победить fa"
+    )
+    assert abs(near_a_zero_tolerance.bpm - plain.bpm) < 1e-6, (
+        "tolerance=0.0 должен вести себя ТОЧНО как обычный argmax (continuity не подменяет измерение)"
+    )
 
 
 def test_lombscargle_handles_irregular_sampling():
@@ -1277,9 +1392,15 @@ def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
         # `with tempfile.TemporaryDirectory()` — сама директория удаляется
         # при выходе из блока.
         assert log_path.exists(), "log_path должен быть создан, раз пайплайн выдал хотя бы одно окно"
-        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
-        print(f"  строк в логе: {len(lines)}")
-        assert len(lines) > 0, "должна быть хотя бы одна строка лога за 13с синтетического видео"
+        from rppg.structured_log import read_jsonl_records
+
+        headers, records = read_jsonl_records(log_path)
+        print(f"  заголовков: {len(headers)}, строк окон: {len(records)}")
+        assert len(headers) == 1, (
+            f"задача 26: КАЖДОЕ открытие лога должно писать РОВНО одну строку заголовка, "
+            f"получено {len(headers)}"
+        )
+        assert len(records) > 0, "должна быть хотя бы одна строка окна за 13с синтетического видео"
 
         required_fields = {
             "timestamp_ms", "bpm", "per_roi_bpm", "publishable", "method_used",
@@ -1290,14 +1411,13 @@ def test_structured_window_logger_writes_valid_jsonl_with_sqi_components():
             "sqi_subharmonic_check_informative",
             "respiration_rate_bpm", "warnings",
         }
-        for line in lines:
-            record = json.loads(line)  # sanity: каждая строка — валидный JSON
+        for record in records:
             missing = required_fields - set(record.keys())
             assert not missing, f"строка лога не содержит поля {missing}: {record}"
             assert isinstance(record["per_roi_bpm"], dict)
             assert isinstance(record["warnings"], list)
 
-        last = json.loads(lines[-1])
+        last = records[-1]
         print(f"  последняя запись: bpm={last['bpm']:.2f}, sqi_overall={last['sqi_overall_score']:.3f}, "
               f"sqi_landmark_stability={last['sqi_landmark_stability']:.3f}, "
               f"sqi_temporal_consistency={last['sqi_temporal_consistency']:.3f}")
@@ -1362,8 +1482,8 @@ def test_publishable_matches_across_csv_and_jsonl():
             pipe.close()
 
         assert log_path.exists(), "log_path должен быть создан, раз пайплайн выдал хотя бы одно окно"
-        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
-        logged = [json.loads(line) for line in lines]
+        from rppg.structured_log import read_jsonl_records
+        _headers, logged = read_jsonl_records(log_path)
 
         assert len(results) == len(logged), (
             f"число окон из process_frame ({len(results)}) не совпадает с числом строк JSONL ({len(logged)})"
@@ -1427,7 +1547,9 @@ def test_window_status_labels_degenerate_and_no_face_windows():
             pipe.close()
         if not log_path.exists():
             return []
-        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
+        from rppg.structured_log import read_jsonl_records
+        _headers, records = read_jsonl_records(log_path)
+        return records
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # true_bpm=0.0 -> нет пульсации, но per-frame шум камеры (см.
@@ -1874,7 +1996,8 @@ def test_aggregate_matches_across_csv_and_jsonl():
             pipe.close()
 
         assert log_path.exists()
-        logged = [json.loads(line) for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
+        from rppg.structured_log import read_jsonl_records
+        _headers, logged = read_jsonl_records(log_path)
         assert len(results) == len(logged)
 
         for i, (result, record) in enumerate(zip(results, logged)):
@@ -1892,6 +2015,115 @@ def test_aggregate_matches_across_csv_and_jsonl():
             )
 
         print(f"  [OK] {len(results)} окон, bpm_aggregate* совпадает поэлементно между CSV-источником и JSONL")
+
+
+def test_rerun_on_same_log_path_overwrites_not_appends():
+    """Регрессия для задачи 26 (доказанный баг): повторный прогон на тот
+    же --log путь БЕЗ --append должен дать файл с ТЕМ ЖЕ числом строк
+    окон, что и один прогон — не удвоенное. Раньше StructuredWindowLogger
+    всегда открывал файл в режиме "a" (дозапись), и повторный запуск молча
+    склеивал записи (найдено на реальном veronika_session.jsonl: 204
+    строки при 68 окнах за прогон — ровно 3 склеенных прогона)."""
+    print("\n=== Тест: повторный прогон перезаписывает лог, а не дозаписывает (задача 26) ===")
+    try:
+        from rppg.pipeline import RPPGPipeline
+        from rppg.config import PipelineConfig
+        from rppg.face.landmarker import FaceFrameResult, HeadPose
+        from rppg.structured_log import read_jsonl_records
+    except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+        print(f"  [SKIP] MediaPipe недоступен в этой среде ({exc})")
+        return
+
+    import tempfile
+    from pathlib import Path
+
+    landmarks = _make_synthetic_landmarks_for_pipeline_test()
+    synthetic_result = FaceFrameResult(
+        detected=True, landmarks_norm=landmarks, head_pose=HeadPose(0.0, 0.0, 0.0), face_presence_ok=True
+    )
+    fps = 30.0
+
+    def _run(log_path: Path) -> int:
+        cfg = PipelineConfig()
+        try:
+            pipe = RPPGPipeline(cfg, log_path=log_path)
+        except Exception as exc:  # noqa: BLE001 - опциональная зависимость среды
+            print(f"  [SKIP] не удалось инициализировать MediaPipe ({exc})")
+            return -1
+        pipe._landmarker.detect = lambda frame_bgr, ts: synthetic_result
+        rng = np.random.default_rng(40)
+        try:
+            for i in range(int(fps * 13.0)):
+                t_sec = i / fps
+                pipe.process_frame(_make_pulsating_frame(t_sec, 72.0, rng), int(t_sec * 1000))
+        finally:
+            pipe.close()
+        _headers, records = read_jsonl_records(log_path)
+        return len(records)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "rerun.jsonl"
+        n_first = _run(log_path)
+        if n_first < 0:
+            return
+        n_second = _run(log_path)  # ТОТ ЖЕ путь, второй раз, без --append
+
+        print(f"  первый прогон: {n_first} строк окон, второй прогон (тот же путь): {n_second} строк окон")
+        assert n_first > 0, "sanity: должно быть хотя бы одно окно за 13с"
+        assert n_second == n_first, (
+            f"повторный прогон на тот же --log путь должен ПЕРЕЗАПИСАТЬ файл ({n_first} строк), "
+            f"а не дописать в него (получено {n_second}) — задача 26"
+        )
+    print("  [OK] повторный прогон не удваивает число строк")
+
+
+def test_analyze_log_rejects_file_with_mixed_run_headers():
+    """Регрессия для задачи 26, второй критерий приёмки: искусственно
+    склеенный файл с ДВУМЯ разными заголовками прогона должен заставить
+    analyze_log.load_log упасть с понятным сообщением, а не молча
+    посчитать статистику по смеси данных от разных конфигураций."""
+    print("\n=== Тест: analyze_log.py отказывается считать статистику по смешанным заголовкам (задача 26) ===")
+    import json
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from analyze_log import load_log
+
+    header_a = {"__run_header__": True, "min_spectral_snr_db": -3.0, "git_hash": "aaa111"}
+    header_b = {"__run_header__": True, "min_spectral_snr_db": -6.0, "git_hash": "bbb222"}
+    fake_record = {
+        "timestamp_ms": 0, "bpm": 72.0, "publishable": True, "sqi_overall_score": 0.6,
+        "sqi_spectral_snr_db": 1.0, "sqi_cross_roi_agreement": 0.8, "sqi_landmark_stability": 0.9,
+        "sqi_temporal_consistency": 0.8, "sqi_harmonic_score": 1.0, "sqi_flicker_suspected": False,
+        "warnings": [], "window_status": "ok",
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mixed_path = Path(tmpdir) / "mixed.jsonl"
+        with open(mixed_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header_a, ensure_ascii=False) + "\n")
+            f.write(json.dumps(fake_record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(header_b, ensure_ascii=False) + "\n")  # склейка второго прогона, другой конфиг
+            f.write(json.dumps(fake_record, ensure_ascii=False) + "\n")
+
+        raised = False
+        message = ""
+        try:
+            load_log(mixed_path)
+        except SystemExit as exc:
+            raised = True
+            message = str(exc)
+
+        print(f"  SystemExit поднят: {raised}")
+        if raised:
+            print(f"  сообщение: {message[:150]}...")
+        assert raised, "load_log должен упасть на файле с двумя разными заголовками, а не посчитать смесь"
+        assert "конфигураций" in message.lower() or "заголовк" in message.lower(), (
+            f"сообщение об ошибке должно объяснять причину (разные заголовки), получено: {message!r}"
+        )
+    print("  [OK] analyze_log.py явно отказался считать статистику по смешанным заголовкам")
 
 
 def test_ranking_preserved():
@@ -1977,6 +2209,9 @@ def run_all():
         test_pos_numba_matches_numpy_reference,
         test_head_motion_method_recovers_known_bpm,
         test_frequency_estimators_agree_on_clean_tone,
+        test_harmonic_sum_avoids_octave_error_that_confuses_plain_argmax,
+        test_octave_error_detector_finds_errors_on_drifting_true_signal,
+        test_continuity_check_prefers_peak_near_recent_history_within_tolerance,
         test_lombscargle_handles_irregular_sampling,
         test_bandpass_rejects_out_of_band_and_keeps_in_band,
         test_detrend_removes_slow_trend,
@@ -2019,6 +2254,8 @@ def run_all():
         test_aggregate_stale_decays_then_becomes_no_data,
         test_aggregate_nan_iff_no_data,
         test_aggregate_matches_across_csv_and_jsonl,
+        test_rerun_on_same_log_path_overwrites_not_appends,
+        test_analyze_log_rejects_file_with_mixed_run_headers,
         test_ranking_preserved,
     ]
     failed = []
