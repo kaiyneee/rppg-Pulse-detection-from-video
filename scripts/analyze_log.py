@@ -39,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from rppg.config import QualityConfig
+from rppg.structured_log import read_jsonl_records, RUN_HEADER_MARKER
 
 # --- Палитра (см. dataviz skill: сериям — категориальный цвет по роли,
 # порогам/гейтам — фиксированные status-цвета, никогда не смешивать смысл) --
@@ -63,7 +64,37 @@ PERCENTILES = [5, 25, 50, 75, 95]
 
 
 def load_log(path: Path) -> pd.DataFrame:
-    df = pd.read_json(path, lines=True)
+    """Задача 26: перед тем как строить статистику, проверяет заголовки
+    прогона (см. structured_log.build_run_header) — если в файле нашлось
+    больше ОДНОГО различного заголовка, это значит, что записи от разных
+    конфигураций/прогонов молча склеены в одном файле (доказанный баг:
+    старый режим "a" дозаписи), и любая статистика по всему файлу
+    физически бессмысленна. Отказываемся считать её, а не выдаём смесь."""
+    headers, records = read_jsonl_records(path)
+    if not records:
+        raise SystemExit(f"{path}: лог пуст (ни одно окно не было оценено).")
+
+    if not headers:
+        raise SystemExit(
+            f"{path}: в логе нет заголовка прогона — это лог от версии кода ДО задачи 26, "
+            "сравнимость записей внутри файла не гарантирована (мог быть смешан из нескольких "
+            "прогонов). Удалите файл и пересчитайте текущим кодом."
+        )
+
+    distinct_headers: list[dict] = []
+    for h in headers:
+        h_compare = {k: v for k, v in h.items() if k != RUN_HEADER_MARKER}
+        if h_compare not in distinct_headers:
+            distinct_headers.append(h_compare)
+    if len(distinct_headers) > 1:
+        diff_lines = "\n".join(f"  {i + 1}: {h}" for i, h in enumerate(distinct_headers))
+        raise SystemExit(
+            f"{path}: файл содержит записи от {len(distinct_headers)} РАЗНЫХ конфигураций "
+            f"(задача 26) — статистика по всему файлу бессмысленна.\n{diff_lines}\n\n"
+            "Удалите файл и прогоните видео заново с чистого листа (не указывайте --append)."
+        )
+
+    df = pd.DataFrame(records)
     if df.empty:
         raise SystemExit(f"{path}: лог пуст (ни одно окно не было оценено).")
     return df

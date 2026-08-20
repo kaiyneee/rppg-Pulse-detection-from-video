@@ -9,13 +9,34 @@ RPPGPipeline.process_frame() с непустым результатом -> од�
 парсинга ВСЕГО файла для чтения одной записи, легко читается построчно
 любым JSON-парсером или через `pandas.read_json(path, lines=True)` для
 последующего анализа failure cases в статье.
+
+ЗАДАЧА 26 (доказанный баг): раньше файл ВСЕГДА открывался в режиме "a"
+(дозапись) — повторный прогон на тот же --log путь молча СКЛЕИВАЛ новые
+строки со старыми, в т.ч. записанными на другом конфиге (другой порог,
+другая полуширина SNR и т.п.). Найдено на реальном файле
+veronika_session.jsonl: 204 строки при 68 окнах за прогон — ровно 68×3,
+три склеенных прогона, перцентили совпадали до последнего знака (выборка,
+повторённая трижды, не меняет перцентили). Теперь:
+  1. Файл по умолчанию ПЕРЕЗАПИСЫВАЕТСЯ ("w"); дозапись — только через
+     явный StructuredWindowLogger(..., append=True).
+  2. Первая строка КАЖДОГО открытия файла — заголовок прогона (build_run_
+     header) с параметрами, которые определяют СРАВНИМОСТЬ записей
+     (min_spectral_snr_db, полуширина SNR, метод оценки частоты и т.п.) и
+     git-хэшем кода. analyze_log.py читает эти заголовки и ОТКАЗЫВАЕТСЯ
+     считать статистику, если в одном файле нашлось больше одного
+     РАЗЛИЧНОГО заголовка — вместо того чтобы молча посчитать смесь.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+# Маркер-ключ, отличающий строку заголовка от строки WindowLogRecord в
+# JSONL-потоке — обе структуры пишутся построчно в один и тот же файл.
+RUN_HEADER_MARKER = "__run_header__"
 
 
 @dataclass
@@ -85,8 +106,72 @@ class WindowLogRecord:
         return json.dumps(asdict(self), ensure_ascii=False)
 
 
+def _git_short_hash() -> str | None:
+    """Короткий git-хэш HEAD, если репозиторий доступен — None в
+    противном случае (установка из архива/pip, git недоступен и т.п.), а
+    не исключение: заголовок прогона должен писаться в любой среде."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:  # noqa: BLE001 - git недоступен -> заголовок без хэша, не падаем
+        pass
+    return None
+
+
+def build_run_header(cfg) -> dict:
+    """Задача 26: параметры прогона, которые определяют СРАВНИМОСТЬ строк
+    лога между собой — если хотя бы один из них отличается между двумя
+    прогонами в одном файле, статистика по всему файлу (перцентили,
+    доля publishable и т.п.) физически бессмысленна, а не просто "чуть
+    менее точна". cfg — PipelineConfig (типа не указан здесь, чтобы не
+    тащить import rppg.config в этот модуль ради одной аннотации)."""
+    return {
+        RUN_HEADER_MARKER: True,
+        "min_spectral_snr_db": cfg.quality.min_spectral_snr_db,
+        "min_overall_score_to_publish": cfg.quality.min_overall_score_to_publish,
+        "snr_peak_half_width_mode": cfg.quality.snr_peak_half_width_mode,
+        "snr_peak_half_width_hz": cfg.quality.snr_peak_half_width_hz,
+        "snr_peak_half_width_k": cfg.quality.snr_peak_half_width_k,
+        "include_second_harmonic_in_snr": cfg.quality.include_second_harmonic_in_snr,
+        "frequency_method": cfg.frequency_method.value,
+        "method": cfg.method.value,
+        "window_seconds": cfg.window.window_seconds,
+        "step_seconds": cfg.window.step_seconds,
+        "git_hash": _git_short_hash(),
+    }
+
+
+def read_jsonl_records(path: str | Path) -> tuple[list[dict], list[dict]]:
+    """Читает JSONL-лог и разделяет строки на (заголовки, окна) по
+    RUN_HEADER_MARKER — общий низкоуровневый парсер для scripts/analyze_log.py
+    и scripts/record_with_reference.py: ни один из них не должен молча
+    трактовать строку заголовка как WindowLogRecord (задача 26). Логи,
+    записанные ДО задачи 26 (без заголовка вообще), дают headers=[] —
+    вызывающий код решает сам, считать ли это ошибкой."""
+    headers: list[dict] = []
+    records: list[dict] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj.get(RUN_HEADER_MARKER):
+                headers.append(obj)
+            else:
+                records.append(obj)
+    return headers, records
+
+
 class StructuredWindowLogger:
-    """Пишет один WindowLogRecord на строку в JSONL-файл.
+    """Пишет один WindowLogRecord на строку в JSONL-файл, и ОДНУ строку
+    заголовка (build_run_header) перед первой записью каждого открытия
+    файла (см. RUN_HEADER_MARKER и docstring модуля, задача 26).
 
     Файл открывается ЛЕНИВО при первом вызове log() (а не в __init__) —
     если ни одно окно так и не было оценено (например, видео короче
@@ -95,16 +180,31 @@ class StructuredWindowLogger:
     небольшие лишние syscall'ы, но при работе с веб-камерой в реальном
     времени (см. scripts/run_webcam.py) так лог остаётся читаемым СРАЗУ,
     даже если процесс потом упадёт или будет прерван — предпочтение отдано
-    надёжности лога перед чистой пропускной способностью записи."""
+    надёжности лога перед чистой пропускной способностью записи.
 
-    def __init__(self, path: str | Path):
+    ПО УМОЛЧАНИЮ файл ПЕРЕЗАПИСЫВАЕТСЯ (режим "w") — задача 26, доказанный
+    баг: старое поведение (всегда "a") молча склеивало записи от разных
+    прогонов/конфигов в одном файле. append=True — явный, осознанный опт-ин
+    для сценариев, где дозапись действительно нужна (например,
+    scripts/run_webcam.py пишет один непрерывный сеанс несколькими
+    process_frame() без переоткрытия файла — там append не нужен вовсе,
+    т.к. логгер и так открывается один раз за сеанс; append=True нужен,
+    только если СОЗНАТЕЛЬНО объединяют несколько отдельных запусков
+    процесса в один файл)."""
+
+    def __init__(self, path: str | Path, header: dict | None = None, append: bool = False):
         self.path = Path(path)
+        self.header = header
+        self.append = append
         self._file = None
 
     def log(self, record: WindowLogRecord) -> None:
         if self._file is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = open(self.path, "a", encoding="utf-8")
+            mode = "a" if self.append else "w"
+            self._file = open(self.path, mode, encoding="utf-8")
+            if self.header is not None:
+                self._file.write(json.dumps(self.header, ensure_ascii=False) + "\n")
         self._file.write(record.to_json_line() + "\n")
         self._file.flush()
 
