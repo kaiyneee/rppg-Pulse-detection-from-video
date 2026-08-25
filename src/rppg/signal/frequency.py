@@ -95,12 +95,68 @@ def _select_peak_with_continuity(
     return int(within_tolerance[int(np.argmin(freq_diffs))])
 
 
+def _apply_physiological_rate_limit(
+    freqs: np.ndarray,
+    power: np.ndarray,
+    rate_limit_median_hz: float | None,
+    selected_idx: int,
+    max_change_hz: float,
+    power_is_log: bool = False,
+    min_power_advantage: float = 2.0,
+) -> int:
+    """Задача 37: ЖЁСТКИЙ физиологический предел скорости изменения BPM —
+    ОТДЕЛЬНЫЙ от мягкой _select_peak_with_continuity выше и СТРОЖЕ её (в
+    частности, действует НЕЗАВИСИМО от FrequencyConfig.continuity_enabled —
+    см. RPPGPipeline._recent_median_hz_for_rate_limit, поэтому у него
+    СВОЙ отдельный параметр rate_limit_median_hz, а не общий с
+    _select_peak_with_continuity). continuity — предпочтение МЕЖДУ
+    кандидатами сопоставимой мощности; этот предел — жёсткая граница: пик,
+    уже выбранный _select_peak_with_continuity, отвергается, если он
+    "прыгнул" от rate_limit_median_hz дальше max_change_hz (максимально
+    правдоподобное изменение частоты за прошедшее время), КРОМЕ случая,
+    когда его мощность как минимум в min_power_advantage раз выше мощности
+    ближайшего к rate_limit_median_hz локального максимума В ПРЕДЕЛАХ
+    допустимого диапазона — тогда сильное прямое свидетельство перевешивает
+    жёсткий предел.
+
+    power_is_log=True — для methods, чья "мощность" уже в лог-масштабе
+    (estimate_hr_harmonic_sum: сумма/среднее log(PSD), может быть
+    отрицательной) — сравнение "в K раз мощнее" там означает разность
+    log-значений >= log(K), а не power[a] >= K*power[b] (которое для
+    отрицательных значений давало бы обратный по смыслу результат)."""
+    if rate_limit_median_hz is None or max_change_hz <= 0 or len(freqs) == 0:
+        return selected_idx
+
+    power = np.asarray(power, dtype=float)
+    if abs(freqs[selected_idx] - rate_limit_median_hz) <= max_change_hz:
+        return selected_idx
+
+    allowed = np.abs(freqs - rate_limit_median_hz) <= max_change_hz
+    if allowed.any():
+        alt_idx = int(np.argmax(np.where(allowed, power, -np.inf)))
+    else:
+        alt_idx = int(np.argmin(np.abs(freqs - rate_limit_median_hz)))
+
+    if alt_idx == selected_idx:
+        return selected_idx
+
+    if power_is_log:
+        has_advantage = (power[selected_idx] - power[alt_idx]) >= np.log(min_power_advantage)
+    else:
+        has_advantage = power[selected_idx] >= min_power_advantage * power[alt_idx]
+
+    return selected_idx if has_advantage else alt_idx
+
+
 def estimate_hr_fft(
     signal: np.ndarray,
     fps: float,
     band_hz: tuple[float, float],
     recent_median_hz: float | None = None,
     continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
 ) -> FrequencyEstimate:
     signal = np.asarray(signal, dtype=float)
     n = len(signal)
@@ -117,6 +173,10 @@ def estimate_hr_fft(
 
     band_freqs, band_power = freqs[mask], spectrum[mask]
     peak_idx = _select_peak_with_continuity(band_freqs, band_power, recent_median_hz, continuity_power_tolerance)
+    peak_idx = _apply_physiological_rate_limit(
+        band_freqs, band_power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+    )
     peak_freq = float(band_freqs[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "fft", band_freqs, band_power)
 
@@ -127,6 +187,9 @@ def estimate_hr_welch(
     band_hz: tuple[float, float],
     recent_median_hz: float | None = None,
     continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
 ) -> FrequencyEstimate:
     signal = np.asarray(signal, dtype=float)
     nperseg = min(len(signal), max(64, int(fps * 8)))
@@ -143,6 +206,10 @@ def estimate_hr_welch(
 
     band_freqs, band_psd = freqs[mask], psd[mask]
     peak_idx = _select_peak_with_continuity(band_freqs, band_psd, recent_median_hz, continuity_power_tolerance)
+    peak_idx = _apply_physiological_rate_limit(
+        band_freqs, band_psd, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+    )
     peak_freq = float(band_freqs[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "welch", band_freqs, band_psd)
 
@@ -154,6 +221,9 @@ def estimate_hr_lombscargle(
     n_freqs: int = 512,
     recent_median_hz: float | None = None,
     continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
 ) -> FrequencyEstimate:
     """
     Lomb-Scargle периодограмма для неравномерно дискретизированного сигнала.
@@ -169,6 +239,10 @@ def estimate_hr_lombscargle(
     power = lombscargle(timestamps_sec, signal, angular_freqs, normalize=True)
 
     peak_idx = _select_peak_with_continuity(freqs_hz, power, recent_median_hz, continuity_power_tolerance)
+    peak_idx = _apply_physiological_rate_limit(
+        freqs_hz, power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+    )
     peak_freq = float(freqs_hz[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "lomb_scargle", freqs_hz, power)
 
@@ -180,6 +254,9 @@ def estimate_hr_harmonic_sum(
     n_harmonics: int = 3,
     recent_median_hz: float | None = None,
     continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
 ) -> FrequencyEstimate:
     """
     Harmonic sum: вместо argmax по самому мощному пику Welch-PSD ищет
@@ -210,8 +287,17 @@ def estimate_hr_harmonic_sum(
     недоступна в PSD — не участвует в сумме ДЛЯ ТЕХ f, для которых она
     недоступна (не обрезаем весь диапазон кандидатов f сразу по самой
     строгой гармонике k=n_harmonics, чтобы не терять k=1 там, где k=3 уже
-    недоступна): для такого f её вклад в сумму просто 0 (нейтрально, не
-    штраф и не бонус), а не NaN/ошибка.
+    недоступна).
+
+    Задача 35 (2026-08-20, исправляет доказанный баг): S(f) усредняется по
+    ЧИСЛУ ДОСТУПНЫХ гармоник, а не суммируется с подстановкой 0.0 для
+    недоступных. log_psd почти всегда отрицателен (мощность PSD в
+    типичных единицах < 1), поэтому 0.0 систематически ВЫШЕ большинства
+    реальных вкладов — раньше недоступная гармоника действовала как БОНУС,
+    а не нейтральный пропуск, и это смещало выбор в сторону кандидатов
+    f > nyquist/3 (у которых 3-я гармоника недоступна и заменяется
+    "бонусным" нулём) даже когда их реальная спектральная мощность ниже,
+    чем у кандидатов с полным набором гармоник.
     """
     signal = np.asarray(signal, dtype=float)
     nperseg = min(len(signal), max(64, int(fps * 8)))
@@ -227,13 +313,23 @@ def estimate_hr_harmonic_sum(
     log_psd = np.log(psd + 1e-15)  # eps: PSD теоретически строго > 0, но защищаемся от log(0)
 
     harmonic_sum = np.zeros_like(band_freqs)
+    n_available = np.zeros_like(band_freqs)
     for k in range(1, n_harmonics + 1):
         harmonic_freqs = k * band_freqs
         available = harmonic_freqs <= nyquist
         contribution = np.interp(harmonic_freqs, freqs, log_psd)
         harmonic_sum = harmonic_sum + np.where(available, contribution, 0.0)
+        n_available = n_available + available.astype(float)
+    # k=1 (f сама) всегда доступна для f внутри band_freqs (band_freqs — подмножество
+    # freqs, которые welch по построению не выдаёт выше nyquist) — n_available >= 1
+    # всегда, np.maximum ниже защищает только от гипотетического n_harmonics=0.
+    harmonic_sum = harmonic_sum / np.maximum(n_available, 1.0)
 
     peak_idx = _select_peak_with_continuity(band_freqs, harmonic_sum, recent_median_hz, continuity_power_tolerance)
+    peak_idx = _apply_physiological_rate_limit(
+        band_freqs, harmonic_sum, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=True, min_power_advantage=physiological_rate_limit_power_advantage,
+    )
     peak_freq = float(band_freqs[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "harmonic_sum", band_freqs, harmonic_sum)
 
@@ -254,6 +350,9 @@ def estimate_hr(
     timestamps_sec: np.ndarray | None = None,
     recent_median_hz: float | None = None,
     continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
 ) -> FrequencyEstimate:
     if method == "lomb_scargle":
         if timestamps_sec is None:
@@ -261,20 +360,28 @@ def estimate_hr(
         return estimate_hr_lombscargle(
             timestamps_sec, signal, band_hz,
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
+            max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+            physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
         )
     if method == "fft":
         return estimate_hr_fft(
             signal, fps, band_hz,
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
+            max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+            physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
         )
     if method == "welch":
         return estimate_hr_welch(
             signal, fps, band_hz,
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
+            max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+            physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
         )
     if method == "harmonic_sum":
         return estimate_hr_harmonic_sum(
             signal, fps, band_hz,
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
+            max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+            physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
         )
     raise ValueError(f"Unknown frequency method: {method}")
