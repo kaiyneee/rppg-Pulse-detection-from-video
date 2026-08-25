@@ -45,15 +45,16 @@ import numpy as np
 
 from rppg.config import PipelineConfig, ExtractionMethod, QualityConfig, AggregateConfig
 from rppg.face.landmarker import FaceLandmarkerWrapper
-from rppg.face.roi import extract_rois, ROIExtractionResult, STABLE_TRACKING_IDX
+from rppg.face.roi import extract_rois, build_skin_mask, ROIExtractionResult, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
 from rppg.signal.methods import get_method, SignalWindow
-from rppg.signal.frequency import estimate_hr
+from rppg.signal.frequency import estimate_hr, FrequencyEstimate
 from rppg.signal.quality import (
     assess_quality,
     dominant_frequency_and_snr,
     compute_psd,
     effective_snr_peak_half_width_hz,
+    resolvable_bpm_difference,
     SQIInputs,
     SQIResult,
 )
@@ -64,7 +65,9 @@ from rppg.hrv.features import (
     detect_pulse_peaks,
     refine_peaks_subsample,
     extract_hrv_features_from_ibi,
+    cross_check_spectral_vs_peaks,
     HRVFeatures,
+    CrossCheckResult,
 )
 
 
@@ -87,6 +90,15 @@ class DebugInfo:
     peak_freq_hz: float
     psd_freqs: np.ndarray | None
     psd_values: np.ndarray | None
+    # Задача 42 (диагностика): psd_freqs/psd_values выше — это спектр из
+    # quality.compute_psd (nperseg=len(signal)//2, для SQI/дебаг-оверлея).
+    # bpm_freq_estimate — ОТДЕЛЬНЫЙ, реальный результат estimate_hr для
+    # best_source (nperseg=fps*8 у welch, СВОЙ выбор пика с continuity/
+    # rate-limit) — то, что БУКВАЛЬНО породило PTSDPulseFeatures.bpm. Эти
+    # два спектра считаются РАЗНЫМИ формулами nperseg и могут расходиться
+    # (см. scripts/dump_spectrum.py) — bpm_freq_estimate нужен, чтобы не
+    # диагностировать выбор пика по спектру, который его не выбирал.
+    bpm_freq_estimate: FrequencyEstimate | None = None
 
 
 @dataclass
@@ -312,6 +324,26 @@ class RPPGPipeline:
         for roi in self.cfg.roi.enabled_rois:
             self._buf.ensure_roi(roi.value)
 
+        # Задача 34: маска кожи кэшируется и обновляется раз в step_seconds
+        # (по медианному кадру, накопленному с прошлого обновления), а не
+        # пересчитывается заново на КАЖДЫЙ кадр — см. _refresh_skin_mask_cache
+        # и docstring skin_mask в roi.extract_rois про то, почему покадровый
+        # пересчёт создаёт ту же проблему "меняющегося состава выборки", что
+        # и медиана в задаче 31.
+        self._cached_skin_mask: np.ndarray | None = None
+        self._skin_mask_refresh_ms: int | None = None
+        self._skin_mask_frame_accum: list = []
+        self._skin_mask_pass_fraction_prev: float | None = None
+        self._pending_skin_mask_warning: str | None = None
+        # Задача 31: история числа валидных (не-клиппинг) пикселей на ROI,
+        # для детектирования резкой смены состава выборки между кадрами —
+        # см. _check_valid_pixel_count_stability. maxlen — небольшое скользящее
+        # окно "недавних" кадров, не привязанное к WindowConfig.window_seconds
+        # (эвристика устойчивости, а не измеряемая величина).
+        self._valid_pixel_count_history: dict[str, deque] = {
+            roi.value: deque(maxlen=30) for roi in self.cfg.roi.enabled_rois
+        }
+
         self._last_estimate_ms: int | None = None
         # AccelerationConfig.use_numba раньше был объявлен в конфиге, но
         # никуда не передавался — get_method() вызывался без kwargs, и
@@ -346,6 +378,20 @@ class RPPGPipeline:
         # нескольким window.step_seconds шагам назад; не привязана к
         # window.window_seconds, т.к. это отдельная, более короткая шкала.
         self._recent_bpm_history: deque = deque(maxlen=6)
+
+        # Задача 44 (сглаживание после cross-check, добавлено по итогам
+        # эмпирической проверки на 19-минутной записи высокого пульса):
+        # ОТДЕЛЬНАЯ от _recent_bpm_history история — копит ТОЛЬКО значения
+        # bpm из окон, которые cross_check_spectral_vs_peaks сам признал
+        # надёжными (is_bpm_reliable=True), НЕ все подряд. cross_check
+        # исправляет окно только когда его СОБСТВЕННЫЕ пики подтверждают
+        # удвоение — на реальных, особенно "шумных" (движение) окнах
+        # пиковый детектор не всегда даёт уверенное подтверждение
+        # (verdict="ambiguous"/"insufficient_peaks"), и заниженная вдвое
+        # спектральная оценка проходит неисправленной, хотя СОСЕДНИЕ,
+        # более уверенные окна ясно показывают вдвое более высокий истинный
+        # пульс. См. _smooth_bpm_against_trusted_history.
+        self._trusted_bpm_history: deque = deque(maxlen=5)
 
         # Задача 8: последнее РЕАЛЬНО измеренное (publishable=True) значение
         # BPM и время его получения — см. PTSDPulseFeatures.last_valid_bpm/
@@ -407,6 +453,71 @@ class RPPGPipeline:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def _refresh_skin_mask_cache(self, frame_bgr: np.ndarray, timestamp_ms: int) -> np.ndarray:
+        """Задача 34: маска кожи обновляется раз в step_seconds, по
+        медианному кадру, накопленному с прошлого обновления — не на
+        каждый кадр. Пересчёт на каждый кадр даёт ту же проблему
+        "меняющегося состава выборки", что и медиана в задаче 31: блик/шум/
+        лёгкий поворот головы меняют бинарное решение "кожа/не кожа" по
+        краю маски от кадра к кадру, никак не будучи связаны с пульсом.
+
+        Аккумулятор кадров ограничен 30 элементами (безопасный потолок по
+        памяти) — этого достаточно для типичного step_seconds~1с даже при
+        высоком fps; при более длинном шаге медиана считается по
+        подвыборке последних 30 кадров, а не по всем кадрам шага."""
+        self._skin_mask_frame_accum.append(frame_bgr)
+        if len(self._skin_mask_frame_accum) > 30:
+            self._skin_mask_frame_accum.pop(0)
+
+        step_ms = self.cfg.window.step_seconds * 1000.0
+        due = (
+            self._cached_skin_mask is None
+            or self._skin_mask_refresh_ms is None
+            or timestamp_ms - self._skin_mask_refresh_ms >= step_ms
+        )
+        if not due:
+            return self._cached_skin_mask
+
+        if len(self._skin_mask_frame_accum) == 1:
+            median_frame = frame_bgr
+        else:
+            stacked = np.stack(self._skin_mask_frame_accum, axis=0)
+            median_frame = np.median(stacked, axis=0).astype(np.uint8)
+
+        new_mask = build_skin_mask(median_frame)
+        pass_fraction = float(new_mask.mean())
+        if self._skin_mask_pass_fraction_prev is not None:
+            prev = self._skin_mask_pass_fraction_prev
+            change = abs(pass_fraction - prev) / prev if prev > 1e-6 else float(pass_fraction > 1e-6)
+            if change > self.cfg.roi.max_skin_mask_pass_fraction_change:
+                self._pending_skin_mask_warning = (
+                    f"Резкое изменение доли skin-mask: {prev:.3f} -> {pass_fraction:.3f} ({change:.0%})"
+                )
+        self._skin_mask_pass_fraction_prev = pass_fraction
+
+        self._cached_skin_mask = new_mask
+        self._skin_mask_refresh_ms = timestamp_ms
+        self._skin_mask_frame_accum = []
+        return new_mask
+
+    def _check_valid_pixel_count_stability(self, roi_name: str, n_valid: int, base_valid: bool) -> bool:
+        """Задача 31: кадр помечается невалидным, если число валидных
+        пикселей ROI отличается от медианы недавних кадров больше, чем на
+        ROIConfig.max_valid_pixel_count_change_fraction — резкая смена
+        состава выборки (окклюзия, поворот головы) не связана с пульсом и
+        не должна искажать усечённое среднее, даже если
+        min_valid_pixel_fraction формально пройдена."""
+        history = self._valid_pixel_count_history[roi_name]
+        stable = True
+        if base_valid and len(history) >= 3:
+            recent_median = float(np.median(history))
+            if recent_median > 0:
+                change = abs(n_valid - recent_median) / recent_median
+                if change > self.cfg.roi.max_valid_pixel_count_change_fraction:
+                    stable = False
+        history.append(n_valid)
+        return base_valid and stable
+
     # ------------------------------------------------------------------ #
     def process_frame(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PTSDPulseFeatures | None:
         face = self._landmarker.detect(frame_bgr, timestamp_ms)
@@ -416,13 +527,22 @@ class RPPGPipeline:
             if self._debug:
                 self.last_roi_result = None
         else:
+            skin_mask = self._refresh_skin_mask_cache(frame_bgr, timestamp_ms)
             roi_result = extract_rois(
                 frame_bgr,
                 face.landmarks_norm,
                 roi_names=tuple(r.value for r in self.cfg.roi.enabled_rois),
                 shrink_factor=self.cfg.roi.shrink_factor,
                 min_valid_fraction=self.cfg.roi.min_valid_pixel_fraction,
+                trim_fraction=self.cfg.roi.trim_fraction,
+                skin_mask=skin_mask,
             )
+            for roi in self.cfg.roi.enabled_rois:
+                name = roi.value
+                n_valid = roi_result.valid_pixel_count_by_roi.get(name, 0)
+                roi_result.valid_by_roi[name] = self._check_valid_pixel_count_stability(
+                    name, n_valid, roi_result.valid_by_roi.get(name, False),
+                )
             self._push_frame(timestamp_ms, roi_result)
             if self._debug:
                 self.last_roi_result = roi_result
@@ -525,6 +645,17 @@ class RPPGPipeline:
             return None
         return float(np.median(self._recent_bpm_history)) / 60.0
 
+    def _recent_median_hz_for_rate_limit(self) -> float | None:
+        """Задача 37: медиана истории BPM для ЖЁСТКОГО физиологического
+        предела скорости — В ОТЛИЧИЕ от _recent_median_hz (мягкая
+        continuity) НЕ зависит от FrequencyConfig.continuity_enabled: это
+        отдельный, независимо действующий механизм (см. docstring
+        FrequencyConfig.max_physiological_change_bpm_per_sec). None только
+        при отсутствии истории (первые окна записи)."""
+        if not self._recent_bpm_history:
+            return None
+        return float(np.median(self._recent_bpm_history)) / 60.0
+
     def _estimate_frequency(
         self,
         raw_signal: np.ndarray,
@@ -533,21 +664,35 @@ class RPPGPipeline:
         fps: float,
         band: tuple[float, float],
         timestamps_sec: np.ndarray,
-    ) -> float:
-        """BPM по одному сигналу. Для lomb_scargle — отдельная ветка: LS
-        работает по НЕинтерполированным валидным отсчётам и их реальным
-        меткам времени (см. docstring frequency.py), а не по сигналу,
-        уже "залеченному" interpolate_missing и пропущенному через
-        filtfilt на равномерной сетке — иначе LS вырождается в обычную
-        периодограмму на том же равномерном сигнале, что и FFT/Welch.
+    ) -> FrequencyEstimate:
+        """Оценка частоты по одному сигналу (полный FrequencyEstimate, не
+        только .bpm — задача 42: нужен и .freqs_hz/.power для честной
+        диагностики выбора пика, см. DebugInfo.bpm_freq_estimate). Для
+        lomb_scargle — отдельная ветка: LS работает по НЕинтерполированным
+        валидным отсчётам и их реальным меткам времени (см. docstring
+        frequency.py), а не по сигналу, уже "залеченному"
+        interpolate_missing и пропущенному через filtfilt на равномерной
+        сетке — иначе LS вырождается в обычную периодограмму на том же
+        равномерном сигнале, что и FFT/Welch.
         """
         recent_median_hz = self._recent_median_hz()
         tolerance = self.cfg.frequency.continuity_power_tolerance
+        # Задача 37: max_change_hz переводит BPM/сек в Гц за один шаг окна
+        # (step_seconds — фактический интервал между последовательными
+        # вызовами _estimate_frequency для одного и того же ROI).
+        rate_limit_median_hz = self._recent_median_hz_for_rate_limit()
+        max_change_hz = (
+            self.cfg.frequency.max_physiological_change_bpm_per_sec * self.cfg.window.step_seconds / 60.0
+            if rate_limit_median_hz is not None else 0.0
+        )
+        power_advantage = self.cfg.frequency.physiological_rate_limit_power_advantage
         if self.cfg.frequency_method.value != "lomb_scargle":
             return estimate_hr(
                 processed_signal, fps, band, method=self.cfg.frequency_method.value,
                 recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
-            ).bpm
+                max_physiological_change_hz=max_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+                physiological_rate_limit_power_advantage=power_advantage,
+            )
 
         trend_removed = detrend(raw_signal, method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda)
         ls_signal = trend_removed[valid_mask]
@@ -555,7 +700,9 @@ class RPPGPipeline:
         return estimate_hr(
             ls_signal, fps, band, method="lomb_scargle", timestamps_sec=ls_timestamps,
             recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
-        ).bpm
+            max_physiological_change_hz=max_change_hz, rate_limit_median_hz=rate_limit_median_hz,
+            physiological_rate_limit_power_advantage=power_advantage,
+        )
 
     def _update_last_valid_bpm(self, timestamp_ms: int, current_bpm: float, is_reliable: bool) -> None:
         """Задача 8: обновляет last_valid_bpm/age ТОЛЬКО когда окно реально
@@ -586,7 +733,14 @@ class RPPGPipeline:
         idx = int(np.searchsorted(cum_weights, cutoff))
         return float(values_sorted[min(idx, len(values_sorted) - 1)])
 
-    def _compute_aggregate(self, timestamp_ms: int, current_bpm: float, confidence: float) -> AggregateResult:
+    def _compute_aggregate(
+        self,
+        timestamp_ms: int,
+        current_bpm: float,
+        confidence: float,
+        is_reliable: bool,
+        window_status: str,
+    ) -> AggregateResult:
         """Задача 25: агрегированный BPM для автоматической подачи в
         систему ПТСР — см. AggregateConfig и контракт потребителя в
         docstring полей bpm_aggregate* на PTSDPulseFeatures.
@@ -604,11 +758,32 @@ class RPPGPipeline:
         10), внутри пятисекундного интервала первое и последнее делят
         половину данных — снижение случайного шума усреднением ожидается
         около 1.4x, не 2.2x. Основная польза агрегата — отбрасывание
-        выбросов через МЕДИАНУ, а не усреднение шума."""
+        выбросов через МЕДИАНУ, а не усреднение шума.
+
+        Задача 30 (2026-08-20, исправляет доказанный баг): раньше кандидаты
+        в агрегат отбирались по confidence > 0.0 — НЕПРЕРЫВНОМУ overall_score,
+        который складывается из НЕСКОЛЬКИХ компонент SQI аддитивно (см.
+        quality.assess_quality). На статичном фото spectral_snr_db=-inf почти
+        всегда (окно физически вырождено, window_status="degenerate_signal"),
+        но snr-компонента overall_score клипуется в 0.0 при -inf, а НЕ делает
+        весь overall_score нулём — прочие компоненты (например,
+        landmark_stability: на статичном фото landmark-точки идеально
+        неподвижны) продолжают давать положительный вклад. В результате
+        confidence>0.0 пропускал заведомо вырожденные окна в пул кандидатов
+        агрегата, и bpm_aggregate_quality оказывался положительным на видео,
+        где НИ ОДНО окно не было реальным измерением пульса. Теперь кандидат
+        должен пройти is_reliable (тот же бинарный гейт, что у publishable,
+        задача 16) И иметь window_status == "ok" — оба условия одновременно,
+        т.к. is_reliable сам по себе НЕ проверяет window_status (окно может
+        быть publishable=False по другой причине при status="ok", но
+        status="degenerate_signal"/"too_short"/"no_face" должно исключаться
+        безусловно, независимо от того, что показал is_reliable)."""
         cfg = self.cfg.aggregate
         cfg_filt = self.cfg.filt
 
-        self._aggregate_history.append((float(timestamp_ms), current_bpm, confidence))
+        self._aggregate_history.append(
+            (float(timestamp_ms), current_bpm, confidence, is_reliable, window_status)
+        )
         cutoff_ms = timestamp_ms - cfg.aggregate_span_seconds * 1000.0
         while self._aggregate_history and self._aggregate_history[0][0] < cutoff_ms:
             self._aggregate_history.popleft()
@@ -618,8 +793,8 @@ class RPPGPipeline:
 
         band_bpm = (cfg_filt.low_hz * 60.0, cfg_filt.high_hz * 60.0)
         candidates = [
-            (bpm, conf) for _, bpm, conf in self._aggregate_history
-            if conf > 0.0 and not np.isnan(bpm) and band_bpm[0] <= bpm <= band_bpm[1]
+            (bpm, conf) for _, bpm, conf, reliable, status in self._aggregate_history
+            if reliable and status == "ok" and not np.isnan(bpm) and band_bpm[0] <= bpm <= band_bpm[1]
         ]
 
         if len(candidates) >= cfg.min_windows:
@@ -633,6 +808,28 @@ class RPPGPipeline:
                 bpm_aggregate = self._weighted_median(bpm_values, conf_values)
                 normalized_spread = float(np.clip(1.0 - spread_bpm / cfg.max_spread_bpm, 0.0, 1.0))
                 quality = float(np.clip(normalized_spread * mean_confidence, 0.0, 1.0))
+
+                # Задача 30: n>2 бит-в-бит идентичных принятых значений —
+                # признак застрявшего/вырожденного кандидата (например, один
+                # и тот же fallback-пик), а не совпадения по удаче на
+                # реальном сигнале; НЕ вознаграждать нулевым spread.
+                if len(candidates) > 2 and float(np.ptp(bpm_values)) == 0.0:
+                    quality = 0.0
+
+                # Задача 30: результат на самом краю полосы пропуска
+                # (low_hz*60 или high_hz*60 в пределах одного спектрального
+                # бина) — типичный признак того, что оценка упёрлась в
+                # границу диапазона поиска, а не нашла настоящий пик.
+                fps = self._estimate_fps()
+                n_samples = int(round(self.cfg.window.window_seconds * fps)) if fps > 0 else 0
+                if fps > 0 and n_samples > 0:
+                    bin_width_bpm = resolvable_bpm_difference(fps, n_samples, self.cfg.frequency_method.value)
+                    if (
+                        abs(bpm_aggregate - band_bpm[0]) <= bin_width_bpm
+                        or abs(bpm_aggregate - band_bpm[1]) <= bin_width_bpm
+                    ):
+                        quality = 0.0
+
                 result = AggregateResult(
                     bpm=bpm_aggregate, quality=quality, status="measured",
                     n_windows=len(candidates), spread_bpm=spread_bpm,
@@ -723,6 +920,7 @@ class RPPGPipeline:
         per_roi_signal: dict[str, np.ndarray],
         warnings: list[str],
         per_roi_raw_signal: dict[str, np.ndarray] | None = None,
+        per_roi_freq_estimate: dict[str, FrequencyEstimate] | None = None,
     ) -> None:
         raw = np.array(self._buf.rgb_by_roi[name])
         valid_mask = np.array(self._buf.valid_by_roi[name], dtype=bool)
@@ -758,7 +956,10 @@ class RPPGPipeline:
         per_roi_signal[name] = processed
         if per_roi_raw_signal is not None:
             per_roi_raw_signal[name] = raw_signal
-        per_roi_bpm[name] = self._estimate_frequency(raw_signal, valid_mask, processed, fps, band, timestamps_sec)
+        estimate = self._estimate_frequency(raw_signal, valid_mask, processed, fps, band, timestamps_sec)
+        per_roi_bpm[name] = estimate.bpm
+        if per_roi_freq_estimate is not None:
+            per_roi_freq_estimate[name] = estimate
 
     def _estimate_head_motion(
         self,
@@ -770,6 +971,7 @@ class RPPGPipeline:
         per_roi_signal: dict[str, np.ndarray],
         warnings: list[str],
         per_roi_raw_signal: dict[str, np.ndarray] | None = None,
+        per_roi_freq_estimate: dict[str, FrequencyEstimate] | None = None,
     ) -> None:
         """HEAD_MOTION не зависит от ROI (он использует движение головы целиком),
         поэтому считается один раз на окно, а не по разу на каждый ROI —
@@ -803,12 +1005,100 @@ class RPPGPipeline:
         per_roi_signal["face"] = processed
         if per_roi_raw_signal is not None:
             per_roi_raw_signal["face"] = raw_signal
-        per_roi_bpm["face"] = self._estimate_frequency(raw_signal, face_valid, processed, fps, band, timestamps_sec)
+        estimate = self._estimate_frequency(raw_signal, face_valid, processed, fps, band, timestamps_sec)
+        per_roi_bpm["face"] = estimate.bpm
+        if per_roi_freq_estimate is not None:
+            per_roi_freq_estimate["face"] = estimate
 
     # ------------------------------------------------------------------ #
-    def _update_ibi_log(self, signal: np.ndarray, fps: float, timestamps_ms) -> None:
+    def _cross_check_bpm(
+        self, signal: np.ndarray, fps: float, bpm_spectral: float, band: tuple[float, float]
+    ) -> CrossCheckResult:
+        """Задача 44/46: независимая проверка спектральной оценки BPM по
+        пикам ТОГО ЖЕ обработанного сигнала (best_signal) — обрезает края
+        тем же способом, что раньше делал _update_ibi_log (см. его текущий
+        docstring про краевые артефакты overlap-add/filtfilt). band —
+        физиологическая полоса (cfg.filt.low_hz/high_hz), нужна
+        cross_check_spectral_vs_peaks для отбраковки кандидатов f/2f/f-2
+        вне неё (задача 46).
+
+        ОДИН проход пикового детектора на окно: CrossCheckResult.peaks_sub
+        (в индексах ПОЛНОГО, необрезанного сигнала) переиспользуется
+        _update_ibi_log ниже, а не пересчитывается заново."""
+        n = len(signal)
+        trim = int(round(self.cfg.hrv.edge_trim_seconds * fps))
+        min_len = 2 * trim + int(round(fps * 2))
+        if n <= min_len:
+            # Окно ещё недостаточно длинное, чтобы безопасно (без краевых
+            # артефактов) искать пики — не опровергаем и не подтверждаем
+            # спектральную оценку, оставляем её как есть.
+            return CrossCheckResult(
+                verdict="insufficient_peaks", bpm=bpm_spectral, ratio=None,
+                mean_hr_from_peaks=None, peaks_sub=np.array([]),
+                is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
+            )
+        lo = trim
+        interior = signal[lo: n - trim]
+        result = cross_check_spectral_vs_peaks(bpm_spectral, interior, fps, band)
+        if len(result.peaks_sub) > 0:
+            result.peaks_sub = result.peaks_sub + lo
+        return result
+
+    def _smooth_bpm_against_trusted_history(
+        self,
+        current_bpm: float,
+        cross_check: CrossCheckResult,
+        min_ratio: float = 1.8,
+        max_ratio: float = 2.2,
+    ) -> tuple[float, bool]:
+        """Задача 44/46 (сглаживание по истории — ОТДЕЛЬНЫЙ слой ПОВЕРХ
+        cross_check_spectral_vs_peaks; сам cross-check НЕ трогается, см.
+        self._trusted_bpm_history).
+
+        ПЕРЕСМОТРЕНО по итогам задачи 46: раньше уже принятые cross_check
+        решения (verdict="corrected_to_2f"/"corrected_to_half_f") НЕ
+        пересматривались — предполагалось, что раз cross_check уверенно
+        выбрал кандидата (прошёл confidence_ratio), он прав. Прямая
+        эмпирическая проверка на "я обычное" это опровергла: ложное
+        corrected_to_2f (|ln(peak/2f)|=0.074, ratio=1.86) оказалось БЛИЖЕ
+        к 2f, чем часть настоящих исправлений на "я пульс 125"
+        (|ln(peak/2f)|=0.114-0.196) — по ОДНОМУ окну эти случаи неразличимы
+        никаким порогом близости, различает их только контекст соседних
+        окон. Поэтому теперь пересматриваются ЛЮБЫЕ verdict, КРОМЕ
+        "agreement" (оба независимых оценщика сошлись на самой f — это
+        единственный по-настоящему золотой сигнал, не подлежащий пересмотру
+        историей): если результат cross_check вдвое отличается от МЕДИАНЫ
+        последних ПОДТВЕРЖДЁННЫХ значений — переворачивается (даже отменяя
+        решение cross_check), если совпадает с историей — остаётся и сам
+        пополняет её.
+
+        Возвращает (bpm, was_smoothed)."""
+        if cross_check.verdict == "agreement":
+            self._trusted_bpm_history.append(current_bpm)
+            return current_bpm, False
+
+        smoothed_bpm = current_bpm
+        was_smoothed = False
+        if len(self._trusted_bpm_history) >= 2 and np.isfinite(current_bpm) and current_bpm > 0:
+            reference = float(np.median(self._trusted_bpm_history))
+            if reference > 0:
+                ratio = reference / current_bpm
+                if min_ratio <= ratio <= max_ratio:
+                    smoothed_bpm = current_bpm * 2.0
+                    was_smoothed = True
+                elif min_ratio <= (1.0 / ratio) <= max_ratio:
+                    smoothed_bpm = current_bpm / 2.0
+                    was_smoothed = True
+
+        if cross_check.is_bpm_reliable or was_smoothed:
+            self._trusted_bpm_history.append(smoothed_bpm)
+        return smoothed_bpm, was_smoothed
+
+    def _update_ibi_log(self, cross_check: CrossCheckResult, timestamps_ms) -> None:
         """Инкрементально пополняет накопитель IBI новыми (ранее не
-        учтёнными) пиками из текущего скользящего BPM-окна.
+        учтёнными) пиками из текущего скользящего BPM-окна — пиками,
+        которые УЖЕ нашёл и провалидировал _cross_check_bpm (не
+        детектирует заново).
 
         Окна перекрываются (шаг WindowConfig.step_seconds << window_seconds),
         поэтому один и тот же пик виден в нескольких последовательных
@@ -818,23 +1108,18 @@ class RPPGPipeline:
         коротких перекрывающихся BPM-окон строится один непрерывный ряд IBI
         длиной в минуты — то, что реально нужно для SDNN/RMSSD/LF/HF
         (см. HRVConfig, п.14 требований).
-        """
-        ts = np.asarray(timestamps_ms, dtype=float)
-        n = len(signal)
-        trim = int(round(self.cfg.hrv.edge_trim_seconds * fps))
-        min_len = 2 * trim + int(round(fps * 2))
-        if n <= min_len:
-            return  # окно ещё недостаточно длинное, чтобы безопасно (без краевых артефактов) искать пики
 
-        lo, hi = trim, n - trim
-        interior = signal[lo:hi]
-        peaks = detect_pulse_peaks(interior, fps)
-        if len(peaks) == 0:
+        Задача 44/46: пики добавляются в накопитель ТОЛЬКО если
+        cross_check.peaks_ok_for_ibi — при verdict="ambiguous" (выбор
+        кандидата ненадёжен) или "insufficient_peaks" эти КОНКРЕТНЫЕ пики
+        известны как ненадёжные и не должны загрязнять долгий ряд IBI, из
+        которого считаются RMSSD/pNN50/LF/HF."""
+        if not cross_check.peaks_ok_for_ibi or len(cross_check.peaks_sub) == 0:
             return
-        peaks_sub = refine_peaks_subsample(interior, peaks) + lo
 
-        idx = np.arange(n, dtype=float)
-        peak_times_ms = np.interp(peaks_sub, idx, ts)
+        ts = np.asarray(timestamps_ms, dtype=float)
+        idx = np.arange(len(ts), dtype=float)
+        peak_times_ms = np.interp(cross_check.peaks_sub, idx, ts)
 
         min_ibi_ms = 60000.0 / 220.0
         max_ibi_ms = 60000.0 / 40.0
@@ -997,7 +1282,7 @@ class RPPGPipeline:
         # эксплуатирует своё преимущество для НЕравномерной выборки здесь.
         fused_bpm = self._estimate_frequency(
             fused_signal, np.ones(len(fused_signal), dtype=bool), fused_signal, fps, band, timestamps_sec
-        )
+        ).bpm
 
         harmonic_check_signal = None
         detrended_sources = {
@@ -1028,18 +1313,22 @@ class RPPGPipeline:
         per_roi_bpm: dict[str, float] = {}
         per_roi_signal: dict[str, np.ndarray] = {}
         per_roi_raw_signal: dict[str, np.ndarray] = {}
+        per_roi_freq_estimate: dict[str, FrequencyEstimate] = {}
         warnings: list[str] = []
+        if self._pending_skin_mask_warning is not None:
+            warnings.append(self._pending_skin_mask_warning)
+            self._pending_skin_mask_warning = None
 
         if self._method.name == "head_motion":
             self._estimate_head_motion(
                 landmark_traj, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings,
-                per_roi_raw_signal=per_roi_raw_signal,
+                per_roi_raw_signal=per_roi_raw_signal, per_roi_freq_estimate=per_roi_freq_estimate,
             )
         else:
             for roi in self.cfg.roi.enabled_rois:
                 self._estimate_color_roi(
                     roi.value, fps, band, timestamps_sec, per_roi_bpm, per_roi_signal, warnings,
-                    per_roi_raw_signal=per_roi_raw_signal,
+                    per_roi_raw_signal=per_roi_raw_signal, per_roi_freq_estimate=per_roi_freq_estimate,
                 )
 
         if not per_roi_signal:
@@ -1054,7 +1343,9 @@ class RPPGPipeline:
             # отфильтроваться по confidence>0), иначе агрегат не увидит
             # разрыв в потоке измерений и будет считать интервал "гуще",
             # чем он есть на самом деле.
-            aggregate = self._compute_aggregate(timestamp_ms, float("nan"), 0.0)
+            aggregate = self._compute_aggregate(
+                timestamp_ms, float("nan"), 0.0, is_reliable=False, window_status=no_signal_window_status,
+            )
             if self._window_logger is not None:
                 # Тоже логируем (п.43) — "окно без сигнала" такой же
                 # материал для анализа failure cases, как и низкий SQI.
@@ -1124,6 +1415,42 @@ class RPPGPipeline:
                     lam=self.cfg.filt.tarvainen_lambda,
                 )
 
+        # Задача 44/46: кросс-проверка спектральной оценки BPM по пикам
+        # ТОГО ЖЕ best_signal — КАЖДОЕ окно, не только раз в минуту для
+        # HRV (см. _cross_check_bpm/cross_check_spectral_vs_peaks).
+        # current_bpm заменяется на выбранного (по близости к peak_hr в
+        # лог-масштабе) кандидата из {f, 2f, f/2}, если выбор уверенный.
+        cross_check = self._cross_check_bpm(best_signal, fps, current_bpm, band)
+        if cross_check.verdict in ("corrected_to_2f", "corrected_to_half_f"):
+            warnings.append(
+                f"BPM скорректирован с {current_bpm:.1f} до {cross_check.bpm:.1f} "
+                f"({cross_check.verdict}: mean_hr_from_peaks="
+                f"{cross_check.mean_hr_from_peaks:.1f}, ratio={cross_check.ratio:.2f}; задача 46)."
+            )
+        elif cross_check.verdict == "ambiguous":
+            warnings.append(
+                f"Выбор кандидата BPM неоднозначен (mean_hr_from_peaks="
+                f"{cross_check.mean_hr_from_peaks:.1f}, ratio={cross_check.ratio:.2f}) — "
+                f"оставлена спектральная оценка {current_bpm:.1f}, окно НЕ снято с публикации "
+                f"(задача 46)."
+            )
+        current_bpm = cross_check.bpm
+
+        # Задача 44 (сглаживание после cross-check): отдельный, более
+        # агрессивный слой ПОВЕРХ уже исправленных окон — см. docstring
+        # _smooth_bpm_against_trusted_history. bpm_was_smoothed идёт в лог
+        # отдельным полем и разрешает публикацию окна, даже если сам
+        # cross-check не смог подтвердить его по своим собственным пикам.
+        current_bpm, bpm_was_smoothed = self._smooth_bpm_against_trusted_history(current_bpm, cross_check)
+        if bpm_was_smoothed:
+            warnings.append(
+                f"BPM сглажен по истории подтверждённых окон до {current_bpm:.1f} "
+                f"(задача 44: cross_check сам не подтвердил, но соседние окна ясно "
+                f"указывают на субгармоническую ошибку)."
+            )
+        if best_roi in per_roi_bpm:
+            per_roi_bpm[best_roi] = current_bpm
+
         # Задача 21: явная классификация вырожденных окон — раньше окно с
         # best_snr_db=-inf (сигнал короче 8 отсчётов или std < 1e-10, см.
         # quality.compute_psd) тихо получало status="ok" с провальным SQI и
@@ -1181,9 +1508,10 @@ class RPPGPipeline:
                 peak_freq_hz=best_peak_freq_hz,
                 psd_freqs=psd_freqs,
                 psd_values=psd_values,
+                bpm_freq_estimate=per_roi_freq_estimate.get(best_roi),
             )
 
-        self._update_ibi_log(best_signal, fps, self._buf.timestamps_ms)
+        self._update_ibi_log(cross_check, self._buf.timestamps_ms)
         hrv_warnings: list[str] = []
         hrv = self._maybe_compute_hrv(timestamp_ms, sqi.overall_score, hrv_warnings)
 
@@ -1199,7 +1527,15 @@ class RPPGPipeline:
         # т.к. _update_last_valid_bpm тоже должен видеть тот же самый гейт —
         # ОДНО значение sqi.is_reliable, а не отдельно пересчитанное правило
         # (см. docstring PTSDPulseFeatures.publishable про прежнюю дыру).
-        confidence = sqi.overall_score
+        # Задача 46: publishable зависит ТОЛЬКО от sqi.is_reliable —
+        # неуверенный выбор кандидата (verdict="ambiguous") САМ ПО СЕБЕ
+        # больше не гасит публикуемость (старая ratio-полосная схema задачи
+        # 44 ставила is_bpm_reliable=False почти на 2/3 реальных окон и
+        # разрушала покрытие; явное требование задачи 46 — "не снимать
+        # публикуемость, если SQI в порядке"). confidence_boost
+        # (verdict="agreement" — оба независимых оценщика совпали) слегка
+        # повышает confidence, отражая более высокое доверие к измерению.
+        confidence = float(np.clip(sqi.overall_score + cross_check.confidence_boost, 0.0, 1.0))
         is_publishable = sqi.is_reliable
 
         # Задача 8: обновляется ТОЛЬКО когда окно реально прошло гейт — см.
@@ -1207,12 +1543,13 @@ class RPPGPipeline:
         # здесь принципиально нет обновления на непубликуемых окнах.
         self._update_last_valid_bpm(timestamp_ms, current_bpm, is_publishable)
 
-        # Задача 25: агрегат считается по НЕПРЕРЫВНОМУ (continuous) confidence
-        # этого окна, а НЕ по бинарному is_publishable — окно с confidence=0.2
-        # (ниже порога публикации, но не ноль) всё равно может войти в пул
-        # кандидатов агрегата и быть отфильтровано там уже по min_confidence
-        # AggregateConfig, если понадобится другая, более мягкая политика.
-        aggregate = self._compute_aggregate(timestamp_ms, current_bpm, confidence)
+        # Задача 25/30: confidence — непрерывный, для взвешенной медианы и
+        # оценки качества внутри _compute_aggregate, но кандидатом в агрегат
+        # окно становится ТОЛЬКО если is_publishable=True И window_status=="ok"
+        # (задача 30) — continuous confidence сам по себе не гейтит отбор.
+        aggregate = self._compute_aggregate(
+            timestamp_ms, current_bpm, confidence, is_reliable=is_publishable, window_status=window_status,
+        )
 
         if self._window_logger is not None:
             # п.43: полная разбивка SQI по компонентам (не только overall_score)
@@ -1223,7 +1560,11 @@ class RPPGPipeline:
                 timestamp_ms=timestamp_ms,
                 bpm=current_bpm,
                 per_roi_bpm=dict(per_roi_bpm),
-                publishable=sqi.is_reliable,
+                publishable=is_publishable,
+                cross_check_verdict=cross_check.verdict,
+                cross_check_ratio=cross_check.ratio,
+                cross_check_mean_hr_from_peaks=cross_check.mean_hr_from_peaks,
+                bpm_was_smoothed=bpm_was_smoothed,
                 method_used=method_used,
                 frequency_method_used=self.cfg.frequency_method.value,
                 sqi_overall_score=sqi.overall_score,
