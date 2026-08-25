@@ -71,7 +71,17 @@ def _mock_face_detected(pipe) -> None:
 def test_static_photo_never_publishes():
     """Один и тот же кадр N раз подряд — НОЛЬ временной вариации в ROI.
     Реальный пульс всегда даёт вариацию яркости во времени; полностью
-    статичный вход не должен пройти SQI ни на одном окне."""
+    статичный вход не должен пройти SQI ни на одном окне.
+
+    Задача 30 (2026-08-20, доказанный баг на реальной записи): раньше
+    bpm_aggregate_quality оставался ПОЛОЖИТЕЛЬНЫМ на статичном фото, где
+    96.4% окон были window_status="degenerate_signal" — _compute_aggregate
+    отбирал кандидатов по confidence>0.0 (непрерывный overall_score, где
+    остальные компоненты SQI, например идеально неподвижные landmark-точки
+    статичного фото, компенсировали обнулённую spectral_snr-компоненту), а
+    не по is_reliable И window_status=="ok" одновременно. Проверяем ОБА
+    гейта здесь: publishable=False (как раньше) И bpm_aggregate_quality
+    строго 0.0 на КАЖДОМ окне без исключения."""
     print("\n=== (а) Статичное фото: publishable должен быть False на каждом окне ===")
     pipe, skip_reason = _try_init_pipeline()
     if pipe is None:
@@ -93,10 +103,15 @@ def test_static_photo_never_publishes():
                 f"идентичный кадр без временной вариации дал publishable=True "
                 f"(bpm={result.bpm}, sqi={result.sqi_score:.3f})"
             )
+            assert result.bpm_aggregate_quality == 0.0, (
+                f"задача 30: bpm_aggregate_quality должен быть 0.0 на статичном фото "
+                f"(вырожденный сигнал), получено {result.bpm_aggregate_quality} "
+                f"(bpm_aggregate={result.bpm_aggregate}, status={result.status})"
+            )
     finally:
         pipe.close()
     assert got_any, "sanity: пайплайн должен вернуть хотя бы один результат за 20с"
-    print("  [OK] статичное фото ни разу не дало publishable=True")
+    print("  [OK] статичное фото ни разу не дало publishable=True, bpm_aggregate_quality всегда 0.0")
 
 
 def test_white_noise_frames_never_publish():

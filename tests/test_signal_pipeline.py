@@ -36,6 +36,8 @@ from rppg.hrv.features import (
     ectopic_artifact_mask,
     hrv_time_domain,
     hrv_frequency_domain,
+    mean_hr_from_peaks_in_window,
+    cross_check_spectral_vs_peaks,
 )
 
 
@@ -118,6 +120,44 @@ def test_color_based_methods_recover_known_bpm():
         processed = preprocess_signal(raw, FPS, *BAND, detrend_method="tarvainen", normalize_method="zscore")
         est = estimate_hr(processed, FPS, BAND, method="welch")
         _assert_bpm_close(est.bpm, true_bpm, tol, f"{method_name.upper()} + Welch")
+
+
+def test_chrom_alpha_robust_to_linear_drift():
+    """Верификация задачи 32: CHROM должен считать alpha (=std(Xf)/std(Yf))
+    ПОСЛЕ полосовой фильтрации Xs/Ys, а не на сырых Xs/Ys — иначе
+    низкочастотный дрейф освещения доминирует над std() и искажает alpha
+    (де-факто это уже так реализовано в ChromMethod.extract, см. его
+    docstring — здесь закрепляем регрессионным тестом, а не принимаем на
+    слово). Реализация alpha воспроизводится напрямую из тех же
+    строительных блоков (_temporal_normalize + bandpass_filter), что
+    использует ChromMethod.extract, т.к. сам alpha не выставлен наружу в
+    возвращаемом сигнале."""
+    print("\n=== Тест: alpha CHROM устойчив к сильному линейному дрейфу освещения (задача 32) ===")
+    from rppg.signal.methods import _temporal_normalize
+
+    def chrom_alpha(rgb, fps, band):
+        cn = _temporal_normalize(rgb)
+        rn, gn, bn = cn[:, 0], cn[:, 1], cn[:, 2]
+        xs = 3 * rn - 2 * gn
+        ys = 1.5 * rn + gn - 1.5 * bn
+        xf = bandpass_filter(xs, fps, *band)
+        yf = bandpass_filter(ys, fps, *band)
+        return np.std(xf) / np.std(yf)
+
+    rgb_clean = make_synthetic_rgb(72.0, noise_std=0.0, seed=7, duration_s=20.0)
+    n = len(rgb_clean)
+    # Дрейф ~9% от типичного DC-уровня (110, канал G) за 20с — заметно
+    # сильнее пульсовой модуляции (~1% DC), но не абсурдно доминирующий.
+    drift = np.linspace(0.0, 10.0, n)[:, None]
+    rgb_drifted = rgb_clean + drift
+
+    alpha_clean = chrom_alpha(rgb_clean, FPS, BAND)
+    alpha_drifted = chrom_alpha(rgb_drifted, FPS, BAND)
+    rel_diff = abs(alpha_drifted - alpha_clean) / abs(alpha_clean)
+
+    print(f"  alpha (без дрейфа) = {alpha_clean:.4f}, alpha (с дрейфом) = {alpha_drifted:.4f}, "
+          f"относительная разница = {rel_diff:.1%}")
+    assert rel_diff < 0.05, f"сильный линейный дрейф исказил alpha CHROM больше чем на 5%: {rel_diff:.1%}"
 
 
 def test_pos_numba_matches_numpy_reference():
@@ -215,6 +255,53 @@ def test_harmonic_sum_avoids_octave_error_that_confuses_plain_argmax():
     )
 
 
+def test_harmonic_sum_not_biased_by_unavailable_high_harmonics():
+    """Регрессия задачи 35: раньше недоступная (за пределами Найквиста)
+    гармоника подставлялась как 0.0 в СУММУ (не среднее), а log_psd почти
+    всегда отрицателен — значит 0.0 действовал как БОНУС, а не нейтральный
+    пропуск, систематически смещая выбор к кандидатам с МЕНЬШИМ числом
+    доступных гармоник. Здесь у истинного f0=1.0 Гц при fps=5 (nyquist=2.5)
+    доступны только k=1,2 (навсегда, а не k=3), а его же СОБСТВЕННАЯ 2-я
+    гармоника (2.0 Гц) как САМОСТОЯТЕЛЬНЫЙ кандидат имеет ЕЩЁ меньше
+    доступных гармоник (только k=1) — раньше это делало её сумму (без
+    усреднения) сильнее суммы истинного f0, и алгоритм ошибочно запирался
+    на октаву выше (2f0) именно при fps=5, хотя при fps=30 (все 3 гармоники
+    доступны у f0) корректно находил f0. После фикса (среднее по числу
+    доступных гармоник) обе частоты дискретизации дают ОДИН И ТОТ ЖЕ
+    результат — прямое требование задачи 35."""
+    print("\n=== Тест: harmonic_sum не смещается октавой из-за недоступных гармоник (задача 35) ===")
+    f0 = 1.0  # 60 BPM
+    band = (0.5, 2.4)  # верх полосы < nyquist(fps=5)=2.5, иначе полоса обрежется целиком
+
+    fps_high = 30.0
+    n_high = int(fps_high * 20)
+    t_high = np.arange(n_high) / fps_high
+    signal_high = (
+        0.35 * np.sin(2 * np.pi * f0 * t_high)
+        + 0.30 * np.sin(2 * np.pi * 2 * f0 * t_high)
+        + 0.15 * np.sin(2 * np.pi * 3 * f0 * t_high)
+    )
+
+    fps_low = 5.0
+    n_low = int(fps_low * 20)
+    t_low = np.arange(n_low) / fps_low
+    # 3-я гармоника (3 Гц) физически недоступна при fps=5 (nyquist=2.5 Гц) —
+    # намеренно НЕ добавляем её, это и есть проверяемый случай.
+    signal_low = 0.35 * np.sin(2 * np.pi * f0 * t_low) + 0.30 * np.sin(2 * np.pi * 2 * f0 * t_low)
+
+    est_high = estimate_hr(signal_high, fps_high, band, method="harmonic_sum")
+    est_low = estimate_hr(signal_low, fps_low, band, method="harmonic_sum")
+
+    print(f"  fps=30: {est_high.freq_hz:.3f} Hz ({est_high.bpm:.1f} BPM), "
+          f"fps=5: {est_low.freq_hz:.3f} Hz ({est_low.bpm:.1f} BPM), истина: {f0} Hz")
+    assert abs(est_high.freq_hz - f0) < 0.1, f"sanity: fps=30 должен найти {f0} Hz, получено {est_high.freq_hz}"
+    assert abs(est_low.freq_hz - f0) < 0.1, (
+        f"fps=5 (3-я гармоника недоступна) должен находить ту же частоту {f0} Hz, а не смещаться "
+        f"октавой выше на 2f0 из-за старого бонуса за недоступность (задача 35), "
+        f"получено {est_low.freq_hz:.3f} Hz"
+    )
+
+
 def test_octave_error_detector_finds_errors_on_drifting_true_signal():
     """Регрессия для задачи 28: старая метрика (задача 27) сравнивала
     оценку с МЕДИАНОЙ ПО ВСЕМУ ВИДЕО и находила 0% ошибок на дрейфующем
@@ -292,6 +379,48 @@ def test_continuity_check_prefers_peak_near_recent_history_within_tolerance():
     )
 
 
+def test_physiological_rate_limit_blocks_implausible_jump_without_power_advantage():
+    """Регрессия задачи 37: ЖЁСТКИЙ предел скорости изменения BPM —
+    ОТДЕЛЬНЫЙ от мягкой continuity выше (test_continuity_check_*) и СТРОЖЕ
+    её. Кандидат, "прыгнувший" от recent_median_hz дальше max_change_hz,
+    должен отклоняться в пользу ближайшего допустимого локального
+    максимума, ЕСЛИ у него нет явного (>= min_power_advantage раз)
+    превосходства по мощности — а при наличии такого превосходства прыжок,
+    наоборот, должен разрешаться (сильное прямое свидетельство важнее
+    мягкого предела)."""
+    print("\n=== Тест: жёсткий физиологический предел скорости BPM (задача 37) ===")
+    from rppg.signal.frequency import _apply_physiological_rate_limit
+
+    freqs = np.array([1.0, 1.2, 1.4, 2.0])  # Hz
+    recent_median_hz = 1.0
+    max_change_hz = 0.3  # допустимый диапазон без превосходства мощности: [0.7, 1.3] Hz
+    selected_idx = 3  # кандидат на 2.0 Гц (уже выбран argmax/continuity)
+
+    power_no_advantage = np.array([1.0, 3.0, 1.0, 3.5])   # 2.0 Гц лишь немного мощнее альтернативы (1.2 Гц)
+    power_with_advantage = np.array([1.0, 3.0, 1.0, 10.0])  # 2.0 Гц явно (>=2x) мощнее альтернативы
+
+    idx_no_adv = _apply_physiological_rate_limit(
+        freqs, power_no_advantage, recent_median_hz, selected_idx, max_change_hz,
+        power_is_log=False, min_power_advantage=2.0,
+    )
+    idx_with_adv = _apply_physiological_rate_limit(
+        freqs, power_with_advantage, recent_median_hz, selected_idx, max_change_hz,
+        power_is_log=False, min_power_advantage=2.0,
+    )
+
+    print(f"  без превосходства мощности: выбрано {freqs[idx_no_adv]:.1f} Hz (ожидание: 1.2 Hz — блок прыжка)")
+    print(f"  с превосходством мощности:  выбрано {freqs[idx_with_adv]:.1f} Hz (ожидание: 2.0 Hz — прыжок разрешён)")
+
+    assert freqs[idx_no_adv] == 1.2, (
+        f"без явного превосходства мощности прыжок должен блокироваться жёстким пределом, "
+        f"выбран {freqs[idx_no_adv]} Hz вместо ближайшего допустимого 1.2 Hz"
+    )
+    assert freqs[idx_with_adv] == 2.0, (
+        f"с явным (>=2x) превосходством мощности прыжок должен разрешаться, "
+        f"выбран {freqs[idx_with_adv]} Hz вместо 2.0 Hz"
+    )
+
+
 def test_lombscargle_handles_irregular_sampling():
     """Ключевое обоснование включения Lomb-Scargle: он остаётся корректным,
     когда часть кадров исключена (окклюзия) и временная сетка неравномерна —
@@ -337,6 +466,91 @@ def test_bandpass_rejects_out_of_band_and_keeps_in_band():
         f"near_dc={power_near_dc:.2f}"
     )
     print(f"  [OK] мощность в полосе {power_in_band:.2f} >> мощность у 0 Hz {power_near_dc:.2f}")
+
+
+def test_bandpass_sos_retains_amplitude_at_low_normalized_cutoff():
+    """Регрессия задачи 33: переход с (b,a)+filtfilt на SOS+sosfiltfilt не
+    должен искажать амплитуду сигнала В ПОЛОСЕ пропускания — особенно при
+    типичной для этого проекта низкой нормированной частоте среза
+    (low_hz=0.7 / nyquist=15 Гц при fps=30 = 0.047), где (b,a)-форма
+    численно наименее устойчива. 1.2 Гц (72 BPM) — юнит-амплитудная
+    синусоида строго внутри рабочей полосы (0.7,4.0) Гц."""
+    print("\n=== Тест: SOS-фильтр сохраняет амплитуду в полосе при низком cutoff (задача 33) ===")
+    fps = 30.0
+    n = int(fps * 20)
+    t = np.arange(n) / fps
+    x = np.sin(2 * np.pi * 1.2 * t)  # юнит-амплитуда, 72 BPM, внутри (0.7,4.0) Hz
+
+    filtered = bandpass_filter(x, fps, *BAND, order=4)
+
+    # отбросить края (переходный процесс zero-phase фильтра на границах окна)
+    edge = int(fps * 3)
+    core = filtered[edge:-edge]
+    amplitude = (core.max() - core.min()) / 2.0
+
+    print(f"  амплитуда после фильтрации: {amplitude:.4f} (истина: 1.0)")
+    assert 0.95 <= amplitude <= 1.05, (
+        f"полосовой SOS-фильтр исказил амплитуду сигнала в полосе больше чем на 5%: {amplitude:.4f}"
+    )
+
+
+def test_roi_mean_rgb_truncated_mean_recovers_subquantization_signal():
+    """Регрессия задачи 31 (КРИТИЧНАЯ, отменяет более раннее решение в
+    пользу медианы): усечённое среднее должно восстанавливать пульсовую
+    модуляцию яркости, ЦЕЛИКОМ находящуюся ПОД порогом одного уровня
+    квантования (peak-to-peak 0.3 из 256 градаций) — пространственное
+    усреднение по ~5000 пикселям ROI снижает шум квантования в sqrt(N) раз.
+    Медиана на ТОЙ ЖЕ выборке физически не может этого сделать: она сама
+    квантована на целочисленную пиксельную сетку и отражает плавный сдвиг
+    среднего яркости СТУПЕНЬКОЙ, а не непрерывно. Явный guard против
+    повторного возврата к медиане в roi_mean_rgb."""
+    print("\n=== Тест: усечённое среднее восстанавливает суб-квантовый сигнал, медиана — нет (задача 31) ===")
+    from rppg.face.roi import roi_mean_rgb
+    from rppg.signal.quality import dominant_frequency_and_snr
+
+    fps = 30.0
+    duration_s = 20.0
+    n_frames = int(fps * duration_s)
+    f0 = 1.2  # 72 BPM
+    t = np.arange(n_frames) / fps
+
+    side = 71  # 71*71 = 5041 пикселей, ~5000 как в критерии приёмки
+    rng = np.random.default_rng(42)
+    texture = rng.uniform(-3.0, 3.0, size=(side, side))  # фиксированная пространственная текстура кожи
+    dc = 128.0
+    amplitude = 0.15  # peak-to-peak 0.3 уровня — глубоко под порогом одного LSB
+
+    mask = np.ones((side, side), dtype=np.uint8)
+    trunc_series = np.zeros(n_frames)
+    median_series = np.zeros(n_frames)
+
+    for i, ti in enumerate(t):
+        modulation = amplitude * np.sin(2 * np.pi * f0 * ti)
+        continuous = dc + modulation + texture
+        quantized = np.clip(np.round(continuous), 0, 255).astype(np.uint8)
+        frame = np.stack([quantized, quantized, quantized], axis=-1)  # (H,W,3) BGR, все каналы равны
+
+        rgb, valid, n_valid = roi_mean_rgb(frame, mask, min_valid_fraction=0.6, trim_fraction=0.10)
+        assert valid and n_valid > 4500
+        trunc_series[i] = rgb[1]
+
+        ys, xs = np.where(mask > 0)
+        pixels = frame[ys, xs].astype(np.float64)
+        brightness = pixels.mean(axis=1)
+        good = (brightness > 10) & (brightness < 250)
+        median_series[i] = np.median(pixels[good], axis=0)[1]  # если бы использовалась медиана
+
+    _, trunc_snr_db = dominant_frequency_and_snr(trunc_series, fps, BAND)
+    _, median_snr_db = dominant_frequency_and_snr(median_series, fps, BAND)
+
+    print(f"  усечённое среднее: SNR={trunc_snr_db:.1f} dB   медиана (для сравнения): SNR={median_snr_db:.1f} dB")
+    assert trunc_snr_db > 20.0, (
+        f"усечённое среднее должно восстанавливать суб-квантовый сигнал, SNR={trunc_snr_db:.1f} dB"
+    )
+    assert median_snr_db < 5.0, (
+        f"медиана НЕ должна восстанавливать суб-квантовый сигнал (guard против регресса задачи 31) — "
+        f"если это упало, кто-то заменил усечённое среднее обратно на медиану, получено SNR={median_snr_db:.1f} dB"
+    )
 
 
 def test_detrend_removes_slow_trend():
@@ -1676,6 +1890,136 @@ def test_hrv_artifact_fraction_gates_publishable():
     assert not hrv_dirty.publishable, "HRV с >5% отбракованных интервалов не должен быть publishable"
 
 
+def _make_pulse_wave_with_dicrotic_notch(
+    bpm: float, fps: float, duration_s: float, notch_amplitude: float = 0.5, notch_phase: float = -1.5,
+) -> np.ndarray:
+    """Синтетическая пульсовая волна с выраженным вторичным подъёмом
+    (дикротической выемкой) внутри каждого удара — сумма гармоник со
+    сдвигом фазы у 2-й гармоники (тот же приём, что и в тестах
+    harmonic_sum на несинусоидальность реального пульса)."""
+    t = np.arange(int(fps * duration_s)) / fps
+    f = bpm / 60.0
+    return (
+        np.sin(2 * np.pi * f * t)
+        + notch_amplitude * np.sin(2 * np.pi * 2 * f * t + notch_phase)
+        + 0.1 * np.sin(2 * np.pi * 3 * f * t)
+    )
+
+
+def test_cross_check_agreement_on_clean_signal():
+    """Регрессия задачи 46: чистый однопиковый сигнал + верная спектральная
+    оценка -> ближайший кандидат к peak_hr — сама f -> verdict="agreement",
+    bpm не меняется, confidence_boost>0."""
+    print("\n=== Тест: cross_check согласен на чистом сигнале (задача 46) ===")
+    true_bpm = 72.0
+    signal = make_synthetic_rgb(true_bpm, noise_std=0.05, seed=1)[:, 1]  # G-канал как proxy пульсовой волны
+    result = cross_check_spectral_vs_peaks(true_bpm, signal, FPS, BAND)
+    print(f"  verdict={result.verdict} ratio={result.ratio} peaks_hr={result.mean_hr_from_peaks}")
+    assert result.verdict == "agreement", f"ожидался agreement, получено {result.verdict}"
+    assert abs(result.bpm - true_bpm) < 1e-9
+    assert result.confidence_boost > 0.0
+    assert result.is_bpm_reliable and result.peaks_ok_for_ibi
+
+
+def test_cross_check_corrects_subharmonic_spectral_estimate():
+    """Регрессия задачи 46 (основной сценарий задачи 42/43): сигнал с
+    истинными пиками на 120 BPM, но НАМЕРЕННО заниженная вдвое спектральная
+    оценка (60 BPM, как в доказанном баге result_ya_squats.csv: 63.92 ->
+    127.84) -> среди кандидатов {60, 120, 30} ближайший к peak_hr~120 —
+    сам 2f=120 -> verdict="corrected_to_2f", bpm=120."""
+    print("\n=== Тест: cross_check исправляет заниженную вдвое спектральную оценку (задача 46) ===")
+    true_bpm = 120.0
+    signal = make_synthetic_rgb(true_bpm, noise_std=0.05, seed=2)[:, 1]
+    wrong_spectral_bpm = true_bpm / 2.0  # 60 BPM — намеренно неверная (субгармоническая) оценка
+    result = cross_check_spectral_vs_peaks(wrong_spectral_bpm, signal, FPS, BAND)
+    print(f"  verdict={result.verdict} ratio={result.ratio} corrected_bpm={result.bpm}")
+    assert result.verdict == "corrected_to_2f", f"ожидался corrected_to_2f, получено {result.verdict}"
+    assert abs(result.bpm - true_bpm) < 3.0, f"скорректированный bpm={result.bpm} должен быть близко к {true_bpm}"
+    assert result.is_bpm_reliable and result.peaks_ok_for_ibi
+
+
+def test_cross_check_flags_unexplained_mismatch_as_ambiguous():
+    """Регрессия задачи 46: расхождение, не объяснимое ни близостью к f,
+    ни к 2f, ни к f/2 достаточно уверенно (ratio далеко от 0.5/1.0/2.0,
+    ближайший кандидат не превосходит следующего хотя бы вдвое по
+    |ln(...)|) -> verdict="ambiguous", bpm остаётся исходным."""
+    print("\n=== Тест: необъяснимое расхождение помечается ambiguous (задача 46) ===")
+    signal = make_synthetic_rgb(80.0, noise_std=0.05, seed=3)[:, 1]  # истинные пики ~80 BPM
+    implausible_spectral_bpm = 80.0 / 1.4  # ratio~1.4 — на полпути между f и 2f
+    result = cross_check_spectral_vs_peaks(implausible_spectral_bpm, signal, FPS, BAND)
+    print(f"  verdict={result.verdict} ratio={result.ratio}")
+    assert result.verdict == "ambiguous", f"ожидался ambiguous, получено {result.verdict}"
+    assert result.bpm == implausible_spectral_bpm, "при ambiguous bpm должен остаться исходным"
+    assert not result.peaks_ok_for_ibi
+
+
+def test_cross_check_dicrotic_notch_suppressed_by_prominence():
+    """Регрессия задачи 44/46 (ПЕРЕСМОТРЕНО эмпирически — см. git history и
+    docstring detect_pulse_peaks: расстояние, посчитанное от спектральной
+    подсказки, ломало обнаружение реальных субгармонических ошибок
+    циклической зависимостью). Дикротическая выемка в 2 раза удваивает
+    счёт "сырых" пиков (find_peaks с одним физиологическим потолком
+    расстояния), но у выемки заметно (в разы) меньше prominence, чем у
+    настоящего систолического пика — _collapse_alternating_low_
+    prominence_peaks должна убрать именно её, БЕЗ какой-либо спектральной
+    подсказки. Критично и для задачи 46: ближайшим кандидатом на записи
+    покоя обязан оказаться сам f, а не 2f."""
+    print("\n=== Тест: дикротическая выемка подавляется по prominence (задача 44/46) ===")
+    true_bpm = 62.0
+    signal = _make_pulse_wave_with_dicrotic_notch(true_bpm, FPS, DURATION_S)
+
+    mean_hr, peaks = mean_hr_from_peaks_in_window(signal, FPS)
+    print(f"  mean_hr_from_peaks={mean_hr}, пиков={len(peaks)}")
+
+    assert mean_hr is not None
+    assert abs(mean_hr - true_bpm) < 5.0, (
+        f"выемка должна быть подавлена по prominence, mean_hr_from_peaks должен остаться "
+        f"близко к {true_bpm}, получено {mean_hr}"
+    )
+
+    result = cross_check_spectral_vs_peaks(true_bpm, signal, FPS, BAND)
+    print(f"  cross_check: verdict={result.verdict} corrected_bpm={result.bpm}")
+    assert result.verdict == "agreement", (
+        f"верная спектральная оценка покоя НЕ должна ложно скорректироваться из-за выемки "
+        f"(задача 44/46 — правка, чинящая нагрузку и ломающая покой, не годится), получено {result.verdict}"
+    )
+    assert abs(result.bpm - true_bpm) < 1e-9, "покой не должен быть поднят с 62 до ~124"
+
+
+def test_hrv_rejects_physiologically_impossible_rmssd_at_high_hr():
+    """Регрессия задачи 44, часть 3: RMSSD>200мс или pNN50>50% при пульсе
+    выше 100 BPM физиологически невозможны и отбраковываются БЕЗУСЛОВНО —
+    даже когда старый фильтр эктопических интервалов (сравнение с
+    непосредственными соседями) не ловит их из-за регулярного чередования
+    длинных/коротких интервалов (задача 43: "соседи тоже испорчены")."""
+    print("\n=== Тест: HRV отбраковывает физиологически невозможный RMSSD при высоком пульсе (задача 44) ===")
+    mean_ibi = 500.0  # 120 BPM
+    n = 200
+    # Строго альтернирующий короткий/длинный интервал — artifact_fraction
+    # у существующего соседского фильтра остаётся 0.0 (ни один интервал не
+    # выглядит выбросом относительно СВОИХ соседей, они тоже чередуются).
+    ibi = np.array([mean_ibi + (60.0 if i % 2 == 0 else -60.0) for i in range(n)])
+
+    mask = ectopic_artifact_mask(ibi)
+    artifact_fraction = float((~mask).mean())
+    hrv = extract_hrv_features_from_ibi(ibi, compute_frequency_domain=False)
+    print(f"  mean_hr={hrv.mean_hr_bpm:.1f} rmssd={hrv.rmssd_ms:.1f} pnn50={hrv.pnn50_pct:.1f}% "
+          f"artifact_fraction={artifact_fraction:.3f} publishable={hrv.publishable}")
+
+    assert hrv.mean_hr_bpm > 100.0, "sanity: пульс должен быть выше 100 BPM для этой проверки"
+    assert hrv.rmssd_ms > 200.0 or hrv.pnn50_pct > 50.0, (
+        "sanity: сценарий должен реально давать физиологически невозможные значения"
+    )
+    assert artifact_fraction < 0.05, (
+        "sanity: старый соседский фильтр НЕ должен отбраковать эти интервалы сам по себе — "
+        "иначе тест не демонстрирует именно новую безусловную проверку (задача 44, часть 3)"
+    )
+    assert not hrv.publishable, (
+        "физиологически невозможные RMSSD/pNN50 при пульсе >100 BPM должны безусловно "
+        "блокировать публикацию HRV, даже если доля отбракованных интервалов низкая"
+    )
+
+
 def test_lf_hf_require_separate_minimum_durations():
     """Регрессия для п.15: старый общий порог duration<20с был мягче ЛЮБОГО
     периода LF-полосы (6.7-25с) и на 10-секундном окне обнулял LF/HF ещё до
@@ -1736,6 +2080,158 @@ def _make_pipeline_for_aggregate_test(cfg=None):
         return None, f"не удалось инициализировать MediaPipe ({exc})"
 
 
+def _make_cross_check_result(verdict: str, bpm: float, is_bpm_reliable: bool) -> "CrossCheckResult":
+    from rppg.hrv.features import CrossCheckResult
+    return CrossCheckResult(
+        verdict=verdict, bpm=bpm, ratio=None, mean_hr_from_peaks=None,
+        peaks_sub=np.array([]), is_bpm_reliable=is_bpm_reliable,
+        peaks_ok_for_ibi=False, confidence_boost=0.0,
+    )
+
+
+def test_bpm_smoothing_corrects_unconfirmed_subharmonic_using_trusted_history():
+    """Регрессия задачи 44 (сглаживание после cross-check, добавлено по
+    итогам эмпирической проверки на 19-минутной записи высокого пульса):
+    если недавняя история ПОДТВЕРЖДЁННЫХ окон ясно указывает на ~126 BPM,
+    а текущее окно (cross_check САМ не смог подтвердить — verdict=
+    "ambiguous") даёт ровно половину — сгладить до удвоенного значения."""
+    print("\n=== Тест: сглаживание исправляет неподтверждённую субгармонику по истории (задача 44) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    try:
+        for v in [124.0, 127.0, 126.0]:
+            pipe._trusted_bpm_history.append(v)
+        cross_check = _make_cross_check_result("ambiguous", 63.0, is_bpm_reliable=False)
+        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(63.0, cross_check)
+        print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
+        assert was_smoothed
+        assert abs(smoothed_bpm - 126.0) < 1.0, f"ожидался ~126 (63*2), получено {smoothed_bpm}"
+    finally:
+        pipe.close()
+
+
+def test_bpm_smoothing_requires_minimum_history_length():
+    """Регрессия задачи 44/46: сглаживание не должно срабатывать, пока не
+    накопилось хотя бы 2 подтверждённых значения (задача 46 снизила порог с
+    3 до 2 — иначе на реальных данных "я обычное" ложное corrected_to_2f в
+    самом начале записи, до накопления 3-й точки истории, оставалось
+    неисправленным) — но одного-единственного значения всё ещё
+    недостаточно: единственная точка не должна задавать опорную точку на
+    весь ряд."""
+    print("\n=== Тест: сглаживание не срабатывает при недостаточной истории (задача 44/46) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    try:
+        pipe._trusted_bpm_history.append(126.0)
+        cross_check = _make_cross_check_result("ambiguous", 63.0, is_bpm_reliable=False)
+        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(63.0, cross_check)
+        print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
+        assert not was_smoothed
+        assert smoothed_bpm == 63.0
+    finally:
+        pipe.close()
+
+
+def test_bpm_smoothing_does_not_trigger_on_resting_range():
+    """Регрессия задачи 44 (найдено эмпирически на записи покоя): если
+    история подтверждённых значений и текущий bpm оба лежат в
+    физиологическом диапазоне покоя (~62 BPM, ratio~1.0), сглаживание НЕ
+    должно срабатывать — иначе именно оно подняло бы верные 62 до 124,
+    ровно то, что задача 44 явно запрещает."""
+    print("\n=== Тест: сглаживание не трогает согласованные окна покоя (задача 44) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    try:
+        for v in [62.0, 63.0, 61.5, 62.5]:
+            pipe._trusted_bpm_history.append(v)
+        cross_check = _make_cross_check_result("ambiguous", 62.1, is_bpm_reliable=False)
+        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(62.1, cross_check)
+        print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
+        assert not was_smoothed
+        assert smoothed_bpm == 62.1
+    finally:
+        pipe.close()
+
+
+def test_bpm_smoothing_skips_already_corrected_windows_but_updates_history():
+    """Регрессия задачи 46: verdict="corrected_to_2f" (или "corrected_to_half_f")
+    означает, что cross_check УЖЕ исправил bpm по своим собственным данным —
+    сглаживание не должно пересматривать его повторно, но обязано добавить
+    его в историю подтверждённых значений (иначе история никогда бы не
+    росла на реальных, часто "ambiguous" данных)."""
+    print("\n=== Тест: сглаживание не трогает уже исправленные cross_check окна (задача 44) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    try:
+        assert len(pipe._trusted_bpm_history) == 0
+        cross_check = _make_cross_check_result("corrected_to_2f", 126.0, is_bpm_reliable=True)
+        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(126.0, cross_check)
+        print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed} "
+              f"history={list(pipe._trusted_bpm_history)}")
+        assert not was_smoothed
+        assert smoothed_bpm == 126.0
+        assert list(pipe._trusted_bpm_history) == [126.0]
+    finally:
+        pipe.close()
+
+
+def test_skin_mask_cached_per_step_not_recomputed_every_frame():
+    """Регрессия задачи 34: маска кожи кэшируется и обновляется раз в
+    step_seconds (по медианному кадру, накопленному с прошлого
+    обновления), а НЕ пересчитывается на каждый кадр — покадровый
+    пересчёт даёт ту же проблему "меняющегося состава выборки", что и
+    медиана в задаче 31 (блик/шум/лёгкий поворот головы меняют бинарное
+    решение "кожа/не кожа" по краю маски, никак не будучи связаны с
+    пульсом). White-box тест напрямую против RPPGPipeline._refresh_skin_
+    mask_cache, без реальных видеокадров/MediaPipe."""
+    print("\n=== Тест: маска кожи кэшируется раз в шаг, не на каждый кадр (задача 34) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+
+    try:
+        h, w = 64, 64
+        skin_bgr = np.array([40, 60, 100], dtype=np.int64)  # тот же оттенок, что и _make_pulsating_frame
+
+        def make_frame(seed):
+            r = np.random.default_rng(seed)
+            noise = r.integers(-2, 3, size=(h, w, 3))
+            return np.clip(skin_bgr[None, None, :] + noise, 0, 255).astype(np.uint8)
+
+        step_ms = int(pipe.cfg.window.step_seconds * 1000)
+
+        mask0 = pipe._refresh_skin_mask_cache(make_frame(1), 0)
+        mask_mid = pipe._refresh_skin_mask_cache(make_frame(2), max(1, step_ms // 3))
+        assert mask_mid is mask0, "маска не должна пересчитываться на кадре ДО истечения step_seconds"
+
+        mask_next_step = pipe._refresh_skin_mask_cache(make_frame(3), step_ms + 1)
+        assert mask_next_step is not mask0, (
+            "маска ДОЛЖНА пересчитаться после истечения step_seconds с прошлого обновления"
+        )
+        print(f"  [OK] кэш маски не менялся внутри шага ({step_ms}мс) и обновился сразу после")
+
+        # Резкая смена состава (skin -> полностью чёрный кадр) на границе следующего
+        # шага должна выставить предупреждение (см. QualityConfig/ROIConfig.
+        # max_skin_mask_pass_fraction_change).
+        black_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        pipe._refresh_skin_mask_cache(black_frame, 2 * step_ms + 1)
+        assert pipe._pending_skin_mask_warning is not None, (
+            "резкая смена доли skin-mask (кожа -> чёрный кадр) должна выставлять предупреждение"
+        )
+        print(f"  [OK] предупреждение выставлено: {pipe._pending_skin_mask_warning}")
+    finally:
+        pipe.close()
+
+
 def test_aggregate_median_robust_to_single_outlier():
     """Регрессия для задачи 25: bpm_aggregate — ВЗВЕШЕННАЯ МЕДИАНА, не
     среднее. Одна октавная ошибка (150 среди восьмидесятых) не должна
@@ -1764,8 +2260,8 @@ def test_aggregate_median_robust_to_single_outlier():
         outlier_seq = [84.0, 85.0, 84.0, 150.0, 85.0]
         result_clean = result_outlier = None
         for i, (bpm_c, bpm_o) in enumerate(zip(clean_seq, outlier_seq)):
-            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8)
-            result_outlier = pipe_outlier._compute_aggregate(i * 1000, bpm_o, confidence=0.8)
+            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8, is_reliable=True, window_status="ok")
+            result_outlier = pipe_outlier._compute_aggregate(i * 1000, bpm_o, confidence=0.8, is_reliable=True, window_status="ok")
 
         print(f"  clean:   bpm={result_clean.bpm:.1f}, spread={result_clean.spread_bpm:.2f}, "
               f"quality={result_clean.quality:.3f}")
@@ -1803,8 +2299,8 @@ def test_aggregate_spread_and_quality_respond_to_dispersion():
         dispersed_seq = [80.0, 82.0, 80.0, 90.0]
         result_clean = result_dispersed = None
         for i, (bpm_c, bpm_d) in enumerate(zip(clean_seq, dispersed_seq)):
-            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8)
-            result_dispersed = pipe_dispersed._compute_aggregate(i * 1000, bpm_d, confidence=0.8)
+            result_clean = pipe_clean._compute_aggregate(i * 1000, bpm_c, confidence=0.8, is_reliable=True, window_status="ok")
+            result_dispersed = pipe_dispersed._compute_aggregate(i * 1000, bpm_d, confidence=0.8, is_reliable=True, window_status="ok")
 
         print(f"  clean:      spread={result_clean.spread_bpm:.2f}, quality={result_clean.quality:.3f}, "
               f"status={result_clean.status}")
@@ -1836,7 +2332,7 @@ def test_aggregate_no_data_when_all_confidence_zero():
     try:
         result = None
         for i in range(5):
-            result = pipe._compute_aggregate(i * 1000, float("nan"), confidence=0.0)
+            result = pipe._compute_aggregate(i * 1000, float("nan"), confidence=0.0, is_reliable=False, window_status="no_signal")
         print(f"  bpm={result.bpm}, quality={result.quality}, status={result.status}")
         assert np.isnan(result.bpm), "bpm_aggregate должен быть NaN, когда данных нет"
         assert result.quality == 0.0
@@ -1865,7 +2361,7 @@ def test_aggregate_stale_decays_then_becomes_no_data():
         t = 0
         result = None
         for bpm in [80.0, 81.0, 80.0, 81.0]:
-            result = pipe._compute_aggregate(t, bpm, confidence=0.8)
+            result = pipe._compute_aggregate(t, bpm, confidence=0.8, is_reliable=True, window_status="ok")
             t += 1000
         assert result.status == "measured", f"sanity: должно стать measured, получено {result.status}"
         measured_quality = result.quality
@@ -1877,7 +2373,7 @@ def test_aggregate_stale_decays_then_becomes_no_data():
         statuses, qualities = [], []
         for _ in range(n_steps):
             t += step_ms
-            result = pipe._compute_aggregate(t, float("nan"), confidence=0.0)
+            result = pipe._compute_aggregate(t, float("nan"), confidence=0.0, is_reliable=False, window_status="no_signal")
             statuses.append(result.status)
             qualities.append(result.quality)
 
@@ -2206,14 +2702,19 @@ def test_ranking_preserved():
 def run_all():
     tests = [
         test_color_based_methods_recover_known_bpm,
+        test_chrom_alpha_robust_to_linear_drift,
         test_pos_numba_matches_numpy_reference,
         test_head_motion_method_recovers_known_bpm,
         test_frequency_estimators_agree_on_clean_tone,
         test_harmonic_sum_avoids_octave_error_that_confuses_plain_argmax,
+        test_harmonic_sum_not_biased_by_unavailable_high_harmonics,
         test_octave_error_detector_finds_errors_on_drifting_true_signal,
         test_continuity_check_prefers_peak_near_recent_history_within_tolerance,
+        test_physiological_rate_limit_blocks_implausible_jump_without_power_advantage,
         test_lombscargle_handles_irregular_sampling,
         test_bandpass_rejects_out_of_band_and_keeps_in_band,
+        test_bandpass_sos_retains_amplitude_at_low_normalized_cutoff,
+        test_roi_mean_rgb_truncated_mean_recovers_subquantization_signal,
         test_detrend_removes_slow_trend,
         test_tarvainen_cutoff_matches_documented_reference_and_new_default_is_transparent_to_pulse_band,
         test_align_sign_and_lag_recovers_known_shift,
@@ -2246,8 +2747,18 @@ def run_all():
         test_subsample_peak_refinement_reduces_rmssd_quantization_error,
         test_ectopic_masking_does_not_stitch_false_diff,
         test_hrv_artifact_fraction_gates_publishable,
+        test_cross_check_agreement_on_clean_signal,
+        test_cross_check_corrects_subharmonic_spectral_estimate,
+        test_cross_check_flags_unexplained_mismatch_as_ambiguous,
+        test_cross_check_dicrotic_notch_suppressed_by_prominence,
+        test_hrv_rejects_physiologically_impossible_rmssd_at_high_hr,
+        test_bpm_smoothing_corrects_unconfirmed_subharmonic_using_trusted_history,
+        test_bpm_smoothing_requires_minimum_history_length,
+        test_bpm_smoothing_does_not_trigger_on_resting_range,
+        test_bpm_smoothing_skips_already_corrected_windows_but_updates_history,
         test_lf_hf_require_separate_minimum_durations,
         test_respiration_rate_from_amplitude_modulation,
+        test_skin_mask_cached_per_step_not_recomputed_every_frame,
         test_aggregate_median_robust_to_single_outlier,
         test_aggregate_spread_and_quality_respond_to_dispersion,
         test_aggregate_no_data_when_all_confidence_zero,
