@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
-from scipy.signal import butter, filtfilt, detrend as _scipy_detrend
+from scipy.signal import butter, sosfiltfilt, detrend as _scipy_detrend
 
 
 def linear_detrend(x: np.ndarray) -> np.ndarray:
@@ -156,11 +156,22 @@ def bandpass_filter(
     order: int = 4,
 ) -> np.ndarray:
     """
-    Butterworth bandpass, zero-phase (filtfilt).
+    Butterworth bandpass, zero-phase (sosfiltfilt).
 
     low_hz/high_hz по умолчанию 0.7-4.0 Hz (42-240 BPM) — шире классических
     "45-180 BPM" оригинального репозитория, чтобы не отбрасывать тахикардию
     при остром стрессовом ответе (актуально для ПТСР-контекста, см. research_report).
+
+    Задача 33 (2026-08-20): раньше фильтр задавался передаточной функцией
+    (b, a) + filtfilt. При типичной нормированной частоте среза этого
+    ROI-сигнала (0.7 Гц / 15 Гц Найквист = 0.047) коэффициенты (b, a)
+    Баттерворта 4-го порядка численно плохо обусловлены — полюсы близко
+    подходят к границе устойчивости, и представление через полином
+    накапливает ошибку округления сильнее, чем секционное представление.
+    SOS (second-order sections, каскад биквадов) — стандартная замена
+    именно для этого случая (см. scipy.signal.butter docs, "For
+    numerical stability... use SOS"), устраняет проблему без изменения
+    частотной характеристики фильтра.
     """
     x = np.asarray(x, dtype=float)
     nyquist = fps / 2.0
@@ -171,21 +182,22 @@ def bandpass_filter(
     if low >= high:
         raise ValueError("low_hz must be < high_hz (после нормировки на Найквист)")
 
-    b, a = butter(order, [low, high], btype="bandpass")
+    sos = butter(order, [low, high], btype="bandpass", output="sos")
 
-    # filtfilt требует len(x) > 3 * max(len(a), len(b)); для коротких окон
-    # понижаем порядок фильтра, а не роняем пайплайн.
-    min_len = 3 * max(len(a), len(b))
+    # sosfiltfilt требует len(x) > 3 * (2 * n_sections + 1) - оценка, аналогичная
+    # прежнему допуску 3*max(len(a),len(b)) для передаточной функции того же
+    # порядка; для коротких окон понижаем порядок фильтра, а не роняем пайплайн.
+    min_len = 3 * (2 * sos.shape[0] + 1)
     if len(x) <= min_len:
         safe_order = max(1, order // 2)
-        b, a = butter(safe_order, [low, high], btype="bandpass")
-        min_len = 3 * max(len(a), len(b))
+        sos = butter(safe_order, [low, high], btype="bandpass", output="sos")
+        min_len = 3 * (2 * sos.shape[0] + 1)
         if len(x) <= min_len:
             # Слишком короткое окно для zero-phase фильтрации — возвращаем
             # как есть (вызывающий код обязан пометить это в SQI).
             return x - np.mean(x)
 
-    return filtfilt(b, a, x)
+    return sosfiltfilt(sos, x)
 
 
 def is_gap_acceptable(valid_mask: np.ndarray, max_gap: int = 15) -> bool:

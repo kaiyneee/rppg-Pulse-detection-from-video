@@ -57,8 +57,39 @@ class HRVFeatures:
     warnings: list[str] = field(default_factory=list)
 
 
+def _collapse_alternating_low_prominence_peaks(
+    peaks: np.ndarray, prominences: np.ndarray | None, min_ratio: float = 1.6
+) -> np.ndarray:
+    """Задача 44, часть 2 (найдено эмпирически — см. docstring detect_pulse_peaks
+    про отказ от циклически зависимого подхода через bpm_hint/расстояние).
+    Дикротическая выемка — это ВТОРОЙ, заметно менее выраженный подъём
+    МЕЖДУ двумя настоящими систолическими пиками: чётные и нечётные пики
+    в таком ряду систематически различаются по prominence в разы (на
+    синтетике с выраженной выемкой — в ~5 раз), тогда как у ряда РЕАЛЬНЫХ
+    ударов (даже вдвое более частых, чем ожидала спектральная оценка)
+    соседние пики сопоставимы по prominence (~1.0). В отличие от порога по
+    расстоянию, это НЕ зависит от того, известен ли заранее истинный
+    интервал — работает и когда сама спектральная оценка неверна."""
+    if prominences is None or len(peaks) < 4:
+        return peaks
+    prominences = np.asarray(prominences, dtype=float)
+    even_mean = float(prominences[0::2].mean())
+    odd_mean = float(prominences[1::2].mean())
+    if even_mean <= 0 or odd_mean <= 0:
+        return peaks
+    if even_mean / odd_mean >= min_ratio:
+        return peaks[0::2]
+    if odd_mean / even_mean >= min_ratio:
+        return peaks[1::2]
+    return peaks
+
+
 def detect_pulse_peaks(
-    signal: np.ndarray, fps: float, min_hr_bpm: float = 40.0, max_hr_bpm: float = 220.0
+    signal: np.ndarray,
+    fps: float,
+    min_hr_bpm: float = 40.0,
+    max_hr_bpm: float = 220.0,
+    alternation_prominence_ratio: float = 1.6,
 ) -> np.ndarray:
     """Детекция систолических пиков пульсовой волны (целочисленные индексы
     отсчётов — суб-сэмпловое уточнение делает refine_peaks_subsample).
@@ -66,13 +97,176 @@ def detect_pulse_peaks(
     distance/prominence подобраны из физиологических границ ЧСС, а не
     произвольно — так минимизируются как пропуски слабых пиков, так и
     ложные срабатывания на дикротической выемке пульсовой волны.
+
+    Задача 44, часть 2 (ПЕРЕСМОТРЕНО — см. git history: первая версия
+    поднимала минимальное расстояние между пиками до 60% интервала,
+    посчитанного от bpm_hint = спектральной оценки ЭТОГО ЖЕ окна). Оказалось,
+    что это ломает именно тот сценарий, ради которого писалась задача 44:
+    если спектральная оценка сама занижена ровно вдвое (доказанный баг
+    задачи 42/43), min_distance, посчитанный от НЕЁ ЖЕ, оказывается БОЛЬШЕ
+    истинного интервала между настоящими (вдвое более частыми) пиками —
+    они физически не находятся, и субгармоническая ошибка остаётся
+    незамеченной (циклическая зависимость). Более узкий порог (~42%)
+    решает эту проблему, но на реальных дикротических выемках (которые
+    могут стоять ближе 40% цикла) снова начинает их пропускать.
+
+    Решение — _collapse_alternating_low_prominence_peaks ПОСЛЕ детекции:
+    отличает настоящие удары от выемки по ВЫРАЖЕННОСТИ (prominence), а не
+    по расстоянию — не зависит от заранее известного (и потенциально
+    неверного) ожидаемого интервала вообще, поэтому применяется всегда,
+    без bpm_hint и без риска циклической зависимости.
     """
     signal = np.asarray(signal, dtype=float)
     min_distance = int(round(fps * 60.0 / max_hr_bpm))
     prominence = 0.25 * np.std(signal) if np.std(signal) > 1e-8 else None
 
-    peaks, _ = find_peaks(signal, distance=max(1, min_distance), prominence=prominence)
+    peaks, props = find_peaks(signal, distance=max(1, min_distance), prominence=prominence)
+    peaks = _collapse_alternating_low_prominence_peaks(
+        peaks, props.get("prominences"), min_ratio=alternation_prominence_ratio
+    )
     return peaks
+
+
+@dataclass
+class CrossCheckResult:
+    """Результат сверки спектральной оценки BPM с независимой оценкой по
+    пикам ТОГО ЖЕ обработанного сигнала (см. cross_check_spectral_vs_peaks).
+
+    verdict:
+      "agreement"           — ближайший (в лог-масштабе) к peak_hr кандидат — сама f;
+                               bpm не меняется, максимум доверия.
+      "corrected_to_2f"     — ближайший кандидат — 2f; спектральная оценка признана
+                               субгармонической (в 2 раза заниженной), bpm = bpm_spectral*2.
+      "corrected_to_half_f" — ближайший кандидат — f/2; спектральная оценка, похоже,
+                               сама заперлась на 2-й гармонике, bpm = bpm_spectral/2.
+      "ambiguous"           — задача 46: ближайший кандидат не превосходит следующего
+                               по близости хотя бы вдвое — выбор ненадёжен, bpm остаётся
+                               исходным (bpm_spectral), НО is_bpm_reliable=True: неуверенный
+                               выбор сам по себе не должен гасить публикуемость окна, если
+                               остальной SQI в порядке (см. RPPGPipeline._compute_estimate,
+                               is_publishable больше НЕ зависит от cross_check).
+      "insufficient_peaks" — пиков недостаточно для оценки (< 2 IBI в окне) либо
+                               спектральная оценка сама вне физиологической полосы.
+    """
+    verdict: str
+    bpm: float
+    ratio: float | None
+    mean_hr_from_peaks: float | None
+    peaks_sub: np.ndarray
+    is_bpm_reliable: bool
+    peaks_ok_for_ibi: bool
+    confidence_boost: float
+
+
+def mean_hr_from_peaks_in_window(signal: np.ndarray, fps: float) -> tuple[float | None, np.ndarray]:
+    """Задача 44, часть 1: независимая оценка HR по пикам ОДНОГО окна (не
+    накопителя IBI за минуты) — переиспользует detect_pulse_peaks как есть,
+    без bpm_hint (циклическая зависимость: если сама спектральная оценка
+    неверна, подсказка, посчитанная от неё же, помешала бы найти пики
+    истинной, вдвое большей частоты — см. _collapse_alternating_low_
+    prominence_peaks в detect_pulse_peaks, которая решает проблему
+    дикротической выемки БЕЗ этой зависимости, через prominence)."""
+    signal = np.asarray(signal, dtype=float)
+    peaks = detect_pulse_peaks(signal, fps)
+    if len(peaks) < 2:
+        return None, peaks
+    peaks_sub = refine_peaks_subsample(signal, peaks)
+    ibi_ms = compute_ibi_ms(peaks_sub, fps)
+    if len(ibi_ms) == 0:
+        return None, peaks_sub
+    return float(60000.0 / np.mean(ibi_ms)), peaks_sub
+
+
+def cross_check_spectral_vs_peaks(
+    bpm_spectral: float,
+    signal: np.ndarray,
+    fps: float,
+    band_hz: tuple[float, float],
+    confidence_ratio: float = 2.0,
+    agreement_confidence_boost: float = 0.1,
+) -> CrossCheckResult:
+    """Задача 46 (заменяет диапазоны отношений из задачи 44 — жёсткие
+    ratio-полосы требовали ручной подгонки границ и на реальных данных
+    либо давали ложные срабатывания (широкий диапазон), либо гасили
+    публикуемость почти двух третей окон (узкий диапазон), см. git history).
+
+    Вместо диапазонов — небольшое множество ФИЗИЧЕСКИ ОСМЫСЛЕННЫХ
+    кандидатов вокруг самой спектральной оценки f = bpm_spectral/60:
+    {f, 2f, f/2 (если ещё в физиологической полосе band_hz)} — отброшенных
+    за пределы band_hz. Выбирается кандидат, ближайший к независимой
+    оценке peak_hr по пикам ЭТОГО ЖЕ сигнала — расстояние |ln(candidate /
+    peak_hz)| (логарифм — чтобы "вдвое выше" и "вдвое ниже" были
+    симметричны по модулю, а не 2.0 против 0.5).
+
+    Требование уверенности: если у ближайшего кандидата |ln(...)| не хотя
+    бы в confidence_ratio (2x) раз меньше, чем у следующего по близости —
+    выбор считается неоднозначным (verdict="ambiguous"). Тогда bpm
+    остаётся исходным (bpm_spectral) — НЕ гадаем между близкими
+    альтернативами — но is_bpm_reliable=True: неуверенный выбор НЕ должен
+    сам по себе гасить публикуемость окна, если остальной SQI в порядке
+    (см. RPPGPipeline._compute_estimate — is_publishable больше не
+    зависит от cross_check вообще, только от sqi.is_reliable)."""
+    peak_hr, peaks_sub = mean_hr_from_peaks_in_window(signal, fps)
+
+    if peak_hr is None or not np.isfinite(bpm_spectral) or bpm_spectral <= 0:
+        return CrossCheckResult(
+            verdict="insufficient_peaks", bpm=bpm_spectral, ratio=None,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
+        )
+
+    low_hz, high_hz = band_hz
+    f_hz = bpm_spectral / 60.0
+    peak_hz = peak_hr / 60.0
+    ratio = peak_hr / bpm_spectral
+
+    candidates_hz = [f_hz, 2.0 * f_hz]
+    if f_hz / 2.0 >= low_hz:
+        candidates_hz.append(f_hz / 2.0)
+    candidates_hz = [c for c in candidates_hz if low_hz <= c <= high_hz]
+
+    if not candidates_hz or peak_hz <= 0:
+        return CrossCheckResult(
+            verdict="insufficient_peaks", bpm=bpm_spectral, ratio=ratio,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
+        )
+
+    distances = [abs(float(np.log(c / peak_hz))) for c in candidates_hz]
+    order = sorted(range(len(candidates_hz)), key=lambda i: distances[i])
+    best_hz = candidates_hz[order[0]]
+    best_dist = distances[order[0]]
+
+    confident = True
+    if len(order) >= 2:
+        second_dist = distances[order[1]]
+        confident = (best_dist == 0.0) or (second_dist >= confidence_ratio * best_dist)
+
+    if not confident:
+        return CrossCheckResult(
+            verdict="ambiguous", bpm=bpm_spectral, ratio=ratio,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=False, peaks_ok_for_ibi=False, confidence_boost=0.0,
+        )
+
+    corrected_bpm = best_hz * 60.0
+    if abs(best_hz - f_hz) < 1e-9:
+        return CrossCheckResult(
+            verdict="agreement", bpm=corrected_bpm, ratio=ratio,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=agreement_confidence_boost,
+        )
+    if abs(best_hz - 2.0 * f_hz) < 1e-9:
+        return CrossCheckResult(
+            verdict="corrected_to_2f", bpm=corrected_bpm, ratio=ratio,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=0.0,
+        )
+    return CrossCheckResult(
+        verdict="corrected_to_half_f", bpm=corrected_bpm, ratio=ratio,
+        mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+        is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=0.0,
+    )
 
 
 def refine_peaks_subsample(signal: np.ndarray, peaks: np.ndarray) -> np.ndarray:
@@ -292,6 +486,22 @@ def _finalize_hrv_features(
             )
 
     td = hrv_time_domain(ibi_ms, valid_mask, pnn_threshold_ms, pnn20_threshold_ms)
+
+    # Задача 44, часть 3: жёсткие физиологические границы, БЕЗУСЛОВНО (вне
+    # зависимости от artifact_fraction — тот отсекает ТОЛЬКО долю отбракованных
+    # интервалов, а не проверяет правдоподобие итоговой сводной метрики).
+    # RMSSD>200мс или pNN50>50% при пульсе выше 100 BPM физиологически
+    # невозможны — это верный признак систематической ошибки детектора пиков
+    # (например, дикротическая выемка, принятая за отдельный удар), а не
+    # реальной аритмии, которую эта система не диагностирует.
+    if publishable and np.isfinite(td["mean_hr_bpm"]) and td["mean_hr_bpm"] > 100:
+        if td["rmssd_ms"] > 200.0 or td["pnn50_pct"] > 50.0:
+            publishable = False
+            warnings.append(
+                f"Физиологически невозможная комбинация при пульсе {td['mean_hr_bpm']:.0f} BPM: "
+                f"RMSSD={td['rmssd_ms']:.0f}мс, pNN50={td['pnn50_pct']:.0f}% — HRV не публикуется "
+                "(задача 44, часть 3)."
+            )
 
     fd = dict(lf_power=None, hf_power=None, lf_hf_ratio=None)
     if compute_frequency_domain and publishable:

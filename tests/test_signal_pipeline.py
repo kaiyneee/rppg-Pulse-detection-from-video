@@ -2104,7 +2104,7 @@ def test_bpm_smoothing_corrects_unconfirmed_subharmonic_using_trusted_history():
         for v in [124.0, 127.0, 126.0]:
             pipe._trusted_bpm_history.append(v)
         cross_check = _make_cross_check_result("ambiguous", 63.0, is_bpm_reliable=False)
-        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(63.0, cross_check)
+        smoothed_bpm, was_smoothed, _hist_insuff = pipe._smooth_bpm_against_trusted_history(63.0, cross_check, entered_history=False)
         print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
         assert was_smoothed
         assert abs(smoothed_bpm - 126.0) < 1.0, f"ожидался ~126 (63*2), получено {smoothed_bpm}"
@@ -2128,7 +2128,7 @@ def test_bpm_smoothing_requires_minimum_history_length():
     try:
         pipe._trusted_bpm_history.append(126.0)
         cross_check = _make_cross_check_result("ambiguous", 63.0, is_bpm_reliable=False)
-        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(63.0, cross_check)
+        smoothed_bpm, was_smoothed, _hist_insuff = pipe._smooth_bpm_against_trusted_history(63.0, cross_check, entered_history=False)
         print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
         assert not was_smoothed
         assert smoothed_bpm == 63.0
@@ -2151,7 +2151,7 @@ def test_bpm_smoothing_does_not_trigger_on_resting_range():
         for v in [62.0, 63.0, 61.5, 62.5]:
             pipe._trusted_bpm_history.append(v)
         cross_check = _make_cross_check_result("ambiguous", 62.1, is_bpm_reliable=False)
-        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(62.1, cross_check)
+        smoothed_bpm, was_smoothed, _hist_insuff = pipe._smooth_bpm_against_trusted_history(62.1, cross_check, entered_history=False)
         print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
         assert not was_smoothed
         assert smoothed_bpm == 62.1
@@ -2160,12 +2160,11 @@ def test_bpm_smoothing_does_not_trigger_on_resting_range():
 
 
 def test_bpm_smoothing_skips_already_corrected_windows_but_updates_history():
-    """Регрессия задачи 46: verdict="corrected_to_2f" (или "corrected_to_half_f")
-    означает, что cross_check УЖЕ исправил bpm по своим собственным данным —
-    сглаживание не должно пересматривать его повторно, но обязано добавить
-    его в историю подтверждённых значений (иначе история никогда бы не
-    росла на реальных, часто "ambiguous" данных)."""
-    print("\n=== Тест: сглаживание не трогает уже исправленные cross_check окна (задача 44) ===")
+    """Регрессия задачи 46/47: с ПУСТОЙ историей (< history_min_windows)
+    сверять ещё не с чем — ЛЮБОЙ verdict (в т.ч. "corrected_to_2f") входит
+    как есть, но обязан добавиться в историю подтверждённых значений
+    (иначе история никогда бы не начала расти)."""
+    print("\n=== Тест: пустая история не пересматривает ни один verdict, но растёт (задача 44/47) ===")
     pipe, skip_reason = _make_pipeline_for_aggregate_test()
     if pipe is None:
         print(f"  [SKIP] {skip_reason}")
@@ -2173,7 +2172,7 @@ def test_bpm_smoothing_skips_already_corrected_windows_but_updates_history():
     try:
         assert len(pipe._trusted_bpm_history) == 0
         cross_check = _make_cross_check_result("corrected_to_2f", 126.0, is_bpm_reliable=True)
-        smoothed_bpm, was_smoothed = pipe._smooth_bpm_against_trusted_history(126.0, cross_check)
+        smoothed_bpm, was_smoothed, _hist_insuff = pipe._smooth_bpm_against_trusted_history(126.0, cross_check, entered_history=True)
         print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed} "
               f"history={list(pipe._trusted_bpm_history)}")
         assert not was_smoothed
@@ -2181,6 +2180,84 @@ def test_bpm_smoothing_skips_already_corrected_windows_but_updates_history():
         assert list(pipe._trusted_bpm_history) == [126.0]
     finally:
         pipe.close()
+
+
+def test_bpm_smoothing_reconsiders_agreement_that_contradicts_established_history():
+    """Регрессия задачи 47 (доказанная на реальных данных "я пульс 125"):
+    "agreement" (оба независимых оценщика — спектр и пики — сошлись на f
+    БЕЗ коррекции) раньше считалось золотым сигналом и никогда не
+    пересматривалось историей. Это оказалось неверно: спектральная оценка
+    и счётчик пиков смотрят на ОДИН и тот же сигнал и могут ОДНОВРЕМЕННО
+    соскользнуть на одну и ту же гармонику — "agreement" на вдвое заниженном
+    значении на фоне уже твёрдо установленной истории (~125, 4+
+    подтверждённых окна) должно переворачиваться так же, как и любой
+    другой verdict, а не слепо анкерить историю на неверном значении."""
+    print("\n=== Тест: agreement пересматривается, если противоречит установленной истории (задача 47) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+    try:
+        for v in [125.2, 125.2, 126.1, 124.3]:
+            pipe._trusted_bpm_history.append(v)
+        cross_check = _make_cross_check_result("agreement", 63.0, is_bpm_reliable=True)
+        smoothed_bpm, was_smoothed, _hist_insuff = pipe._smooth_bpm_against_trusted_history(63.0, cross_check, entered_history=True)
+        print(f"  smoothed_bpm={smoothed_bpm:.1f} was_smoothed={was_smoothed}")
+        assert was_smoothed, "agreement, противоречащий твёрдой истории вдвое, должен быть перевёрнут"
+        assert abs(smoothed_bpm - 126.0) < 2.0, f"ожидался ~126 (63*2), получено {smoothed_bpm}"
+    finally:
+        pipe.close()
+
+
+def test_apply_history_ratio_check_reports_insufficient_history():
+    """Регрессия задачи 48: apply_history_ratio_check — общая функция между
+    потоковым первым проходом (RPPGPipeline._smooth_bpm_against_trusted_history)
+    и вторым (офлайн) проходом scripts/run_on_video.py. С историей короче
+    min_windows решение не принимается вообще (history_was_insufficient=True,
+    bpm не меняется) — ЭТО и есть флаг, по которому второй проход отбирает
+    окна для пересмотра."""
+    print("\n=== Тест: apply_history_ratio_check сообщает о недостаточной истории (задача 48) ===")
+    from rppg.pipeline import apply_history_ratio_check
+
+    bpm, was_smoothed, insufficient = apply_history_ratio_check(63.0, [125.0], min_windows=3)
+    print(f"  bpm={bpm} was_smoothed={was_smoothed} insufficient={insufficient}")
+    assert insufficient
+    assert not was_smoothed
+    assert bpm == 63.0
+
+
+def test_apply_history_ratio_check_flips_against_full_history():
+    """Регрессия задачи 48: с историей >= min_windows, ясно указывающей на
+    вдвое большее значение, apply_history_ratio_check переворачивает bpm и
+    сообщает history_was_insufficient=False — это ровно то решение, которое
+    второй проход применяет задним числом к окнам первого прохода,
+    которым не хватило истории (например, самое первое окно записи)."""
+    print("\n=== Тест: apply_history_ratio_check переворачивает по полной истории (задача 48) ===")
+    from rppg.pipeline import apply_history_ratio_check
+
+    bpm, was_smoothed, insufficient = apply_history_ratio_check(
+        67.5, [125.2, 126.1, 124.3, 127.8], min_windows=3,
+    )
+    print(f"  bpm={bpm:.1f} was_smoothed={was_smoothed} insufficient={insufficient}")
+    assert not insufficient
+    assert was_smoothed
+    assert abs(bpm - 135.0) < 1.0, f"ожидался ~135 (67.5*2), получено {bpm}"
+
+
+def test_apply_history_ratio_check_does_not_flip_consistent_value():
+    """Регрессия задачи 48 (симметричная проверка — предотвращает ложные
+    удвоения второго прохода на записи покоя): если значение УЖЕ близко к
+    полной истории, apply_history_ratio_check не должен его трогать."""
+    print("\n=== Тест: apply_history_ratio_check не трогает согласованное значение (задача 48) ===")
+    from rppg.pipeline import apply_history_ratio_check
+
+    bpm, was_smoothed, insufficient = apply_history_ratio_check(
+        62.1, [63.0, 62.0, 64.8, 61.3], min_windows=3,
+    )
+    print(f"  bpm={bpm:.1f} was_smoothed={was_smoothed} insufficient={insufficient}")
+    assert not insufficient
+    assert not was_smoothed
+    assert bpm == 62.1
 
 
 def test_skin_mask_cached_per_step_not_recomputed_every_frame():
@@ -2756,6 +2833,10 @@ def run_all():
         test_bpm_smoothing_requires_minimum_history_length,
         test_bpm_smoothing_does_not_trigger_on_resting_range,
         test_bpm_smoothing_skips_already_corrected_windows_but_updates_history,
+        test_bpm_smoothing_reconsiders_agreement_that_contradicts_established_history,
+        test_apply_history_ratio_check_reports_insufficient_history,
+        test_apply_history_ratio_check_flips_against_full_history,
+        test_apply_history_ratio_check_does_not_flip_consistent_value,
         test_lf_hf_require_separate_minimum_durations,
         test_respiration_rate_from_amplitude_modulation,
         test_skin_mask_cached_per_step_not_recomputed_every_frame,

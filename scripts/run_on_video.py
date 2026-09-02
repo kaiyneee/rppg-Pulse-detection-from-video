@@ -9,15 +9,31 @@ result.config.yaml) — п.42 требований: "каждая строчка
 должна быть привязана к конкретному конфигу", а не к неявному состоянию
 кода/CLI-флагов на момент запуска.
 
+Задача 48 (двухпроходный режим): --two-pass включён по умолчанию —
+единственное расхождение между "я пульс 125" (истина требует коррекции
+первого окна) и "я обычное" (не требует) — это пустая история в самом
+начале записи, и по ОДНОМУ окну без контекста они математически
+неразличимы (доказанный предел причинного правила, см. задачи 46/47). Для
+уже ЗАПИСАННОГО видео этого предела нет — файл можно пройти дважды: первый
+проход как обычно (причинно, вперёд по времени, копит историю
+подтверждённых окон), второй — без пересчёта сигнала и БЕЗ какого-либо
+усреднения по времени — просто заново применяет то же самое правило
+коррекции (apply_history_ratio_check) к тем окнам, которым в первом
+проходе не хватило истории для решения, используя итоговую историю
+целиком. В scripts/run_webcam.py (реальное время) такого флага нет и не
+может быть — там причинность обязательна.
+
 Использование:
     python scripts/run_on_video.py --video path/to/video.mp4 --out result.csv
     python scripts/run_on_video.py --video path/to/video.mp4 --config my_experiment.yaml --out result.csv
+    python scripts/run_on_video.py --video path/to/video.mp4 --out result.csv --no-two-pass
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -27,7 +43,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
 from rppg.config_io import load_config, save_config
-from rppg.pipeline import RPPGPipeline
+from rppg.pipeline import RPPGPipeline, apply_history_ratio_check
+from rppg.structured_log import read_jsonl_records
+
+
+def _patch_jsonl_second_pass(log_path: str, corrections: dict[int, float]) -> None:
+    """Задача 48: JSONL уже записан ПОТОКОВО (по одному окну за раз) во
+    время первого прохода — раньше второго прохода просто не существовало,
+    переписывать в момент записи было нечего. Здесь файл читается целиком
+    и правится ТОЧЕЧНО: только bpm и pass_that_decided у окон из
+    corrections (timestamp_ms -> новый bpm), остальные поля (включая
+    bpm_aggregate — задача 48 явно не пересчитывает агрегат задним числом,
+    только само решение о коррекции) остаются такими, какими их видел
+    первый проход."""
+    headers, records = read_jsonl_records(log_path)
+    for record in records:
+        ts = record.get("timestamp_ms")
+        if ts in corrections:
+            record["bpm"] = corrections[ts]
+            record["pass_that_decided"] = 2
+    with open(log_path, "w", encoding="utf-8") as f:
+        for obj in headers:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        for obj in records:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
@@ -50,6 +89,13 @@ def main() -> None:
         help="Дозаписать в существующий --log вместо перезаписи (задача 26; по умолчанию файл "
              "перезаписывается — прошлый баг молча склеивал записи от разных прогонов/конфигов).",
     )
+    parser.add_argument(
+        "--two-pass", action=argparse.BooleanOptionalAction, default=True,
+        help="Задача 48: второй проход пересматривает (БЕЗ пересчёта сигнала и без усреднения по "
+             "времени) окна, которым в первом (причинном) проходе не хватило истории для решения о "
+             "коррекции, используя итоговую историю целиком. Включён по умолчанию для офлайн-обработки; "
+             "--no-two-pass — прежнее строго причинное поведение.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config) if args.config else PipelineConfig()
@@ -68,8 +114,15 @@ def main() -> None:
 
     rows = []
     frame_idx = 0
+    n_reconsidered = 0
+    n_changed = 0
+    jsonl_corrections: dict[int, float] = {}
 
-    with RPPGPipeline(config, log_path=args.log, log_append=args.append) as pipeline:
+    # Задача 48: --two-pass читает history_was_insufficient/cross_check
+    # ЧЕРЕЗ debug=True (см. pipeline.DebugInfo) — это НЕ часть публичного
+    # контракта PTSDPulseFeatures, только диагностическая надстройка,
+    # существующая именно для таких офлайн-скриптов.
+    with RPPGPipeline(config, log_path=args.log, log_append=args.append, debug=args.two_pass) as pipeline:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -80,7 +133,31 @@ def main() -> None:
                 rows.append(result)
             frame_idx += 1
 
+        if args.two_pass:
+            # Второй проход: сигнал НЕ пересчитывается (никаких новых
+            # process_frame), никакого усреднения по времени — только
+            # повторное применение ТОГО ЖЕ правила коррекции
+            # (apply_history_ratio_check, общего с потоковым первым
+            # проходом) к окнам с history_was_insufficient=True, теперь
+            # против итоговой истории, накопленной за ВЕСЬ первый проход.
+            final_history = list(pipeline._trusted_bpm_history)
+            min_windows = pipeline.cfg.frequency.history_min_windows
+            for r in rows:
+                if r.debug is None or not r.debug.history_was_insufficient:
+                    continue
+                n_reconsidered += 1
+                new_bpm, _was_smoothed, _still_insufficient = apply_history_ratio_check(
+                    r.bpm, final_history, min_windows,
+                )
+                jsonl_corrections[r.timestamp_ms] = new_bpm
+                if new_bpm != r.bpm:
+                    n_changed += 1
+                    r.bpm = new_bpm
+
     cap.release()
+
+    if args.two_pass and args.log and jsonl_corrections:
+        _patch_jsonl_second_pass(args.log, jsonl_corrections)
 
     out_path = Path(args.out)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -121,6 +198,9 @@ def main() -> None:
 
     n_publishable = sum(1 for r in rows if r.publishable)
     print(f"Обработано окон: {len(rows)}, из них publishable (SQI ok): {n_publishable}")
+    if args.two_pass:
+        print(f"Второй проход: пересмотрено окон (недостаточная история в первом проходе) — "
+              f"{n_reconsidered}, из них изменено значение bpm — {n_changed}")
     print(f"Результат сохранён в {out_path}")
     print(f"Конфиг эксперимента сохранён в {config_out_path}")
 

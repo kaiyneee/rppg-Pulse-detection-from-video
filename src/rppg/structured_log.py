@@ -101,6 +101,35 @@ class WindowLogRecord:
     bpm_aggregate_status: str = "no_data"
     bpm_aggregate_n_windows: int = 0
     bpm_aggregate_spread_bpm: float = float("nan")
+    # Задача 44: результат кросс-проверки спектральной оценки BPM по пикам
+    # того же сигнала — "agreement" | "corrected_to_2f" | "corrected_to_half_f" |
+    # "ambiguous" | "insufficient_peaks" (см. hrv.features.CrossCheckResult).
+    # cross_check_ratio = mean_hr_from_peaks / bpm_spectral (ДО коррекции),
+    # None при verdict="insufficient_peaks".
+    cross_check_verdict: str = "insufficient_peaks"
+    cross_check_ratio: float | None = None
+    cross_check_mean_hr_from_peaks: float | None = None
+    # Задача 44 (сглаживание после cross-check): True, если bpm скорректирован
+    # НЕ самим cross_check (тот не смог подтвердить по своим пикам в этом
+    # окне), а по медиане недавних ПОДТВЕРЖДЁННЫХ окон — см.
+    # RPPGPipeline._smooth_bpm_against_trusted_history.
+    bpm_was_smoothed: bool = False
+    # Задача 47: допущено ли ЭТО окно в опорную историю кросс-проверки/
+    # сглаживания (window_status=="ok" И spectral_snr_db>=history_min_snr_db
+    # И cross_check_verdict!="ambiguous") — ОТДЕЛЬНО от валидности кадра
+    # ROI. history_rejection_reason — почему нет, None если entered_history.
+    entered_history: bool = False
+    history_rejection_reason: str | None = None
+    # Задача 48 (двухпроходный офлайн-режим): True, если решение о
+    # коррекции ЭТОГО окна было принято при истории короче
+    # FrequencyConfig.history_min_windows (см. RPPGPipeline._smooth_bpm_
+    # against_trusted_history / apply_history_ratio_check) — кандидат на
+    # пересмотр вторым проходом в scripts/run_on_video.py --two-pass.
+    # pass_that_decided — 1 (обычный причинный проход) или 2 (значение
+    # пересмотрено вторым проходом по итоговой истории целиком). В
+    # потоковом (веб-камера) режиме всегда 1 — там причинность обязательна.
+    history_was_insufficient: bool = False
+    pass_that_decided: int = 1
 
     def to_json_line(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

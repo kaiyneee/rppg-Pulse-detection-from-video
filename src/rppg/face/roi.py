@@ -210,43 +210,83 @@ def build_skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
     return mask.astype(np.uint8)
 
 
-def roi_mean_rgb(frame_bgr: np.ndarray, mask: np.ndarray, min_valid_fraction: float = 0.6) -> tuple[np.ndarray | None, bool]:
-    """Робастная оценка R,G,B по маске (медиана, не среднее). Возвращает
-    (rgb[3] | None, valid).
+def roi_mean_rgb(
+    frame_bgr: np.ndarray,
+    mask: np.ndarray,
+    min_valid_fraction: float = 0.6,
+    trim_fraction: float = 0.10,
+) -> tuple[np.ndarray | None, bool, int]:
+    """Робастная оценка R,G,B по маске: усечённое среднее (truncated mean),
+    НЕ медиана. Возвращает (rgb[3] | None, valid, n_valid_pixels).
 
-    Медиана вместо среднего: покадровый яркостный порог (good = не клиппинг)
-    отсекает переменную долю пикселей ROI (блик может убрать 30% пикселей за
-    один кадр) — при усреднении это даёт скачок среднего, не связанный с
-    пульсом, а связанный только с тем, ЧТО именно вошло в выборку в этом
-    кадре. Медиана устойчива к такой смене состава выборки, пока
-    большинство пикселей остаётся валидным.
+    Задача 31 (2026-08-20) отменяет более раннее решение в пользу медианы,
+    закреплённое в предыдущей версии этой функции — тот выбор был ошибкой.
+    Пульсовая модуляция яркости кожи — это ~0.1-0.5% DC-компоненты
+    (~0.15-0.75 уровня из 256 при 8-битном АЦП). Пространственное
+    усреднение по тысячам пикселей ROI снижает шум квантования в sqrt(N)
+    раз, поднимая сигнал далеко выше шумового порога отдельного пикселя —
+    но у МЕДИАНЫ пиксельных значений на целочисленной сетке нет этого
+    преимущества: она сама квантована на ту же целочисленную сетку и
+    отражает плавный сдвиг среднего на 0.3-0.5 уровня СТУПЕНЬКОЙ (меняется
+    только когда пересекает целочисленную границу), уничтожая как раз тот
+    непрерывный сигнал, ради сохранения которого делалось усреднение по
+    площади. Плюс медиана асимптотически ~1.57x менее эффективна среднего
+    для нормального шума (ARE = 2/pi). Усечённое среднее убирает выбросы
+    (блики/тени/клиппинг сенсора) почти так же надёжно, как медиана, но
+    остаётся НЕПРЕРЫВНОЙ функцией входа.
+
+    trim_fraction — ФИКСИРОВАННАЯ доля пикселей, отбрасываемых с каждого
+    конца по яркости (не зависит от яркостного порога клиппинга ниже) —
+    иначе эффективная доля усечения плавает вместе с составом кадра, и
+    возвращается ровно та же "смена состава выборки двигает оценку"
+    проблема, только на другом уровне. Усечение общее для R/G/B (по рангу
+    ЯРКОСТИ пикселя, не по рангу каждого канала отдельно) — так триплет
+    BGR одного физического пикселя либо весь остаётся в выборке, либо весь
+    из неё выбрасывается.
+
+    Считается в float64 (не float32) — усечённое среднее по тысячам
+    пикселей само по себе устойчиво к суммарной ошибке округления float32,
+    но не даёт повода терять точность там, где она достаётся бесплатно.
 
     valid=False, если после исключения переэкспонированных/недоэкспонированных
     пикселей (типичный артефакт при бликах/тенях) валидных пикселей осталось
     меньше min_valid_fraction от площади ROI — тогда кадр не должен тянуть
     оценку ROI в сторону артефакта, а должен считаться отсутствующим
     (см. preprocessing.interpolate_missing).
+
+    n_valid_pixels отдаётся наружу отдельно: резкое изменение состава ROI
+    между кадрами (окклюзия, поворот головы) — самостоятельный повод
+    пометить кадр невалидным, ДАЖЕ если min_valid_fraction формально
+    пройдена (см. RPPGPipeline._check_valid_pixel_count_stability, задача 31).
     """
     ys, xs = np.where(mask > 0)
     if len(ys) == 0:
-        return None, False
+        return None, False, 0
 
-    pixels = frame_bgr[ys, xs].astype(np.float32)  # (K,3) BGR
+    pixels = frame_bgr[ys, xs].astype(np.float64)  # (K,3) BGR, float64
     brightness = pixels.mean(axis=1)
     good = (brightness > 10) & (brightness < 250)  # отсекаем клиппинг
+    n_valid = int(good.sum())
 
-    if good.sum() < min_valid_fraction * len(ys):
-        return None, False
+    if n_valid < min_valid_fraction * len(ys):
+        return None, False, n_valid
 
-    median_bgr = np.median(pixels[good], axis=0)
-    median_rgb = median_bgr[::-1].copy()  # BGR -> RGB
-    return median_rgb, True
+    good_pixels = pixels[good]
+    good_brightness = brightness[good]
+    order = np.argsort(good_brightness)
+    trim_n = int(len(order) * trim_fraction)
+    trimmed_idx = order[trim_n: len(order) - trim_n] if 2 * trim_n < len(order) else order
+
+    mean_bgr = good_pixels[trimmed_idx].mean(axis=0)
+    mean_rgb = mean_bgr[::-1].copy()  # BGR -> RGB
+    return mean_rgb, True, n_valid
 
 
 @dataclass
 class ROIExtractionResult:
     rgb_by_roi: dict[str, np.ndarray | None]
     valid_by_roi: dict[str, bool]
+    valid_pixel_count_by_roi: dict[str, int]  # задача 31 — для проверки стабильности состава ROI
     landmarks_px: np.ndarray
     stable_tracking_points: np.ndarray  # (len(STABLE_TRACKING_IDX), 2)
     interocular_distance_px: float  # п.19 — абсолютный масштаб лица
@@ -260,18 +300,33 @@ def extract_rois(
     roi_names: tuple[str, ...] = ("forehead", "left_cheek", "right_cheek"),
     shrink_factor: float = 0.9,
     min_valid_fraction: float = 0.6,
+    trim_fraction: float = 0.10,
+    skin_mask: np.ndarray | None = None,
 ) -> ROIExtractionResult:
+    """skin_mask: если задан, используется вместо пересчёта build_skin_mask
+    на каждый кадр (задача 34) — маска кожи, посчитанная по одному кадру,
+    имеет ту же проблему "меняющегося состава выборки", что и медиана в
+    задаче 31: шум/блик/лёгкий поворот головы меняют бинарное решение
+    "кожа/не кожа" по краю маски кадр к кадру, и это никак не связано с
+    пульсом. RPPGPipeline кэширует маску, посчитанную по медианному кадру
+    последнего шага (см. RPPGPipeline._refresh_skin_mask_cache), и
+    передаёт её сюда фиксированной на весь шаг. None (по умолчанию)
+    сохраняет прежнее поведение "посчитать заново по этому кадру" — нужно
+    для прямых юнит-тестов extract_rois без пайплайна."""
     landmarks_px = landmarks_to_pixels(landmarks_norm, frame_bgr.shape)
-    skin_mask = build_skin_mask(frame_bgr)
+    if skin_mask is None:
+        skin_mask = build_skin_mask(frame_bgr)
 
     rgb_by_roi: dict[str, np.ndarray | None] = {}
     valid_by_roi: dict[str, bool] = {}
+    valid_pixel_count_by_roi: dict[str, int] = {}
     for name in roi_names:
         mask = build_roi_mask(landmarks_px, name, frame_bgr.shape, shrink_factor)
         mask = mask & skin_mask
-        rgb, valid = roi_mean_rgb(frame_bgr, mask, min_valid_fraction)
+        rgb, valid, n_valid = roi_mean_rgb(frame_bgr, mask, min_valid_fraction, trim_fraction)
         rgb_by_roi[name] = rgb
         valid_by_roi[name] = valid
+        valid_pixel_count_by_roi[name] = n_valid
 
     stable_points = landmarks_px[STABLE_TRACKING_IDX].astype(np.float64)
     ipd = interocular_distance_px(landmarks_px)
@@ -281,11 +336,12 @@ def extract_rois(
     bg_mask = build_background_roi_mask(frame_bgr.shape, landmarks_px)
     if bg_mask is not None:
         # Фон намеренно БЕЗ skin_mask — это не кожа, и порог кожи отсеял бы его целиком.
-        background_rgb, background_valid = roi_mean_rgb(frame_bgr, bg_mask, min_valid_fraction)
+        background_rgb, background_valid, _ = roi_mean_rgb(frame_bgr, bg_mask, min_valid_fraction, trim_fraction)
 
     return ROIExtractionResult(
         rgb_by_roi=rgb_by_roi,
         valid_by_roi=valid_by_roi,
+        valid_pixel_count_by_roi=valid_pixel_count_by_roi,
         landmarks_px=landmarks_px,
         stable_tracking_points=stable_points,
         interocular_distance_px=ipd,

@@ -99,6 +99,15 @@ class DebugInfo:
     # (см. scripts/dump_spectrum.py) — bpm_freq_estimate нужен, чтобы не
     # диагностировать выбор пика по спектру, который его не выбирал.
     bpm_freq_estimate: FrequencyEstimate | None = None
+    # Задача 48 (двухпроходный офлайн-режим): полный результат cross-check
+    # этого окна и флаг "решение о коррекции принято при истории короче
+    # history_min_windows" — offline-скрипт (scripts/run_on_video.py)
+    # использует ИМЕННО эти два поля, чтобы понять, какие окна стоит
+    # пересмотреть вторым проходом по УЖЕ накопленной (после первого
+    # прохода) истории. Доступно только при debug=True — не часть
+    # публичного контракта PTSDPulseFeatures.
+    cross_check: CrossCheckResult | None = None
+    history_was_insufficient: bool = False
 
 
 @dataclass
@@ -271,6 +280,42 @@ class _RingBuffer:
                 dq.popleft()
             for dq in self.valid_by_roi.values():
                 dq.popleft()
+
+
+def apply_history_ratio_check(
+    current_bpm: float,
+    reference_history: list[float] | tuple[float, ...],
+    min_windows: int,
+    min_ratio: float = 1.7,
+    max_ratio: float = 2.3,
+) -> tuple[float, bool, bool]:
+    """Задача 44/46/47/48: единственное место, где решается "отличается ли
+    current_bpm вдвое от опорной истории — перевернуть". Вынесено в
+    отдельную МОДУЛЬНУЮ (не привязанную к состоянию self._trusted_bpm_history)
+    функцию задачей 48: двухпроходный офлайн-режим (scripts/run_on_video.py)
+    пересматривает окна ПОСЛЕ первого прохода целиком, с уже готовой
+    итоговой историей, а не через живое состояние потокового
+    RPPGPipeline — нужна одна и та же логика, вызываемая и изнутри
+    пайплайна (см. RPPGPipeline._smooth_bpm_against_trusted_history), и
+    напрямую из офлайн-скрипта на втором проходе.
+
+    Возвращает (bpm, was_smoothed, history_was_insufficient) —
+    history_was_insufficient=True означает "сверять было не с чем"
+    (len(reference_history) < min_windows) — именно эти окна задача 48
+    помечает как кандидатов для пересмотра вторым проходом."""
+    if len(reference_history) < min_windows or not np.isfinite(current_bpm) or current_bpm <= 0:
+        return current_bpm, False, True
+
+    reference = float(np.median(reference_history))
+    if reference <= 0:
+        return current_bpm, False, True
+
+    ratio = reference / current_bpm
+    if min_ratio <= ratio <= max_ratio:
+        return current_bpm * 2.0, True, False
+    if min_ratio <= (1.0 / ratio) <= max_ratio:
+        return current_bpm / 2.0, True, False
+    return current_bpm, False, False
 
 
 class RPPGPipeline:
@@ -1048,10 +1093,11 @@ class RPPGPipeline:
         self,
         current_bpm: float,
         cross_check: CrossCheckResult,
-        min_ratio: float = 1.8,
-        max_ratio: float = 2.2,
-    ) -> tuple[float, bool]:
-        """Задача 44/46 (сглаживание по истории — ОТДЕЛЬНЫЙ слой ПОВЕРХ
+        entered_history: bool,
+        min_ratio: float = 1.7,
+        max_ratio: float = 2.3,
+    ) -> tuple[float, bool, bool]:
+        """Задача 44/46/47 (сглаживание по истории — ОТДЕЛЬНЫЙ слой ПОВЕРХ
         cross_check_spectral_vs_peaks; сам cross-check НЕ трогается, см.
         self._trusted_bpm_history).
 
@@ -1064,35 +1110,58 @@ class RPPGPipeline:
         к 2f, чем часть настоящих исправлений на "я пульс 125"
         (|ln(peak/2f)|=0.114-0.196) — по ОДНОМУ окну эти случаи неразличимы
         никаким порогом близости, различает их только контекст соседних
-        окон. Поэтому теперь пересматриваются ЛЮБЫЕ verdict, КРОМЕ
-        "agreement" (оба независимых оценщика сошлись на самой f — это
-        единственный по-настоящему золотой сигнал, не подлежащий пересмотру
-        историей): если результат cross_check вдвое отличается от МЕДИАНЫ
-        последних ПОДТВЕРЖДЁННЫХ значений — переворачивается (даже отменяя
-        решение cross_check), если совпадает с историей — остаётся и сам
-        пополняет её.
+        окон. Поэтому пересматриваются ЛЮБЫЕ verdict.
 
-        Возвращает (bpm, was_smoothed)."""
-        if cross_check.verdict == "agreement":
-            self._trusted_bpm_history.append(current_bpm)
-            return current_bpm, False
+        ПЕРЕСМОТРЕНО ЕЩЁ РАЗ по итогам задачи 47 (вторая эмпирическая
+        находка, серьёзнее первой): "agreement" ТОЖЕ пересматривается, а не
+        освобождена от проверки. Первая версия этой правки считала
+        "agreement" золотым сигналом (оба независимых оценщика сошлись на f
+        БЕЗ коррекции) и никогда не пересматривала его — это оказалось
+        неверно: на "я пульс 125" при уже ТВЁРДО установленной истории
+        (~125, 4+ подтверждённых окна подряд) встретилось одиночное
+        "agreement"=63.0 — оба оценщика ОДНОВРЕМЕННО и ОШИБОЧНО сошлись на
+        вдвое заниженном значении (сама спектральная оценка соскользнула на
+        f/2, а независимый счётчик пиков — на такое же заниженное число
+        пиков) — это "agreement" было слепо добавлено в историю БЕЗ
+        проверки и мгновенно её испортило, после чего сглаживание начало
+        откатывать ПРАВИЛЬНЫЕ последующие corrected_to_2f обратно к
+        неверному значению. "Оба независимых оценщика согласны" — сильный,
+        но не непогрешимый сигнал: спектральная оценка и счётчик пиков
+        смотрят на ОДИН и тот же сигнал и могут синхронно соскользнуть на
+        одну и ту же гармонику. Теперь любой verdict, включая "agreement",
+        сверяется с историей ОДИНАКОВО: если больше min_windows
+        подтверждённых точек и текущее значение вдвое отличается от их
+        медианы — переворачивается. Пока история пуста/короче min_windows
+        (холодный старт, где сверять не с чем) — ничего не пересматривается,
+        первые точки входят как есть, ниже это работает само собой через
+        условие len(history) >= min_windows.
 
-        smoothed_bpm = current_bpm
-        was_smoothed = False
-        if len(self._trusted_bpm_history) >= 2 and np.isfinite(current_bpm) and current_bpm > 0:
-            reference = float(np.median(self._trusted_bpm_history))
-            if reference > 0:
-                ratio = reference / current_bpm
-                if min_ratio <= ratio <= max_ratio:
-                    smoothed_bpm = current_bpm * 2.0
-                    was_smoothed = True
-                elif min_ratio <= (1.0 / ratio) <= max_ratio:
-                    smoothed_bpm = current_bpm / 2.0
-                    was_smoothed = True
+        entered_history (см. _compute_estimate) — ОТДЕЛЬНЫЙ от valid-кадра
+        порогов (ROIConfig, задачи 31/34) критерий допуска ИМЕННО В ЭТУ
+        ИСТОРИЮ, вычисленный ВНЕ этой функции: window_status=="ok" И
+        spectral_snr_db >= history_min_snr_db И verdict=="agreement".
+        Управляет только тем, ПОПОЛНЯЕТ ли (уже, возможно, перевёрнутое)
+        значение ЭТОГО окна историю для будущих окон — не тем, проверяется
+        ли ОНО САМО против существующей истории (это происходит всегда).
 
-        if cross_check.is_bpm_reliable or was_smoothed:
+        Минимум history_min_windows (по умолчанию 3, FrequencyConfig) —
+        если в истории меньше, коррекция не применяется вообще (вырождается
+        в строгое поведение без сглаживания, а не в угадывание по 1-2 точкам).
+        Задача 48: именно эти "меньше" случаи возвращаются с
+        history_was_insufficient=True — офлайн-скрипт использует этот флаг,
+        чтобы знать, какие окна стоит пересмотреть вторым проходом по уже
+        накопленной (после первого прохода) истории целиком (см.
+        apply_history_ratio_check выше — общая с этим методом логика).
+
+        Возвращает (bpm, was_smoothed, history_was_insufficient)."""
+        min_windows = self.cfg.frequency.history_min_windows
+        smoothed_bpm, was_smoothed, history_was_insufficient = apply_history_ratio_check(
+            current_bpm, list(self._trusted_bpm_history), min_windows, min_ratio, max_ratio,
+        )
+
+        if entered_history:
             self._trusted_bpm_history.append(smoothed_bpm)
-        return smoothed_bpm, was_smoothed
+        return smoothed_bpm, was_smoothed, history_was_insufficient
 
     def _update_ibi_log(self, cross_check: CrossCheckResult, timestamps_ms) -> None:
         """Инкрементально пополняет накопитель IBI новыми (ранее не
@@ -1415,6 +1484,22 @@ class RPPGPipeline:
                     lam=self.cfg.filt.tarvainen_lambda,
                 )
 
+        # Задача 21: явная классификация вырожденных окон — раньше окно с
+        # best_snr_db=-inf (сигнал короче 8 отсчётов или std < 1e-10, см.
+        # quality.compute_psd) тихо получало status="ok" с провальным SQI и
+        # молча выпадало из перцентилей analyze_log.py ("N inf/nan
+        # исключено") без объяснения ПОЧЕМУ. window_status идёт ТОЛЬКО в
+        # WindowLogRecord (JSONL/CSV) — публичный PTSDPulseFeatures.status
+        # остаётся ok/no_signal, это отдельный документированный контракт.
+        # Задача 47: посчитан ЗДЕСЬ (раньше — после cross_check/сглаживания),
+        # т.к. теперь нужен ДО них для критерия entered_history.
+        if len(best_signal) < 8:
+            window_status = "too_short"
+        elif not np.isfinite(best_snr_db):
+            window_status = "degenerate_signal"
+        else:
+            window_status = "ok"
+
         # Задача 44/46: кросс-проверка спектральной оценки BPM по пикам
         # ТОГО ЖЕ best_signal — КАЖДОЕ окно, не только раз в минуту для
         # HRV (см. _cross_check_bpm/cross_check_spectral_vs_peaks).
@@ -1436,12 +1521,58 @@ class RPPGPipeline:
             )
         current_bpm = cross_check.bpm
 
-        # Задача 44 (сглаживание после cross-check): отдельный, более
-        # агрессивный слой ПОВЕРХ уже исправленных окон — см. docstring
+        # Задача 47: допуск ИЗМЕРЕНИЯ этого окна в опорную историю
+        # кросс-проверки/сглаживания — ОТДЕЛЬНЫЙ от валидности кадров ROI
+        # (ROIConfig.max_valid_pixel_count_change_fraction/
+        # max_skin_mask_pass_fraction_change, задачи 31/34) критерий.
+        # Смешение этих двух решений было доказанной причиной регрессии:
+        # ослабление порогов валидности кадра (нужное для покрытия на
+        # "вероника") одновременно впускало более шумные окна в историю
+        # коррекции, размывая консенсус и ломая исправление на "я пульс
+        # 125". entered_history НЕ влияет на публикацию окна (та решается
+        # только через sqi.is_reliable) — только на то, пополняет ли ЭТО
+        # окно опорную историю, из которой сглаживание корректирует ДРУГИЕ
+        # окна (см. _smooth_bpm_against_trusted_history).
+        #
+        # ВАЖНО (найдено эмпирически при первой реализации — см. git
+        # history задачи 47): третье условие сужено с "verdict != ambiguous"
+        # (буквальная формулировка задачи) до "verdict == agreement".
+        # Причина: на "я обычное" окно с verdict="corrected_to_2f" и
+        # ВЫСОКИМ spectral_snr_db=6.0 прошло в историю по буквальному
+        # критерию, пока в истории было всего 2 точки (< history_min_windows) —
+        # проверить его было нечем, и оно испортило саму историю с самого
+        # начала, породив ещё 2 ложных срабатывания далее по записи.
+        # corrected_to_2f/corrected_to_half_f — это САМИ результат
+        # оценочного решения cross_check (могут быть ровно тем самым
+        # ложным срабатыванием, которое сглаживание должно ловить) — давать
+        # такому окну самому себя подтверждать в опорной истории циклически
+        # рискованно. "agreement" — единственный случай, где оба независимых
+        # оценщика (спектр и пики) сошлись БЕЗ какой-либо коррекции.
+        entered_history = (
+            window_status == "ok"
+            and best_snr_db >= self.cfg.frequency.history_min_snr_db
+            and cross_check.verdict == "agreement"
+        )
+        history_rejection_reason = None
+        if not entered_history:
+            if window_status != "ok":
+                history_rejection_reason = f"window_status={window_status}"
+            elif best_snr_db < self.cfg.frequency.history_min_snr_db:
+                history_rejection_reason = (
+                    f"spectral_snr_db={best_snr_db:.2f} < history_min_snr_db="
+                    f"{self.cfg.frequency.history_min_snr_db:.2f}"
+                )
+            else:
+                history_rejection_reason = f"cross_check_verdict={cross_check.verdict}"
+
+        # Задача 44/47 (сглаживание по истории): отдельный слой ПОВЕРХ
+        # уже исправленных окон — см. docstring
         # _smooth_bpm_against_trusted_history. bpm_was_smoothed идёт в лог
         # отдельным полем и разрешает публикацию окна, даже если сам
         # cross-check не смог подтвердить его по своим собственным пикам.
-        current_bpm, bpm_was_smoothed = self._smooth_bpm_against_trusted_history(current_bpm, cross_check)
+        current_bpm, bpm_was_smoothed, history_was_insufficient = self._smooth_bpm_against_trusted_history(
+            current_bpm, cross_check, entered_history,
+        )
         if bpm_was_smoothed:
             warnings.append(
                 f"BPM сглажен по истории подтверждённых окон до {current_bpm:.1f} "
@@ -1450,20 +1581,6 @@ class RPPGPipeline:
             )
         if best_roi in per_roi_bpm:
             per_roi_bpm[best_roi] = current_bpm
-
-        # Задача 21: явная классификация вырожденных окон — раньше окно с
-        # best_snr_db=-inf (сигнал короче 8 отсчётов или std < 1e-10, см.
-        # quality.compute_psd) тихо получало status="ok" с провальным SQI и
-        # молча выпадало из перцентилей analyze_log.py ("N inf/nan
-        # исключено") без объяснения ПОЧЕМУ. window_status идёт ТОЛЬКО в
-        # WindowLogRecord (JSONL/CSV) — публичный PTSDPulseFeatures.status
-        # остаётся ok/no_signal, это отдельный документированный контракт.
-        if len(best_signal) < 8:
-            window_status = "too_short"
-        elif not np.isfinite(best_snr_db):
-            window_status = "degenerate_signal"
-        else:
-            window_status = "ok"
 
         interocular_distances_px = np.array(self._buf.interocular_dist, dtype=float)
         background_signal = self._estimate_background_signal(fps, band)
@@ -1509,6 +1626,8 @@ class RPPGPipeline:
                 psd_freqs=psd_freqs,
                 psd_values=psd_values,
                 bpm_freq_estimate=per_roi_freq_estimate.get(best_roi),
+                cross_check=cross_check,
+                history_was_insufficient=history_was_insufficient,
             )
 
         self._update_ibi_log(cross_check, self._buf.timestamps_ms)
@@ -1565,6 +1684,10 @@ class RPPGPipeline:
                 cross_check_ratio=cross_check.ratio,
                 cross_check_mean_hr_from_peaks=cross_check.mean_hr_from_peaks,
                 bpm_was_smoothed=bpm_was_smoothed,
+                entered_history=entered_history,
+                history_rejection_reason=history_rejection_reason,
+                history_was_insufficient=history_was_insufficient,
+                pass_that_decided=1,
                 method_used=method_used,
                 frequency_method_used=self.cfg.frequency_method.value,
                 sqi_overall_score=sqi.overall_score,
