@@ -125,6 +125,34 @@ def tarvainen_cutoff_hz(lam: float, fs: float, level: float = 1.0 / np.sqrt(2.0)
     return float(brentq(f, lo, hi))
 
 
+def tarvainen_lambda_for_cutoff(cutoff_hz: float, fs: float) -> float:
+    """λ, дающая заданную частоту среза на заданной fs — обратная к
+    tarvainen_cutoff_hz.
+
+    Нужна, когда ОДИН И ТОТ ЖЕ препроцессинг применяется к сигналам с
+    РАЗНОЙ частотой дискретизации: λ — не физическая величина, у неё нет
+    смысла в отрыве от fs (см. FilterConfig.tarvainen_lambda: λ=3542
+    подобрана под fs=30 Гц и даёт срез 0.1 Гц, а на контактной волне
+    UBFC DATASET_1 с fs≈62 Гц та же λ даёт 0.207 Гц — вдвое более
+    агрессивный фильтр). Чтобы обработка была эквивалентной, переносить
+    надо ЧАСТОТУ СРЕЗА, а не число λ.
+
+    Поиск ведётся по log10(λ): H_hp монотонна по λ, а сама λ меняется на
+    порядки, поэтому логарифмическая шкала устойчивее линейной.
+    """
+    from scipy.optimize import brentq
+
+    def f(log_lam: float) -> float:
+        return tarvainen_cutoff_hz(10.0 ** log_lam, fs) - cutoff_hz
+
+    lo, hi = -3.0, 12.0
+    if f(lo) < 0:
+        return 10.0 ** lo
+    if f(hi) > 0:
+        return 10.0 ** hi
+    return float(10.0 ** brentq(f, lo, hi))
+
+
 def detrend(x: np.ndarray, method: str = "tarvainen", lam: float = 3542.0) -> np.ndarray:
     if method == "none":
         return np.asarray(x, dtype=float) - np.mean(x)
