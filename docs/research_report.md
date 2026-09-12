@@ -657,7 +657,7 @@ numpy-реализации (разница `4.4e-16`, машинная точн�
 
 | Датасет | Особенности | Что проверяем |
 |---|---|---|
-| **UBFC-rPPG** (Bobbia et al., 2019) | Небольшой (42 субъекта, DATASET_2), контролируемое освещение, минимум движения | Базовая точность методов в "лёгких" условиях; сюда уже есть готовый загрузчик (`benchmark/evaluate.py::UBFCrPPGLoader`) |
+| **UBFC-rPPG** (Bobbia et al., 2017) | Небольшой (42 субъекта, DATASET_2), контролируемое освещение, минимум движения | Базовая точность методов в "лёгких" условиях; сюда уже есть готовый загрузчик (`benchmark/evaluate.py::UBFCrPPGLoader`) |
 | **PURE** (Stricker et al., 2014) | 10 субъектов × 6 сценариев движения головы (стабильно/разговор/медленное-быстрое вращение/маленькое-большое вращение) | Целевой тест на "устойчивость к движению головы" — прямое требование ТЗ |
 | **VIPL-HR** (Niu et al., 2018/2019) | ~2000 видео, 107 субъектов, 9 сценариев (движение, освещение, разговор), несколько устройств записи, разнообразие по демографии | Кросс-девайсовая генерализация + разбивка по условиям освещения/тону кожи (§5.4) |
 | **MMSE-HR** (Zhang et al., 2016) | Синхронизировано с индуцированными эмоциональными реакциями (elicited expressions) | Ближайший по духу к сценарию ПТСР-системы прокси-датасет: пульс в условиях выраженной, не нейтральной мимики/аффекта — тест на устойчивость ROI к мимике, не только к вращению головы |
@@ -784,7 +784,7 @@ VIPL-HR/UBFC-rPPG/PURE/MMSE-HR не содержит клинической ПТ
 - Schneider, M., & Schwerdtfeger, A. (2020). *Autonomic dysfunction in posttraumatic stress disorder indexed by heart rate variability: a meta-analysis*. Psychological Medicine.
 - Мета-анализ вагус-опосредованной ВСР при ПТСР (2026), 24 исследования/2537 участников — уточнить полную библиографическую запись при цитировании в статье (см. §5.2).
 - Liu, X., et al. (2023). *rPPG-Toolbox: Deep Remote PPG Toolbox*. NeurIPS Datasets and Benchmarks Track.
-- Bobbia, S., Macwan, R., Benezeth, Y., Mansouri, A., & Dubois, J. (2019). *Unsupervised skin tissue segmentation for remote photoplethysmography*. Pattern Recognition Letters. (UBFC-rPPG)
+- Bobbia, S., Macwan, R., Benezeth, Y., Mansouri, A., & Dubois, J. (2017). *Unsupervised skin tissue segmentation for remote photoplethysmography*. Pattern Recognition Letters, Elsevier. (UBFC-rPPG — год и формулировка приведены к тем, которые авторы датасета просят использовать в readme.txt и ubfcrppg_data_processor.py)
 - Stricker, R., Müller, S., & Gross, H.-M. (2014). *Non-contact video-based pulse rate measurement on a mobile service robot*. RO-MAN. (PURE)
 - Niu, X., Han, H., Shan, S., & Chen, X. (2019). *VIPL-HR: A Multi-modal Database for Pulse Estimation from Less-constrained Face Video*. ACCV.
 - Zhang, Z., et al. (2016). *Multimodal Spontaneous Emotion Corpus for Human Behavior Analysis*. CVPR. (MMSE-HR)
