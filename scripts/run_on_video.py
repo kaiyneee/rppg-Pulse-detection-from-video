@@ -17,11 +17,15 @@ result.config.yaml) — п.42 требований: "каждая строчка
 уже ЗАПИСАННОГО видео этого предела нет — файл можно пройти дважды: первый
 проход как обычно (причинно, вперёд по времени, копит историю
 подтверждённых окон), второй — без пересчёта сигнала и БЕЗ какого-либо
-усреднения по времени — просто заново применяет то же самое правило
-коррекции (apply_history_ratio_check) к тем окнам, которым в первом
-проходе не хватило истории для решения, используя итоговую историю
-целиком. В scripts/run_webcam.py (реальное время) такого флага нет и не
-может быть — там причинность обязательна.
+усреднения по времени — пересматривает те окна, которым в первом проходе
+не хватило истории для решения, используя итоговую историю целиком.
+Задача 49, п.3: второй проход сначала пробует пересмотреть САМ ВЫБОР
+кандидата {f, 2f, f/2} против медианы итоговой истории (см.
+rppg.hrv.features.reconsider_candidate_against_history) — не только
+"отличается ли ровно в 2 раза", как раньше; если это не даёт уверенного
+ответа, откатывается к прежнему грубому флипу apply_history_ratio_check.
+В scripts/run_webcam.py (реальное время) такого флага нет и не может
+быть — там причинность обязательна.
 
 Использование:
     python scripts/run_on_video.py --video path/to/video.mp4 --out result.csv
@@ -38,12 +42,13 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
 from rppg.config_io import load_config, save_config
-from rppg.pipeline import RPPGPipeline, apply_history_ratio_check
+from rppg.pipeline import RPPGPipeline, apply_second_pass
 from rppg.structured_log import read_jsonl_records
 
 
@@ -116,6 +121,8 @@ def main() -> None:
     frame_idx = 0
     n_reconsidered = 0
     n_changed = 0
+    n_changed_by_candidate = 0
+    n_changed_by_ratio = 0
     jsonl_corrections: dict[int, float] = {}
 
     # Задача 48: --two-pass читает history_was_insufficient/cross_check
@@ -134,25 +141,17 @@ def main() -> None:
             frame_idx += 1
 
         if args.two_pass:
-            # Второй проход: сигнал НЕ пересчитывается (никаких новых
-            # process_frame), никакого усреднения по времени — только
-            # повторное применение ТОГО ЖЕ правила коррекции
-            # (apply_history_ratio_check, общего с потоковым первым
-            # проходом) к окнам с history_was_insufficient=True, теперь
-            # против итоговой истории, накопленной за ВЕСЬ первый проход.
-            final_history = list(pipeline._trusted_bpm_history)
-            min_windows = pipeline.cfg.frequency.history_min_windows
-            for r in rows:
-                if r.debug is None or not r.debug.history_was_insufficient:
-                    continue
-                n_reconsidered += 1
-                new_bpm, _was_smoothed, _still_insufficient = apply_history_ratio_check(
-                    r.bpm, final_history, min_windows,
-                )
-                jsonl_corrections[r.timestamp_ms] = new_bpm
-                if new_bpm != r.bpm:
-                    n_changed += 1
-                    r.bpm = new_bpm
+            # Вся логика второго прохода — в rppg.pipeline.apply_second_pass
+            # (единственная реализация, общая с scripts/eval_ubfc_subject.py
+            # --two-pass; см. её docstring про оба правила коррекции).
+            stats = apply_second_pass(
+                rows, pipeline._trusted_bpm_history, pipeline.cfg.frequency.history_min_windows,
+            )
+            n_reconsidered = stats.n_reconsidered
+            n_changed = stats.n_changed
+            n_changed_by_candidate = stats.n_changed_by_candidate
+            n_changed_by_ratio = stats.n_changed_by_ratio
+            jsonl_corrections = stats.corrections
 
     cap.release()
 
@@ -200,7 +199,8 @@ def main() -> None:
     print(f"Обработано окон: {len(rows)}, из них publishable (SQI ok): {n_publishable}")
     if args.two_pass:
         print(f"Второй проход: пересмотрено окон (недостаточная история в первом проходе) — "
-              f"{n_reconsidered}, из них изменено значение bpm — {n_changed}")
+              f"{n_reconsidered}, из них изменено значение bpm — {n_changed} "
+              f"(пересмотром кандидата — {n_changed_by_candidate}, флипом x2 — {n_changed_by_ratio})")
     print(f"Результат сохранён в {out_path}")
     print(f"Конфиг эксперимента сохранён в {config_out_path}")
 

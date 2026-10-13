@@ -130,6 +130,14 @@ class WindowLogRecord:
     # потоковом (веб-камера) режиме всегда 1 — там причинность обязательна.
     history_was_insufficient: bool = False
     pass_that_decided: int = 1
+    # Задача 52: по каждому включённому ROI — сколько кадров ЭТОГО окна
+    # невалидны по каждой ИЗ ЧЕТЫРЁХ различимых причин ("skin_mask_empty" |
+    # "brightness_clipping" | "valid_pixel_count_unstable" | "face_loss",
+    # см. RPPGPipeline._roi_rejection_cause_breakdown) — причины, ранее
+    # слитые в одно неинформативное предупреждение "слишком длинный провал
+    # трекинга/окклюзии", теперь различимы программно, а не только по
+    # тексту warnings. Пустой dict у ROI — все кадры окна были валидны.
+    roi_rejection_causes: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_json_line(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

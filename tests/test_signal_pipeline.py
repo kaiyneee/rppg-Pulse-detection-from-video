@@ -530,7 +530,7 @@ def test_roi_mean_rgb_truncated_mean_recovers_subquantization_signal():
         quantized = np.clip(np.round(continuous), 0, 255).astype(np.uint8)
         frame = np.stack([quantized, quantized, quantized], axis=-1)  # (H,W,3) BGR, все каналы равны
 
-        rgb, valid, n_valid = roi_mean_rgb(frame, mask, min_valid_fraction=0.6, trim_fraction=0.10)
+        rgb, valid, n_valid, _cause = roi_mean_rgb(frame, mask, min_valid_fraction=0.6, trim_fraction=0.10)
         assert valid and n_valid > 4500
         trunc_series[i] = rgb[1]
 
@@ -918,6 +918,82 @@ def test_resolvable_bpm_difference_reflects_main_lobe_width():
         f"тона, отстоящие ЗАМЕТНО БОЛЬШЕ разрешающей способности, должны быть различимы как два горба "
         f"(получено {n_resolved} локальных максимумов)"
     )
+
+
+def test_whiten_psd_flattens_smooth_low_frequency_hill():
+    """Задача 50: whiten_psd — скользящая медиана лог-мощности как оценка
+    шумового пола, вычитаемая из log(psd). На синтетическом PSD с гладким
+    широким "холмом" на низкой частоте и узким пиком на более высокой —
+    после отбеливания холм должен ЗАМЕТНО просесть относительно пика
+    (в отличие от сырого PSD, где холм остаётся доминирующим)."""
+    print("\n=== Тест: whiten_psd подавляет гладкий низкочастотный холм (задача 50) ===")
+    from rppg.signal.frequency import whiten_psd
+
+    freqs = np.linspace(0.5, 3.0, 500)
+    hill = 5.0 * np.exp(-((freqs - 0.8) ** 2) / (2 * 0.25 ** 2))  # широкий гладкий холм на 0.8 Гц
+    spike = 1.0 * np.exp(-((freqs - 1.5) ** 2) / (2 * 0.01 ** 2))  # узкий пик на 1.5 Гц
+    psd = hill + spike + 1e-3
+
+    raw_argmax_hz = freqs[np.argmax(psd)]
+    whitened = whiten_psd(freqs, psd, window_hz=0.5)
+    whitened_argmax_hz = freqs[np.argmax(whitened)]
+
+    print(f"  raw argmax={raw_argmax_hz:.2f} Hz, whitened argmax={whitened_argmax_hz:.2f} Hz")
+    assert abs(raw_argmax_hz - 0.8) < 0.05, "сырой PSD должен выбирать холм (доминирует по абсолютной мощности)"
+    assert abs(whitened_argmax_hz - 1.5) < 0.05, "отбелённый PSD должен выбирать узкий пик, а не холм"
+
+
+def test_estimate_hr_welch_whitened_recovers_true_peak_masked_by_hill():
+    """Задача 50, интеграционный уровень: полный estimate_hr_welch на
+    сконструированном временном сигнале (не искусственном PSD) — гладкий
+    широкополосный "холм" (окрашенный шум, отфильтрованный в 0.7-1.0 Гц)
+    плюс чистый синус истинного пульса на 90 BPM (1.5 Гц). peak_selection=
+    "argmax" (умолчание) должен ошибиться в пользу холма; "whitened"
+    должен восстановить истинную частоту. Детерминировано (фиксированный
+    seed), устойчиво к амплитуде холма (см. разведку задачи 50)."""
+    print("\n=== Тест: estimate_hr_welch(peak_selection='whitened') восстанавливает пик под холмом (задача 50) ===")
+    from scipy.signal import butter, filtfilt
+    from rppg.signal.frequency import estimate_hr_welch
+
+    fps = 30.0
+    n = int(fps * 12.0)
+    t = np.arange(n) / fps
+    band = (0.7, 3.0)
+    true_bpm = 90.0
+
+    rng = np.random.default_rng(2)
+    pulse = 0.35 * np.sin(2 * np.pi * (true_bpm / 60.0) * t)
+    noise = rng.standard_normal(n)
+    b, a = butter(4, [0.7 / (fps / 2), 1.0 / (fps / 2)], btype="band")
+    hill = filtfilt(b, a, noise)
+    hill = hill / np.std(hill)
+    signal = pulse + 2.0 * hill
+
+    est_argmax = estimate_hr_welch(signal, fps, band, peak_selection="argmax")
+    est_whitened = estimate_hr_welch(signal, fps, band, peak_selection="whitened")
+    print(f"  true={true_bpm:.1f} argmax={est_argmax.bpm:.1f} whitened={est_whitened.bpm:.1f}")
+
+    assert abs(est_argmax.bpm - true_bpm) > 20.0, "конструкция теста должна ломать обычный argmax (иначе тест не проверяет то, что нужно)"
+    assert abs(est_whitened.bpm - true_bpm) < 2.0, "whitened должен восстановить истинный пик под холмом"
+
+
+def test_estimate_hr_welch_argmax_default_unchanged():
+    """Регрессия: peak_selection по умолчанию ("argmax") не должен менять
+    поведение estimate_hr_welch ни на бит — задача 50 явно требует, чтобы
+    отбеливание было ОПТ-ИН, а не менило умолчание без отдельной калибровки."""
+    print("\n=== Тест: estimate_hr_welch без peak_selection ведёт себя как раньше (задача 50) ===")
+    from rppg.signal.frequency import estimate_hr_welch
+
+    fps = 30.0
+    n = 300
+    t = np.arange(n) / fps
+    band = (0.7, 3.0)
+    signal = np.sin(2 * np.pi * 1.2 * t) + 0.1 * np.random.default_rng(0).standard_normal(n)
+
+    est_default = estimate_hr_welch(signal, fps, band)
+    est_explicit_argmax = estimate_hr_welch(signal, fps, band, peak_selection="argmax")
+    assert est_default.bpm == est_explicit_argmax.bpm
+    assert abs(est_default.bpm - 72.0) < 3.0
 
 
 def test_cross_roi_agreement_robust_to_single_outlier_roi():
@@ -2260,6 +2336,64 @@ def test_apply_history_ratio_check_does_not_flip_consistent_value():
     assert bpm == 62.1
 
 
+def test_reconsider_candidate_against_history_fixes_octave_error_using_history():
+    """Задача 49, п.3: для окна с history_was_insufficient=True второй
+    проход теперь пересматривает САМ ВЫБОР кандидата {f, 2f, f/2} против
+    медианы итоговой истории, а не только "ровно в 2 раза" от bpm.
+    Регрессия на реальном случае из диагностики задачи 49 (subject 5,
+    skip_seconds=2, окно 1): исходная спектральная оценка 150.3 при
+    истинном ~73 — f/2=75.15 гораздо ближе к референсу истории (73), чем
+    сам f (150.3) или 2f (300.6), и второй по близости кандидат дальше
+    минимум в 2 раза — выбор уверенный."""
+    print("\n=== Тест: reconsider_candidate_against_history чинит октавную ошибку по истории (задача 49) ===")
+    from rppg.hrv.features import reconsider_candidate_against_history
+
+    bpm, verdict, confident = reconsider_candidate_against_history(150.3, (0.7, 3.0), 73.0)
+    print(f"  bpm={bpm:.2f} verdict={verdict} confident={confident}")
+    assert confident
+    assert verdict == "corrected_to_half_f"
+    assert abs(bpm - 75.15) < 0.01
+
+
+def test_reconsider_candidate_against_history_leaves_non_harmonic_error_unchanged():
+    """Задача 49 (диагностика): часть холодностартовых ошибок — НЕ
+    гармоника/субгармоника истинного значения (например, 53.6 против
+    истинных 73 — отношение 1.36, не октава; см. scripts/diagnose_cold_
+    start.py, subject 8). Ни один кандидат {f, 2f} (f/2=26.8 вне полосы)
+    не оказывается достаточно ближе к референсу, чем другой — выбор
+    остаётся неуверенным, bpm НЕ меняется. Это осознанное ограничение
+    (см. docstring reconsider_candidate_against_history), а не баг —
+    важно, чтобы функция честно отказывалась гадать, а не подгоняла
+    ближайший из двух одинаково неподходящих кандидатов."""
+    print("\n=== Тест: reconsider_candidate_against_history не трогает негармоническую ошибку (задача 49) ===")
+    from rppg.hrv.features import reconsider_candidate_against_history
+
+    bpm, verdict, confident = reconsider_candidate_against_history(53.6, (0.7, 3.0), 73.0)
+    print(f"  bpm={bpm:.2f} verdict={verdict} confident={confident}")
+    assert not confident
+    assert bpm == 53.6
+
+
+def test_reconsider_candidate_against_history_requires_reference():
+    """Без референса (история короче min_windows даже целиком по всему
+    видео — reference_history_bpm=None) или без валидной спектральной
+    оценки функция явно отказывается решать (verdict="insufficient_peaks",
+    bpm не меняется), а не падает и не гадает по нулевому референсу."""
+    print("\n=== Тест: reconsider_candidate_against_history требует валидный референс (задача 49) ===")
+    from rppg.hrv.features import reconsider_candidate_against_history
+
+    bpm, verdict, confident = reconsider_candidate_against_history(53.6, (0.7, 3.0), None)
+    print(f"  bpm={bpm:.2f} verdict={verdict} confident={confident}")
+    assert not confident
+    assert verdict == "insufficient_peaks"
+    assert bpm == 53.6
+
+    bpm2, verdict2, confident2 = reconsider_candidate_against_history(float("nan"), (0.7, 3.0), 73.0)
+    assert not confident2
+    assert verdict2 == "insufficient_peaks"
+    assert bpm2 != bpm2  # nan
+
+
 def test_skin_mask_cached_per_step_not_recomputed_every_frame():
     """Регрессия задачи 34: маска кожи кэшируется и обновляется раз в
     step_seconds (по медианному кадру, накопленному с прошлого
@@ -2305,6 +2439,73 @@ def test_skin_mask_cached_per_step_not_recomputed_every_frame():
             "резкая смена доли skin-mask (кожа -> чёрный кадр) должна выставлять предупреждение"
         )
         print(f"  [OK] предупреждение выставлено: {pipe._pending_skin_mask_warning}")
+    finally:
+        pipe.close()
+
+
+def test_roi_mean_rgb_distinguishes_empty_mask_from_brightness_clipping():
+    """Задача 52: roi_mean_rgb теперь возвращает ЧЕТВЁРТЫЙ элемент —
+    причину valid=False. Пустая маска (например, маска кожи отклонила
+    весь полигон ROI — типичный случай чёлки на лбу) и слишком много
+    переэкспонированных/недоэкспонированных пикселей — РАЗНЫЕ причины, до
+    задачи 52 неразличимые (обе давали valid=False без объяснения)."""
+    print("\n=== Тест: roi_mean_rgb различает пустую маску и клиппинг яркости (задача 52) ===")
+    from rppg.face.roi import roi_mean_rgb
+
+    h, w = 32, 32
+    frame = np.full((h, w, 3), 128, dtype=np.uint8)
+
+    empty_mask = np.zeros((h, w), dtype=np.uint8)
+    rgb, valid, n_valid, cause = roi_mean_rgb(frame, empty_mask)
+    print(f"  пустая маска: valid={valid} cause={cause}")
+    assert not valid and cause == "mask_empty" and n_valid == 0
+
+    overexposed_frame = np.full((h, w, 3), 255, dtype=np.uint8)  # яркость 255 > порога клиппинга 250
+    full_mask = np.ones((h, w), dtype=np.uint8)
+    rgb, valid, n_valid, cause = roi_mean_rgb(overexposed_frame, full_mask)
+    print(f"  засвеченный кадр: valid={valid} cause={cause}")
+    assert not valid and cause == "brightness_clipping"
+
+    rgb, valid, n_valid, cause = roi_mean_rgb(frame, full_mask)
+    print(f"  нормальный кадр: valid={valid} cause={cause}")
+    assert valid and cause is None
+
+
+def test_roi_rejection_cause_breakdown_separates_all_four_causes():
+    """Задача 52 — приёмочный критерий: лог должен явно показывать, КАКАЯ
+    ИМЕННО проверка отклоняет ROI, а не одно слитое предупреждение.
+    White-box тест напрямую заполняет _buf.rejection_cause_by_roi (как это
+    делают _push_frame/_push_invalid_frame) и проверяет, что
+    _roi_rejection_cause_breakdown корректно считает каждую из четырёх
+    причин по отдельности, не путая их между собой."""
+    print("\n=== Тест: разбивка причин отбраковки ROI по 4 категориям (задача 52) ===")
+    pipe, skip_reason = _make_pipeline_for_aggregate_test()
+    if pipe is None:
+        print(f"  [SKIP] {skip_reason}")
+        return
+
+    try:
+        roi_name = pipe.cfg.roi.enabled_rois[0].value
+        pipe._buf.ensure_roi(roi_name)
+        causes_sequence = (
+            ["skin_mask_empty"] * 5
+            + ["brightness_clipping"] * 3
+            + ["valid_pixel_count_unstable"] * 2
+            + ["face_loss"] * 1
+            + [None] * 4  # валидные кадры — не должны попасть в разбивку
+        )
+        for c in causes_sequence:
+            pipe._buf.rejection_cause_by_roi[roi_name].append(c)
+
+        breakdown = pipe._roi_rejection_cause_breakdown(roi_name)
+        print(f"  {roi_name}: {breakdown}")
+        assert breakdown == {
+            "skin_mask_empty": 5,
+            "brightness_clipping": 3,
+            "valid_pixel_count_unstable": 2,
+            "face_loss": 1,
+        }
+        assert sum(breakdown.values()) == len(causes_sequence) - 4  # 4 валидных кадра не считаются
     finally:
         pipe.close()
 
@@ -2804,6 +3005,9 @@ def run_all():
         test_temporal_consistency_penalizes_unstable_bpm_sequence,
         test_temporal_consistency_does_not_penalize_spectral_grid_jitter,
         test_resolvable_bpm_difference_reflects_main_lobe_width,
+        test_whiten_psd_flattens_smooth_low_frequency_hill,
+        test_estimate_hr_welch_whitened_recovers_true_peak_masked_by_hill,
+        test_estimate_hr_welch_argmax_default_unchanged,
         test_cross_roi_agreement_robust_to_single_outlier_roi,
         test_cross_roi_agreement_ignores_low_snr_roi,
         test_cross_roi_agreement_guarantees_minimum_two_participants,
@@ -2837,9 +3041,14 @@ def run_all():
         test_apply_history_ratio_check_reports_insufficient_history,
         test_apply_history_ratio_check_flips_against_full_history,
         test_apply_history_ratio_check_does_not_flip_consistent_value,
+        test_reconsider_candidate_against_history_fixes_octave_error_using_history,
+        test_reconsider_candidate_against_history_leaves_non_harmonic_error_unchanged,
+        test_reconsider_candidate_against_history_requires_reference,
         test_lf_hf_require_separate_minimum_durations,
         test_respiration_rate_from_amplitude_modulation,
         test_skin_mask_cached_per_step_not_recomputed_every_frame,
+        test_roi_mean_rgb_distinguishes_empty_mask_from_brightness_clipping,
+        test_roi_rejection_cause_breakdown_separates_all_four_causes,
         test_aggregate_median_robust_to_single_outlier,
         test_aggregate_spread_and_quality_respond_to_dispersion,
         test_aggregate_no_data_when_all_confidence_zero,

@@ -48,7 +48,7 @@ from rppg.face.landmarker import FaceLandmarkerWrapper
 from rppg.face.roi import extract_rois, build_skin_mask, ROIExtractionResult, STABLE_TRACKING_IDX
 from rppg.signal.preprocessing import preprocess_signal, interpolate_missing, detrend, is_gap_acceptable, fill_gaps
 from rppg.signal.methods import get_method, SignalWindow
-from rppg.signal.frequency import estimate_hr, FrequencyEstimate
+from rppg.signal.frequency import estimate_hr, FrequencyEstimate, select_peak_from_spectrum
 from rppg.signal.quality import (
     assess_quality,
     dominant_frequency_and_snr,
@@ -66,6 +66,7 @@ from rppg.hrv.features import (
     refine_peaks_subsample,
     extract_hrv_features_from_ibi,
     cross_check_spectral_vs_peaks,
+    reconsider_candidate_against_history,
     HRVFeatures,
     CrossCheckResult,
 )
@@ -247,6 +248,10 @@ class _RingBuffer:
         self.frames_bgr_ts: deque = deque()
         self.rgb_by_roi: dict[str, deque] = {}
         self.valid_by_roi: dict[str, deque] = {}
+        # Задача 52: причина valid_by_roi[name][i]=False для i-го кадра
+        # окна (None при valid=True) — см. ROIExtractionResult.
+        # rejection_cause_by_roi и RPPGPipeline._push_frame/_push_invalid_frame.
+        self.rejection_cause_by_roi: dict[str, deque] = {}
         self.landmark_traj: deque = deque()
         self.face_valid: deque = deque()  # True, если лицо было обнаружено в кадре
         self.timestamps_ms: deque = deque()
@@ -261,6 +266,7 @@ class _RingBuffer:
         if roi_name not in self.rgb_by_roi:
             self.rgb_by_roi[roi_name] = deque()
             self.valid_by_roi[roi_name] = deque()
+            self.rejection_cause_by_roi[roi_name] = deque()
 
     def __len__(self) -> int:
         return len(self.timestamps_ms)
@@ -279,6 +285,8 @@ class _RingBuffer:
             for dq in self.rgb_by_roi.values():
                 dq.popleft()
             for dq in self.valid_by_roi.values():
+                dq.popleft()
+            for dq in self.rejection_cause_by_roi.values():
                 dq.popleft()
 
 
@@ -316,6 +324,74 @@ def apply_history_ratio_check(
     if min_ratio <= (1.0 / ratio) <= max_ratio:
         return current_bpm / 2.0, True, False
     return current_bpm, False, False
+
+
+@dataclass
+class SecondPassStats:
+    """Что сделал второй проход — для отчёта вызывающего кода."""
+    n_reconsidered: int = 0
+    n_changed: int = 0
+    n_changed_by_candidate: int = 0
+    n_changed_by_ratio: int = 0
+    corrections: dict = field(default_factory=dict)  # timestamp_ms -> новый bpm
+
+
+def apply_second_pass(rows, trusted_history, min_windows: int) -> SecondPassStats:
+    """Задача 48/49: ВТОРОЙ (офлайн) проход по уже посчитанным окнам.
+
+    Сигнал НЕ пересчитывается (никаких новых process_frame) и никакого
+    усреднения по времени не делается — к окнам, помеченным
+    history_was_insufficient=True (в первом, причинном проходе решение о
+    коррекции принималось при истории короче min_windows), применяются
+    ДВА правила по очереди, против итоговой истории за ВЕСЬ первый проход:
+
+    1. Задача 49, п.3: reconsider_candidate_against_history — пересматривает
+       САМ ВЫБОР кандидата {f, 2f, f/2} из ИСХОДНОЙ (до коррекции)
+       спектральной оценки, используя медиану итоговой истории как референс
+       ВМЕСТО шумной пиковой оценки одного холодностартового окна.
+    2. Если (1) не дал уверенного ответа — apply_history_ratio_check
+       (задача 48): грубый флип "ровно в 2 раза". Не убран — ловит то, что
+       (1) пропускает из-за требований band_hz/уверенности.
+
+    Вынесено сюда из scripts/run_on_video.py, чтобы у логики коррекции
+    была РОВНО ОДНА реализация (тот же принцип, по которому в задаче 48
+    выделялась apply_history_ratio_check): её используют и офлайн-обработка
+    видео, и оценка на датасете (scripts/eval_ubfc_subject.py --two-pass).
+    rows мутируются на месте (r.bpm), как и раньше.
+
+    Работает только по rows с заполненным .debug (пайплайн должен быть
+    создан с debug=True) — без него history_was_insufficient недоступен.
+    """
+    stats = SecondPassStats()
+    trusted_history = list(trusted_history)
+    reference_history_bpm = (
+        float(np.median(trusted_history)) if len(trusted_history) >= min_windows else None
+    )
+    for r in rows:
+        if r.debug is None or not r.debug.history_was_insufficient:
+            continue
+        stats.n_reconsidered += 1
+        bpm_spectral = (
+            r.debug.bpm_freq_estimate.bpm if r.debug.bpm_freq_estimate is not None else r.bpm
+        )
+        new_bpm, _verdict, confident = reconsider_candidate_against_history(
+            bpm_spectral, r.debug.band_hz, reference_history_bpm,
+        )
+        changed_by = "candidate"
+        if not confident:
+            new_bpm, _was_smoothed, _still_insufficient = apply_history_ratio_check(
+                r.bpm, trusted_history, min_windows,
+            )
+            changed_by = "ratio"
+        stats.corrections[r.timestamp_ms] = new_bpm
+        if new_bpm != r.bpm:
+            stats.n_changed += 1
+            if changed_by == "candidate":
+                stats.n_changed_by_candidate += 1
+            else:
+                stats.n_changed_by_ratio += 1
+            r.bpm = new_bpm
+    return stats
 
 
 class RPPGPipeline:
@@ -563,6 +639,31 @@ class RPPGPipeline:
         history.append(n_valid)
         return base_valid and stable
 
+    def _roi_rejection_cause_breakdown(self, roi_name: str) -> dict[str, int]:
+        """Задача 52: сколько кадров ТЕКУЩЕГО окна невалидны для этого ROI
+        по каждой из четырёх различимых причин (см. ROIExtractionResult.
+        rejection_cause_by_roi и _push_frame/_push_invalid_frame) —
+        "skin_mask_empty" (маска кожи отклонила весь полигон ROI),
+        "brightness_clipping" (блик/недосвет), "valid_pixel_count_unstable"
+        (резкая смена состава ROI между кадрами, задача 31), "face_loss"
+        (лицо не обнаружено вообще). Порядок ключей фиксирован (а не
+        порядок появления) — удобнее сравнивать разные окна/испытуемых
+        построчно в логе."""
+        causes = list(self._buf.rejection_cause_by_roi.get(roi_name, []))
+        order = ["skin_mask_empty", "brightness_clipping", "valid_pixel_count_unstable", "face_loss"]
+        counts = {cause: causes.count(cause) for cause in order}
+        return {cause: n for cause, n in counts.items() if n > 0}
+
+    def _all_roi_rejection_causes(self) -> dict[str, dict[str, int]]:
+        """Задача 52: _roi_rejection_cause_breakdown для ВСЕХ включённых
+        ROI сразу — для WindowLogRecord.roi_rejection_causes (нужно на
+        КАЖДОЕ окно, а не только на то, где сработало предупреждение о
+        провале — иначе не с чем сравнить "нормальные" окна с "плохими")."""
+        return {
+            roi.value: self._roi_rejection_cause_breakdown(roi.value)
+            for roi in self.cfg.roi.enabled_rois
+        }
+
     # ------------------------------------------------------------------ #
     def process_frame(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PTSDPulseFeatures | None:
         face = self._landmarker.detect(frame_bgr, timestamp_ms)
@@ -585,9 +686,17 @@ class RPPGPipeline:
             for roi in self.cfg.roi.enabled_rois:
                 name = roi.value
                 n_valid = roi_result.valid_pixel_count_by_roi.get(name, 0)
+                was_valid = roi_result.valid_by_roi.get(name, False)
                 roi_result.valid_by_roi[name] = self._check_valid_pixel_count_stability(
-                    name, n_valid, roi_result.valid_by_roi.get(name, False),
+                    name, n_valid, was_valid,
                 )
+                # Задача 52: если этот кадр был валиден по roi_mean_rgb
+                # (rejection_cause_by_roi[name] is None), но именно
+                # _check_valid_pixel_count_stability его забраковала —
+                # причина невалидности этого кадра ИМЕННО она, а не
+                # "None" (валиден), которое там сейчас стоит.
+                if was_valid and not roi_result.valid_by_roi[name]:
+                    roi_result.rejection_cause_by_roi[name] = "valid_pixel_count_unstable"
             self._push_frame(timestamp_ms, roi_result)
             if self._debug:
                 self.last_roi_result = roi_result
@@ -612,8 +721,20 @@ class RPPGPipeline:
         # Доказуемая верхняя граница нехватки — РОВНО один период кадра (см.
         # анализ инварианта trim_older_than), поэтому допуск 1.5/fps с запасом
         # покрывает её в любом (в т.ч. наихудшем идеально равномерном) случае.
-        fps_estimate = self._estimate_fps()
-        readiness_tolerance_s = 1.5 / fps_estimate if fps_estimate > 0 else 0.0
+        # Допуск готовности берётся от ЗАЯВЛЕННОЙ частоты записи
+        # (WindowConfig.assumed_fps, куда офлайн-прогон кладёт fps
+        # контейнера), а НЕ от оценки по меткам. Причина: этот допуск
+        # решает, на каком кадре выдаётся первая оценка, а от неё
+        # отсчитывается вся дальнейшая сетка окон. Если завязать его на
+        # _estimate_fps, то любое уточнение оценки частоты сдвигает сетку
+        # окон на кадр (проверено: при переходе медианной оценки на
+        # интервальную сетка сместилась у 3 записей из 50), и эталон,
+        # считаемый по границам окна, перестаёт быть сопоставимым между
+        # прогонами. Физический смысл допуска — "один период кадра с
+        # запасом" — от этого не страдает: заявленная частота записи
+        # отличается от фактической на доли процента.
+        fps_for_tolerance = self.cfg.window.assumed_fps
+        readiness_tolerance_s = 1.5 / fps_for_tolerance if fps_for_tolerance > 0 else 0.0
         if elapsed_s < self.cfg.window.min_seconds_before_estimate - readiness_tolerance_s:
             return None
 
@@ -641,6 +762,7 @@ class RPPGPipeline:
             valid = roi_result.valid_by_roi.get(name, False)
             self._buf.rgb_by_roi[name].append(rgb if rgb is not None else np.zeros(3))
             self._buf.valid_by_roi[name].append(bool(valid))
+            self._buf.rejection_cause_by_roi[name].append(roi_result.rejection_cause_by_roi.get(name))
         self._buf.trim_older_than(self.cfg.window.window_seconds)
 
     def _push_invalid_frame(self, timestamp_ms: int) -> None:
@@ -656,18 +778,38 @@ class RPPGPipeline:
             name = roi.value
             self._buf.rgb_by_roi[name].append(np.zeros(3))
             self._buf.valid_by_roi[name].append(False)
+            # Задача 52: лицо не обнаружено вообще — причина невалидности
+            # ЭТОГО кадра для ВСЕХ ROI одна и та же, не связана ни с маской
+            # кожи, ни с яркостью, ни со стабильностью состава ROI.
+            self._buf.rejection_cause_by_roi[name].append("face_loss")
         self._buf.trim_older_than(self.cfg.window.window_seconds)
 
     # ------------------------------------------------------------------ #
     def _estimate_fps(self) -> float:
+        """Частота дискретизации окна — по ВСЕМУ интервалу меток, а не по
+        медиане межкадровых шагов.
+
+        Метки приходят в ЦЕЛЫХ миллисекундах (этого требует MediaPipe:
+        detect_for_video принимает целочисленный timestamp_ms), поэтому
+        шаг между соседними кадрами округлён до миллисекунды и гуляет
+        между двумя соседними целыми. Медиана таких шагов — тоже целое
+        число миллисекунд, из-за чего прежняя оценка принимала лишь
+        значения вида 1000/k: например, 1000/34 = 29.41 Гц вместо
+        фактических 29.75 Гц. Ошибка в 1.1% масштабирует КАЖДУЮ оценку
+        пульса ровно на эти же 1.1%, потому что BPM линейна по fs.
+
+        Интервальная оценка (N-1)/(t_last - t_first) от округления меток
+        почти свободна: ошибка каждой отдельной метки не превышает 1 мс,
+        а делится она на полную длину окна (~10 с), давая относительную
+        погрешность порядка 1e-4 вместо 1.5e-2.
+        """
         ts = np.array(self._buf.timestamps_ms, dtype=float)
         if len(ts) < 2:
             return self.cfg.window.assumed_fps
-        dt = np.diff(ts) / 1000.0
-        dt = dt[dt > 1e-3]
-        if len(dt) == 0:
+        span = float(ts[-1] - ts[0]) / 1000.0
+        if not np.isfinite(span) or span <= 0:
             return self.cfg.window.assumed_fps
-        return float(1.0 / np.median(dt))
+        return float((len(ts) - 1) / span)
 
     def _dominant_frequency_and_snr(self, signal: np.ndarray, fps: float, band: tuple[float, float]) -> tuple[float, float]:
         """Задача 19: тонкая обёртка над quality.dominant_frequency_and_snr,
@@ -737,6 +879,8 @@ class RPPGPipeline:
                 recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
                 max_physiological_change_hz=max_change_hz, rate_limit_median_hz=rate_limit_median_hz,
                 physiological_rate_limit_power_advantage=power_advantage,
+                peak_selection=self.cfg.frequency.peak_selection,
+                whitening_window_hz=self.cfg.frequency.whitening_window_hz,
             )
 
         trend_removed = detrend(raw_signal, method=self.cfg.filt.detrend_method, lam=self.cfg.filt.tarvainen_lambda)
@@ -747,6 +891,44 @@ class RPPGPipeline:
             recent_median_hz=recent_median_hz, continuity_power_tolerance=tolerance,
             max_physiological_change_hz=max_change_hz, rate_limit_median_hz=rate_limit_median_hz,
             physiological_rate_limit_power_advantage=power_advantage,
+        )
+
+    def _peak_selection_kwargs(self) -> dict:
+        """Параметры выбора пика — те же, что _estimate_frequency передаёт в
+        estimate_hr (непрерывность и физиологическое ограничение скорости)."""
+        rate_limit_median_hz = self._recent_median_hz_for_rate_limit()
+        return {
+            "recent_median_hz": self._recent_median_hz(),
+            "continuity_power_tolerance": self.cfg.frequency.continuity_power_tolerance,
+            "rate_limit_median_hz": rate_limit_median_hz,
+            "max_physiological_change_hz": (
+                self.cfg.frequency.max_physiological_change_bpm_per_sec * self.cfg.window.step_seconds / 60.0
+                if rate_limit_median_hz is not None else 0.0
+            ),
+            "physiological_rate_limit_power_advantage": self.cfg.frequency.physiological_rate_limit_power_advantage,
+        }
+
+    def _spectral_mean_estimate(
+        self, per_roi_freq_estimate: dict[str, FrequencyEstimate],
+    ) -> FrequencyEstimate | None:
+        """ROIConfig.spectral_combination="spectral_mean": пик по среднему
+        НОРМИРОВАННЫХ спектров всех ROI. None, если ROI с пригодным
+        спектром меньше двух или их частотные сетки не совпадают (тогда
+        остаётся оценка по одному ROI с наибольшим SNR)."""
+        ests = [
+            e for e in per_roi_freq_estimate.values()
+            if e is not None and len(e.freqs_hz) > 0 and np.all(np.isfinite(e.power)) and float(np.sum(e.power)) > 0
+        ]
+        if len(ests) < 2:
+            return None
+        grid = ests[0].freqs_hz
+        ests = [e for e in ests if len(e.freqs_hz) == len(grid) and np.allclose(e.freqs_hz, grid)]
+        if len(ests) < 2:
+            return None
+        mean_power = np.mean([e.power / np.sum(e.power) for e in ests], axis=0)
+        return select_peak_from_spectrum(
+            grid, mean_power, f"{self.cfg.frequency_method.value}+spectral_mean",
+            **self._peak_selection_kwargs(),
         )
 
     def _update_last_valid_bpm(self, timestamp_ms: int, current_bpm: float, is_reliable: bool) -> None:
@@ -974,7 +1156,19 @@ class RPPGPipeline:
         # кадра, а не канала) — проверяем допустимость провала ОДИН раз, а
         # не пересчитываем длину провала 3 раза подряд (п.47 требований).
         if not is_gap_acceptable(valid_mask):
-            warnings.append(f"ROI '{name}': слишком длинный провал трекинга/окклюзии в окне.")
+            # Задача 52: раньше все причины невалидности кадра (маска кожи
+            # отклонила весь ROI, блик/недосвет, нестабильный состав ROI,
+            # лицо потеряно) были слиты в одно предупреждение — по нему
+            # было невозможно понять, какая ИМЕННО причина доминирует (см.
+            # scripts/diagnose_roi_rejection.py для примера, где subject 5
+            # из UBFC терял лоб 71 из 74 окон, а причина была неизвестна).
+            causes = self._roi_rejection_cause_breakdown(name)
+            n_invalid = int((~valid_mask).sum())
+            breakdown = ", ".join(f"{cause}={count}" for cause, count in causes.items()) or "нет данных"
+            warnings.append(
+                f"ROI '{name}': слишком длинный провал трекинга/окклюзии в окне "
+                f"({n_invalid} невалидных кадров из {len(valid_mask)}; причины: {breakdown})."
+            )
             return
         rgb = np.stack([fill_gaps(raw[:, ch], valid_mask) for ch in range(3)], axis=1)
 
@@ -1431,6 +1625,7 @@ class RPPGPipeline:
                     sqi_subharmonic_check_informative=True,
                     respiration_rate_bpm=None, warnings=no_signal_warnings,
                     window_status=no_signal_window_status,
+                    roi_rejection_causes=self._all_roi_rejection_causes(),
                     bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
                     bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
                     bpm_aggregate_spread_bpm=aggregate.spread_bpm,
@@ -1483,6 +1678,17 @@ class RPPGPipeline:
                     method=self.cfg.filt.detrend_method,
                     lam=self.cfg.filt.tarvainen_lambda,
                 )
+
+            # ROIConfig.spectral_combination="spectral_mean": частота — по
+            # среднему нормированных спектров всех ROI, а не по одному
+            # «лучшему». SQI выше уже посчитан по best_roi и не меняется;
+            # объединённая оценка кладётся на место оценки best_roi, чтобы
+            # DebugInfo.bpm_freq_estimate показывал то, что породило BPM.
+            if self.cfg.roi.spectral_combination == "spectral_mean":
+                combined = self._spectral_mean_estimate(per_roi_freq_estimate)
+                if combined is not None and np.isfinite(combined.bpm):
+                    current_bpm = float(combined.bpm)
+                    per_roi_freq_estimate[best_roi] = combined
 
         # Задача 21: явная классификация вырожденных окон — раньше окно с
         # best_snr_db=-inf (сигнал короче 8 отсчётов или std < 1e-10, см.
@@ -1709,6 +1915,7 @@ class RPPGPipeline:
                 bpm_aggregate=aggregate.bpm, bpm_aggregate_quality=aggregate.quality,
                 bpm_aggregate_status=aggregate.status, bpm_aggregate_n_windows=aggregate.n_windows,
                 bpm_aggregate_spread_bpm=aggregate.spread_bpm,
+                roi_rejection_causes=self._all_roi_rejection_causes(),
             ))
 
         # confidence/is_publishable уже посчитаны выше (перед _update_last_valid_bpm).

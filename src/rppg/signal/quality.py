@@ -721,14 +721,34 @@ class SQIResult:
     # НЕ штраф. Логируется, но не участвует в harmonic_score/overall — см.
     # docstring harmonic_plausibility.
     harmonic_support: bool = False
+    # Нормированная в [0,1] SNR-компонента — ровно та величина, что входит
+    # в взвешенную сумму overall_score. Раньше наружу отдавался только
+    # spectral_snr_db (дБ, до нормировки) и harmonic_score (множитель), а
+    # сам вклад приходилось восстанавливать по формуле снаружи, дублируя
+    # её. Поле добавлено как ЭКСПОРТ: ни формулы, ни веса, ни пороги не
+    # изменены (см. задачу «поведение SQI на вырожденных входах», где
+    # нужно сравнивать компоненты между собой в одной шкале).
+    snr_score: float = 0.0
+    # Та же компонента ДО штрафа за гармоническую путаницу (snr_score =
+    # snr_score_raw * harmonic_score). Нужна, чтобы отличать «слабый
+    # спектральный пик» от «пик есть, но он похож на гармонику».
+    snr_score_raw: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
 
 def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
     warnings: list[str] = []
 
+    # Задача 51, п.2: диапазон нормализации ФИКСИРОВАН (snr_score_min_db/
+    # max_db) и НЕ зависит от порога публикации min_spectral_snr_db —
+    # раньше знаменатель включал min_spectral_snr_db, из-за чего ужесточение
+    # порога публикации незаметно огрубляло саму шкалу snr_score (см.
+    # комментарий у min_spectral_snr_db в config.py).
     snr_score = float(
-        np.clip((inputs.spectral_snr_db - (-5)) / (qcfg.min_spectral_snr_db - (-5) + 10), 0.0, 1.0)
+        np.clip(
+            (inputs.spectral_snr_db - qcfg.snr_score_min_db) / (qcfg.snr_score_max_db - qcfg.snr_score_min_db),
+            0.0, 1.0,
+        )
     )
     if inputs.spectral_snr_db < qcfg.min_spectral_snr_db:
         warnings.append(
@@ -750,6 +770,7 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
     # поэтому штрафует именно spectral SNR, а не вводится как отдельный вес
     # в overall (у неё и так нет "своего" физического смысла качества сигнала
     # отдельно от того, ту ли частоту мы вообще нашли).
+    snr_score_raw = snr_score
     snr_score *= harmonic_score
 
     roi_score, cross_roi_n_participants, cross_roi_insufficient_in_principle = cross_roi_agreement_score(
@@ -882,5 +903,7 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
         cross_roi_n_participants=cross_roi_n_participants,
         cross_roi_insufficient_in_principle=cross_roi_insufficient_in_principle,
         harmonic_support=harmonic_support,
+        snr_score=snr_score,
+        snr_score_raw=snr_score_raw,
         warnings=warnings,
     )

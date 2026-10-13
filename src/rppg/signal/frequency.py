@@ -38,6 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import median_filter
 from scipy.signal import welch
 from scipy.signal import lombscargle
 
@@ -148,6 +149,74 @@ def _apply_physiological_rate_limit(
     return selected_idx if has_advantage else alt_idx
 
 
+def whiten_psd(freqs: np.ndarray, psd: np.ndarray, window_hz: float = 0.5) -> np.ndarray:
+    """Задача 50: отбеливание спектра — оценивает локальный шумовой пол
+    как скользящую МЕДИАНУ лог-мощности в широком (~window_hz) окне вдоль
+    частоты и вычитает её из log(psd). Возвращает whitened[i] =
+    log(psd[i]) - noise_floor[i] — эквивалентно (для выбора argmax)
+    делению psd на сглаженный noise_floor в линейном масштабе, но
+    устойчивее численно для очень малых значений PSD.
+
+    Мотивация: после детренда/бандпасса в спектре нередко остаётся
+    низкочастотный "холм" (~0.7-1.2 Hz) — при обычном argmax по сырому PSD
+    он может конкурировать с истинным пиком пульса, когда истинный HR
+    низкий (см. задачу 50: MAE растёт по мере снижения истинного HR,
+    subject 8 из UBFC — BPM осциллирует ±8 с периодом ~15с, классический
+    признак чередования между двумя сопоставимыми пиками). МЕДИАНА (а не
+    среднее/сглаживание) как оценка шумового пола устойчива к самому узкому
+    пику пульса (не "утекает" в его сторону при усреднении), но честно
+    отслеживает МЕДЛЕННЫЙ тренд базовой мощности вдоль спектра, включая сам
+    "холм" — деление на неё выравнивает базовый уровень по всей полосе, а
+    не только там, где он и так низкий.
+
+    window_hz переводится в число бинов через фактический шаг сетки
+    freqs (одинаковый для welch/fft, т.к. обе строят равномерную сетку) —
+    ширина окна в бинах не зависит от того, насколько подробна сетка
+    (влияет только частотное РАЗРЕШЕНИЕ отображения, см. quality.
+    resolvable_bpm_difference, не физический смысл окна)."""
+    freqs = np.asarray(freqs, dtype=float)
+    psd = np.asarray(psd, dtype=float)
+    log_psd = np.log(psd + 1e-15)  # eps: PSD теоретически строго > 0, защита от log(0)
+    if len(freqs) < 3:
+        return log_psd
+    df = float(np.median(np.diff(freqs)))
+    if not np.isfinite(df) or df <= 0:
+        return log_psd
+    window_bins = max(3, int(round(window_hz / df)))
+    if window_bins % 2 == 0:
+        window_bins += 1
+    noise_floor = median_filter(log_psd, size=window_bins, mode="nearest")
+    return log_psd - noise_floor
+
+
+def select_peak_from_spectrum(
+    freqs_hz: np.ndarray,
+    power: np.ndarray,
+    method_label: str,
+    recent_median_hz: float | None = None,
+    continuity_power_tolerance: float = 0.15,
+    max_physiological_change_hz: float = 0.0,
+    rate_limit_median_hz: float | None = None,
+    physiological_rate_limit_power_advantage: float = 2.0,
+) -> FrequencyEstimate:
+    """Выбор пика по уже посчитанному спектру (в полосе) — та же логика
+    непрерывности и физиологического ограничения скорости, что внутри
+    estimate_hr_fft/estimate_hr_welch. Нужна там, где спектр получается
+    не из одного сигнала, а объединением нескольких (см.
+    ROIConfig.spectral_combination="spectral_mean")."""
+    freqs_hz = np.asarray(freqs_hz, dtype=float)
+    power = np.asarray(power, dtype=float)
+    if len(freqs_hz) == 0 or not np.any(np.isfinite(power)):
+        return FrequencyEstimate(np.nan, np.nan, method_label, freqs_hz, power)
+    peak_idx = _select_peak_with_continuity(freqs_hz, power, recent_median_hz, continuity_power_tolerance)
+    peak_idx = _apply_physiological_rate_limit(
+        freqs_hz, power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+    )
+    peak_freq = float(freqs_hz[peak_idx])
+    return FrequencyEstimate(peak_freq * 60.0, peak_freq, method_label, freqs_hz, power)
+
+
 def estimate_hr_fft(
     signal: np.ndarray,
     fps: float,
@@ -157,6 +226,8 @@ def estimate_hr_fft(
     max_physiological_change_hz: float = 0.0,
     rate_limit_median_hz: float | None = None,
     physiological_rate_limit_power_advantage: float = 2.0,
+    peak_selection: str = "argmax",
+    whitening_window_hz: float = 0.5,
 ) -> FrequencyEstimate:
     signal = np.asarray(signal, dtype=float)
     n = len(signal)
@@ -172,10 +243,17 @@ def estimate_hr_fft(
         return FrequencyEstimate(np.nan, np.nan, "fft", freqs, spectrum)
 
     band_freqs, band_power = freqs[mask], spectrum[mask]
-    peak_idx = _select_peak_with_continuity(band_freqs, band_power, recent_median_hz, continuity_power_tolerance)
+    # Задача 50: peak_selection="whitened" — ВЫБОР пика идёт по отбелённому
+    # спектру (см. whiten_psd), но .power в возвращаемом FrequencyEstimate
+    # остаётся исходной (не отбелённой) мощностью — внешние потребители
+    # (SQI/debug-оверлей) ожидают физическую величину, не лог-разность.
+    selection_power = (
+        whiten_psd(band_freqs, band_power, whitening_window_hz) if peak_selection == "whitened" else band_power
+    )
+    peak_idx = _select_peak_with_continuity(band_freqs, selection_power, recent_median_hz, continuity_power_tolerance)
     peak_idx = _apply_physiological_rate_limit(
-        band_freqs, band_power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
-        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+        band_freqs, selection_power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=(peak_selection == "whitened"), min_power_advantage=physiological_rate_limit_power_advantage,
     )
     peak_freq = float(band_freqs[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "fft", band_freqs, band_power)
@@ -190,7 +268,17 @@ def estimate_hr_welch(
     max_physiological_change_hz: float = 0.0,
     rate_limit_median_hz: float | None = None,
     physiological_rate_limit_power_advantage: float = 2.0,
+    peak_selection: str = "argmax",
+    whitening_window_hz: float = 0.5,
 ) -> FrequencyEstimate:
+    """peak_selection="whitened" (задача 50): перед поиском пика PSD
+    делится (в лог-масштабе — см. whiten_psd) на скользящую медиану
+    лог-мощности в окне шириной whitening_window_hz — устраняет
+    низкочастотный "холм", конкурирующий с истинным пиком пульса, когда
+    истинный HR низкий (см. docstring whiten_psd). По умолчанию
+    "argmax" — прежнее поведение без изменений (см. FrequencyConfig.
+    peak_selection: пока не откалибровано против argmax на полном наборе
+    данных, включено по умолчанию НЕ отбеливание)."""
     signal = np.asarray(signal, dtype=float)
     nperseg = min(len(signal), max(64, int(fps * 8)))
     # nfft отвязан от nperseg и явно завышен (zero-padding) — nperseg управляет
@@ -205,10 +293,17 @@ def estimate_hr_welch(
         return FrequencyEstimate(np.nan, np.nan, "welch", freqs, psd)
 
     band_freqs, band_psd = freqs[mask], psd[mask]
-    peak_idx = _select_peak_with_continuity(band_freqs, band_psd, recent_median_hz, continuity_power_tolerance)
+    # Задача 50: ВЫБОР пика идёт по отбелённому спектру, если запрошено, но
+    # .power в возвращаемом FrequencyEstimate остаётся исходной (не
+    # отбелённой) мощностью — внешние потребители (SQI/debug-оверлей)
+    # ожидают физическую величину, не лог-разность.
+    selection_power = (
+        whiten_psd(band_freqs, band_psd, whitening_window_hz) if peak_selection == "whitened" else band_psd
+    )
+    peak_idx = _select_peak_with_continuity(band_freqs, selection_power, recent_median_hz, continuity_power_tolerance)
     peak_idx = _apply_physiological_rate_limit(
-        band_freqs, band_psd, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
-        power_is_log=False, min_power_advantage=physiological_rate_limit_power_advantage,
+        band_freqs, selection_power, rate_limit_median_hz, peak_idx, max_physiological_change_hz,
+        power_is_log=(peak_selection == "whitened"), min_power_advantage=physiological_rate_limit_power_advantage,
     )
     peak_freq = float(band_freqs[peak_idx])
     return FrequencyEstimate(peak_freq * 60.0, peak_freq, "welch", band_freqs, band_psd)
@@ -353,7 +448,15 @@ def estimate_hr(
     max_physiological_change_hz: float = 0.0,
     rate_limit_median_hz: float | None = None,
     physiological_rate_limit_power_advantage: float = 2.0,
+    peak_selection: str = "argmax",
+    whitening_window_hz: float = 0.5,
 ) -> FrequencyEstimate:
+    """peak_selection/whitening_window_hz (задача 50) применимы только к
+    welch/fft (единый равномерный частотный PSD-грид, см. whiten_psd) —
+    lomb_scargle/harmonic_sum молча их игнорируют: harmonic_sum уже
+    считает СВОЮ производную величину (лог-сумма по гармоникам, не сырой
+    PSD одной точки), а lomb_scargle нормализован иначе (normalize=True) —
+    отбеливание для них не определено в этой задаче."""
     if method == "lomb_scargle":
         if timestamps_sec is None:
             timestamps_sec = np.arange(len(signal)) / fps
@@ -369,6 +472,7 @@ def estimate_hr(
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
             max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
             physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
+            peak_selection=peak_selection, whitening_window_hz=whitening_window_hz,
         )
     if method == "welch":
         return estimate_hr_welch(
@@ -376,6 +480,7 @@ def estimate_hr(
             recent_median_hz=recent_median_hz, continuity_power_tolerance=continuity_power_tolerance,
             max_physiological_change_hz=max_physiological_change_hz, rate_limit_median_hz=rate_limit_median_hz,
             physiological_rate_limit_power_advantage=physiological_rate_limit_power_advantage,
+            peak_selection=peak_selection, whitening_window_hz=whitening_window_hz,
         )
     if method == "harmonic_sum":
         return estimate_hr_harmonic_sum(

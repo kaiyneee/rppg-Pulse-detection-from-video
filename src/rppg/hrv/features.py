@@ -177,6 +177,111 @@ def mean_hr_from_peaks_in_window(signal: np.ndarray, fps: float) -> tuple[float 
     return float(60000.0 / np.mean(ibi_ms)), peaks_sub
 
 
+def _select_frequency_candidate(
+    f_hz: float,
+    band_hz: tuple[float, float],
+    reference_hz: float,
+    confidence_ratio: float = 2.0,
+) -> tuple[float, str, bool, bool]:
+    """Ядро выбора кандидата {f, 2f, f/2}, вынесенное из
+    cross_check_spectral_vs_peaks задачей 49 — та же самая логика нужна не
+    только для сверки со СВОЕЙ пиковой оценкой ОДНОГО окна (задача 46), но
+    и для пересмотра выбора против ИТОГОВОЙ истории по всему видео (см.
+    reconsider_candidate_against_history ниже) — вместо шумной
+    однооконной peak_hz подставляется reference_hz, посчитанная как
+    угодно вызывающим кодом.
+
+    Возвращает (best_hz, verdict, confident, has_candidates).
+    has_candidates=False — ОТДЕЛЬНЫЙ от confident случай: кандидатов вне
+    band_hz не осталось вообще (или reference_hz<=0) — сравнивать было не
+    с чем, а не "сравнили и не уверены" (вызывающий код различает эти два
+    случая — первый остаётся "insufficient_peaks", второй — "ambiguous").
+    verdict называет, ЧЕМ оказался ближайший кандидат относительно f_hz —
+    не зависит от confident; при confident=False ближайший кандидат не
+    превосходит следующего по близости минимум в confidence_ratio раз (см.
+    докстринг CrossCheckResult.verdict про "ambiguous")."""
+    low_hz, high_hz = band_hz
+    candidates_hz = [f_hz, 2.0 * f_hz]
+    if f_hz / 2.0 >= low_hz:
+        candidates_hz.append(f_hz / 2.0)
+    candidates_hz = [c for c in candidates_hz if low_hz <= c <= high_hz]
+
+    if not candidates_hz or reference_hz <= 0:
+        return f_hz, "agreement", False, False
+
+    distances = [abs(float(np.log(c / reference_hz))) for c in candidates_hz]
+    order = sorted(range(len(candidates_hz)), key=lambda i: distances[i])
+    best_hz = candidates_hz[order[0]]
+    best_dist = distances[order[0]]
+
+    confident = True
+    if len(order) >= 2:
+        second_dist = distances[order[1]]
+        confident = (best_dist == 0.0) or (second_dist >= confidence_ratio * best_dist)
+
+    if abs(best_hz - f_hz) < 1e-9:
+        verdict = "agreement"
+    elif abs(best_hz - 2.0 * f_hz) < 1e-9:
+        verdict = "corrected_to_2f"
+    else:
+        verdict = "corrected_to_half_f"
+    return best_hz, verdict, confident, True
+
+
+def reconsider_candidate_against_history(
+    bpm_spectral: float,
+    band_hz: tuple[float, float],
+    reference_history_bpm: float | None,
+    confidence_ratio: float = 2.0,
+) -> tuple[float, str, bool]:
+    """Задача 49, п.3: для окон, которым при первом (причинном) проходе не
+    хватило истории (history_was_insufficient=True, см.
+    RPPGPipeline._smooth_bpm_against_trusted_history), второй офлайн-проход
+    (scripts/run_on_video.py --two-pass) до сих пор пересматривал ТОЛЬКО
+    кратность — apply_history_ratio_check жёстко флипает bpm в 2 раза,
+    если он отличается от медианы итоговой истории в диапазоне [1.7, 2.3].
+    Это находит настоящие октавные ошибки (~2x), но: (1) не ловит НЕ
+    ровно двукратные холодностартовые ошибки (например, 53.6 против
+    истинных 73 — ratio 1.36, не октава), и (2) не использует физиологическую
+    полосу band_hz для отбраковки кандидатов вне неё.
+
+    Здесь вместо этого пересматривается САМ ВЫБОР кандидата {f, 2f, f/2}
+    (см. _select_frequency_candidate) — референсом служит НЕ пиковая
+    оценка этого одного (holодностартового, потому и ненадёжного) окна, а
+    медиана итоговой истории по всему видео, доступная только офлайн и
+    только вторым проходом. Ошибки типа (1) выше это НЕ ловит и не должно —
+    если bpm_spectral сам по себе не является гармоникой/субгармоникой
+    правильного значения (см. задача 49: диагностика показала, что часть
+    холодностартовых ошибок — не октавные, а самостоятельно смещённая
+    оценка пика, вероятно из-за дрейфа экспозиции камеры в начале записи;
+    это отдельная проблема, не решаемая пересмотром кандидатов).
+
+    Возвращает (bpm, verdict, confident) — verdict/confident как у
+    _select_frequency_candidate; при отсутствии валидного bpm_spectral,
+    reference_history_bpm, либо кандидатов в band_hz возвращает
+    (bpm_spectral, "insufficient_peaks", False) без изменений; при наличии
+    кандидатов, но неуверенном выборе — (bpm_spectral, "ambiguous", False)
+    (тоже без изменений — не гадаем между близкими альтернативами, как и
+    cross_check_spectral_vs_peaks)."""
+    if (
+        not np.isfinite(bpm_spectral) or bpm_spectral <= 0
+        or reference_history_bpm is None or not np.isfinite(reference_history_bpm)
+        or reference_history_bpm <= 0
+    ):
+        return bpm_spectral, "insufficient_peaks", False
+
+    f_hz = bpm_spectral / 60.0
+    reference_hz = reference_history_bpm / 60.0
+    best_hz, verdict, confident, has_candidates = _select_frequency_candidate(
+        f_hz, band_hz, reference_hz, confidence_ratio,
+    )
+    if not has_candidates:
+        return bpm_spectral, "insufficient_peaks", False
+    if not confident:
+        return bpm_spectral, "ambiguous", False
+    return best_hz * 60.0, verdict, confident
+
+
 def cross_check_spectral_vs_peaks(
     bpm_spectral: float,
     signal: np.ndarray,
@@ -215,32 +320,27 @@ def cross_check_spectral_vs_peaks(
             is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
         )
 
-    low_hz, high_hz = band_hz
     f_hz = bpm_spectral / 60.0
     peak_hz = peak_hr / 60.0
     ratio = peak_hr / bpm_spectral
 
-    candidates_hz = [f_hz, 2.0 * f_hz]
-    if f_hz / 2.0 >= low_hz:
-        candidates_hz.append(f_hz / 2.0)
-    candidates_hz = [c for c in candidates_hz if low_hz <= c <= high_hz]
-
-    if not candidates_hz or peak_hz <= 0:
+    if peak_hz <= 0:
         return CrossCheckResult(
             verdict="insufficient_peaks", bpm=bpm_spectral, ratio=ratio,
             mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
             is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
         )
 
-    distances = [abs(float(np.log(c / peak_hz))) for c in candidates_hz]
-    order = sorted(range(len(candidates_hz)), key=lambda i: distances[i])
-    best_hz = candidates_hz[order[0]]
-    best_dist = distances[order[0]]
+    best_hz, verdict, confident, has_candidates = _select_frequency_candidate(
+        f_hz, band_hz, peak_hz, confidence_ratio,
+    )
 
-    confident = True
-    if len(order) >= 2:
-        second_dist = distances[order[1]]
-        confident = (best_dist == 0.0) or (second_dist >= confidence_ratio * best_dist)
+    if not has_candidates:
+        return CrossCheckResult(
+            verdict="insufficient_peaks", bpm=bpm_spectral, ratio=ratio,
+            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
+            is_bpm_reliable=True, peaks_ok_for_ibi=False, confidence_boost=0.0,
+        )
 
     if not confident:
         return CrossCheckResult(
@@ -250,22 +350,11 @@ def cross_check_spectral_vs_peaks(
         )
 
     corrected_bpm = best_hz * 60.0
-    if abs(best_hz - f_hz) < 1e-9:
-        return CrossCheckResult(
-            verdict="agreement", bpm=corrected_bpm, ratio=ratio,
-            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
-            is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=agreement_confidence_boost,
-        )
-    if abs(best_hz - 2.0 * f_hz) < 1e-9:
-        return CrossCheckResult(
-            verdict="corrected_to_2f", bpm=corrected_bpm, ratio=ratio,
-            mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
-            is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=0.0,
-        )
     return CrossCheckResult(
-        verdict="corrected_to_half_f", bpm=corrected_bpm, ratio=ratio,
+        verdict=verdict, bpm=corrected_bpm, ratio=ratio,
         mean_hr_from_peaks=peak_hr, peaks_sub=peaks_sub,
-        is_bpm_reliable=True, peaks_ok_for_ibi=True, confidence_boost=0.0,
+        is_bpm_reliable=True, peaks_ok_for_ibi=True,
+        confidence_boost=agreement_confidence_boost if verdict == "agreement" else 0.0,
     )
 
 

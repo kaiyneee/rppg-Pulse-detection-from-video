@@ -215,7 +215,7 @@ def roi_mean_rgb(
     mask: np.ndarray,
     min_valid_fraction: float = 0.6,
     trim_fraction: float = 0.10,
-) -> tuple[np.ndarray | None, bool, int]:
+) -> tuple[np.ndarray | None, bool, int, str | None]:
     """Робастная оценка R,G,B по маске: усечённое среднее (truncated mean),
     НЕ медиана. Возвращает (rgb[3] | None, valid, n_valid_pixels).
 
@@ -258,10 +258,27 @@ def roi_mean_rgb(
     между кадрами (окклюзия, поворот головы) — самостоятельный повод
     пометить кадр невалидным, ДАЖЕ если min_valid_fraction формально
     пройдена (см. RPPGPipeline._check_valid_pixel_count_stability, задача 31).
+
+    Задача 52: четвёртый элемент возврата — rejection_cause (None при
+    valid=True), различающий ДВЕ разные причины valid=False, до этого
+    слитые в один и тот же булев флаг и неразличимые в логе:
+      "mask_empty"         — mask (обычно полигон ROI ∩ маска кожи, см.
+                              extract_rois) пуст ЦЕЛИКОМ — для реальных
+                              лицевых ROI геометрический полигон почти
+                              никогда не пуст сам по себе (лицо уже
+                              обнаружено), так что это практически всегда
+                              означает "маска кожи отклонила весь полигон"
+                              (например, чёлка перекрывает лоб — см.
+                              extract_rois, где вызывающий код переименовывает
+                              эту причину в "skin_mask_empty" для лицевых ROI).
+      "brightness_clipping" — mask непустая, но доля пикселей, прошедших
+                              порог отсечения блика/тени (10 < яркость <
+                              250), не набрала min_valid_fraction —
+                              освещение, а не маска кожи.
     """
     ys, xs = np.where(mask > 0)
     if len(ys) == 0:
-        return None, False, 0
+        return None, False, 0, "mask_empty"
 
     pixels = frame_bgr[ys, xs].astype(np.float64)  # (K,3) BGR, float64
     brightness = pixels.mean(axis=1)
@@ -269,7 +286,7 @@ def roi_mean_rgb(
     n_valid = int(good.sum())
 
     if n_valid < min_valid_fraction * len(ys):
-        return None, False, n_valid
+        return None, False, n_valid, "brightness_clipping"
 
     good_pixels = pixels[good]
     good_brightness = brightness[good]
@@ -279,7 +296,7 @@ def roi_mean_rgb(
 
     mean_bgr = good_pixels[trimmed_idx].mean(axis=0)
     mean_rgb = mean_bgr[::-1].copy()  # BGR -> RGB
-    return mean_rgb, True, n_valid
+    return mean_rgb, True, n_valid, None
 
 
 @dataclass
@@ -287,6 +304,13 @@ class ROIExtractionResult:
     rgb_by_roi: dict[str, np.ndarray | None]
     valid_by_roi: dict[str, bool]
     valid_pixel_count_by_roi: dict[str, int]  # задача 31 — для проверки стабильности состава ROI
+    # Задача 52: причина valid_by_roi[name]=False на уровне ОДНОГО кадра
+    # (None при valid=True) — "skin_mask_empty"/"brightness_clipping" из
+    # roi_mean_rgb (переименовано из общего "mask_empty", см. extract_rois
+    # ниже); "valid_pixel_count_unstable" добавляется ПОСЛЕ, вызывающим
+    # кодом (RPPGPipeline.process_frame), если валидный по этой функции
+    # кадр забраковала _check_valid_pixel_count_stability.
+    rejection_cause_by_roi: dict[str, str | None]
     landmarks_px: np.ndarray
     stable_tracking_points: np.ndarray  # (len(STABLE_TRACKING_IDX), 2)
     interocular_distance_px: float  # п.19 — абсолютный масштаб лица
@@ -320,13 +344,20 @@ def extract_rois(
     rgb_by_roi: dict[str, np.ndarray | None] = {}
     valid_by_roi: dict[str, bool] = {}
     valid_pixel_count_by_roi: dict[str, int] = {}
+    rejection_cause_by_roi: dict[str, str | None] = {}
     for name in roi_names:
         mask = build_roi_mask(landmarks_px, name, frame_bgr.shape, shrink_factor)
         mask = mask & skin_mask
-        rgb, valid, n_valid = roi_mean_rgb(frame_bgr, mask, min_valid_fraction, trim_fraction)
+        rgb, valid, n_valid, cause = roi_mean_rgb(frame_bgr, mask, min_valid_fraction, trim_fraction)
         rgb_by_roi[name] = rgb
         valid_by_roi[name] = valid
         valid_pixel_count_by_roi[name] = n_valid
+        # Задача 52: здесь mask = полигон ROI ∩ маска кожи — геометрический
+        # полигон сам по себе почти никогда не пуст (лицо уже обнаружено),
+        # поэтому "mask_empty" для лицевого ROI практически всегда означает
+        # именно "маска кожи отклонила весь полигон" — переименовываем для
+        # точности лога (см. docstring roi_mean_rgb).
+        rejection_cause_by_roi[name] = "skin_mask_empty" if cause == "mask_empty" else cause
 
     stable_points = landmarks_px[STABLE_TRACKING_IDX].astype(np.float64)
     ipd = interocular_distance_px(landmarks_px)
@@ -336,12 +367,13 @@ def extract_rois(
     bg_mask = build_background_roi_mask(frame_bgr.shape, landmarks_px)
     if bg_mask is not None:
         # Фон намеренно БЕЗ skin_mask — это не кожа, и порог кожи отсеял бы его целиком.
-        background_rgb, background_valid, _ = roi_mean_rgb(frame_bgr, bg_mask, min_valid_fraction, trim_fraction)
+        background_rgb, background_valid, _, _ = roi_mean_rgb(frame_bgr, bg_mask, min_valid_fraction, trim_fraction)
 
     return ROIExtractionResult(
         rgb_by_roi=rgb_by_roi,
         valid_by_roi=valid_by_roi,
         valid_pixel_count_by_roi=valid_pixel_count_by_roi,
+        rejection_cause_by_roi=rejection_cause_by_roi,
         landmarks_px=landmarks_px,
         stable_tracking_points=stable_points,
         interocular_distance_px=ipd,
