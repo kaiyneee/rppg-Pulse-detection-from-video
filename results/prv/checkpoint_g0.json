@@ -1,0 +1,258 @@
+{
+  "preset": "fft_spectral_mean",
+  "n_records": 50,
+  "mae_by_records": 1.196987163727766,
+  "coverage_mean": 0.9921405194394134,
+  "per_record": {
+    "10": {
+      "mae": 0.40451895000822663,
+      "coverage": 1.0,
+      "n_windows": 33
+    },
+    "11": {
+      "mae": 0.3931711919190716,
+      "coverage": 1.0,
+      "n_windows": 70
+    },
+    "12": {
+      "mae": 0.5817095410643568,
+      "coverage": 1.0,
+      "n_windows": 73
+    },
+    "5": {
+      "mae": 0.8356785982814158,
+      "coverage": 0.9459459459459459,
+      "n_windows": 74
+    },
+    "6": {
+      "mae": 0.4884171095724276,
+      "coverage": 1.0,
+      "n_windows": 73
+    },
+    "7": {
+      "mae": 0.4252282207873665,
+      "coverage": 1.0,
+      "n_windows": 72
+    },
+    "8": {
+      "mae": 1.2898136629864672,
+      "coverage": 1.0,
+      "n_windows": 63
+    },
+    "after-exercise": {
+      "mae": 0.551183361599541,
+      "coverage": 1.0,
+      "n_windows": 107
+    },
+    "subject1": {
+      "mae": 1.6181830576559058,
+      "coverage": 1.0,
+      "n_windows": 42
+    },
+    "subject10": {
+      "mae": 0.9660679632328004,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject11": {
+      "mae": 1.3825914553419967,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject12": {
+      "mae": 0.9468528433176658,
+      "coverage": 1.0,
+      "n_windows": 57
+    },
+    "subject13": {
+      "mae": 0.8616801936287398,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject14": {
+      "mae": 2.196775897153499,
+      "coverage": 1.0,
+      "n_windows": 57
+    },
+    "subject15": {
+      "mae": 1.9405719766205713,
+      "coverage": 0.9827586206896551,
+      "n_windows": 58
+    },
+    "subject16": {
+      "mae": 0.44256355434888794,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject17": {
+      "mae": 0.46151978806052746,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject18": {
+      "mae": 0.8930565217580756,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject20": {
+      "mae": 1.7217961002936495,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject22": {
+      "mae": 1.1641697266103455,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject23": {
+      "mae": 1.4553763979401466,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject24": {
+      "mae": 2.8465897375937312,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject25": {
+      "mae": 1.03713378713549,
+      "coverage": 1.0,
+      "n_windows": 51
+    },
+    "subject26": {
+      "mae": 0.5450974217176716,
+      "coverage": 0.9245283018867925,
+      "n_windows": 53
+    },
+    "subject27": {
+      "mae": 3.8038366864645985,
+      "coverage": 0.84,
+      "n_windows": 50
+    },
+    "subject3": {
+      "mae": 3.3195680649280805,
+      "coverage": 1.0,
+      "n_windows": 51
+    },
+    "subject30": {
+      "mae": 0.9748222918666688,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject31": {
+      "mae": 0.7756086110522113,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject32": {
+      "mae": 1.2337075089082814,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject33": {
+      "mae": 2.6672861040794356,
+      "coverage": 1.0,
+      "n_windows": 57
+    },
+    "subject34": {
+      "mae": 0.45197212723979435,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject35": {
+      "mae": 0.640072474666907,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject36": {
+      "mae": 0.6979419766673749,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject37": {
+      "mae": 0.729093948487636,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject38": {
+      "mae": 0.4834688531796546,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject39": {
+      "mae": 0.822323930712759,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject4": {
+      "mae": 2.499039171634888,
+      "coverage": 1.0,
+      "n_windows": 36
+    },
+    "subject40": {
+      "mae": 0.709488414867022,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject41": {
+      "mae": 1.074270943964997,
+      "coverage": 0.9655172413793104,
+      "n_windows": 58
+    },
+    "subject42": {
+      "mae": 0.4633177292152797,
+      "coverage": 1.0,
+      "n_windows": 59
+    },
+    "subject43": {
+      "mae": 1.325148384489878,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject44": {
+      "mae": 1.0905702192017757,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject45": {
+      "mae": 0.8260667352225062,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject46": {
+      "mae": 2.382119889887578,
+      "coverage": 1.0,
+      "n_windows": 57
+    },
+    "subject47": {
+      "mae": 0.9985682630230844,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject48": {
+      "mae": 1.3732875557796238,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject49": {
+      "mae": 1.1997559798794506,
+      "coverage": 0.9482758620689655,
+      "n_windows": 58
+    },
+    "subject5": {
+      "mae": 1.1601121679481978,
+      "coverage": 1.0,
+      "n_windows": 42
+    },
+    "subject8": {
+      "mae": 0.856947760503916,
+      "coverage": 1.0,
+      "n_windows": 58
+    },
+    "subject9": {
+      "mae": 1.8412153338881216,
+      "coverage": 1.0,
+      "n_windows": 58
+    }
+  }
+}
