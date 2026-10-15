@@ -43,12 +43,14 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmark"))
 
-from rppg.config import PipelineConfig
+from rppg.config import DEFAULT_PRESET, PRESET_OVERRIDES, PipelineConfig, make_pipeline_config
 from rppg.pipeline import RPPGPipeline, apply_second_pass
 from rppg.signal.preprocessing import preprocess_signal, tarvainen_cutoff_hz, tarvainen_lambda_for_cutoff
 from rppg.signal.frequency import estimate_hr
 from rppg.signal.quality import dominant_frequency_and_snr
+from reference_full10s import reference_full10s  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Однопроходные и двухпроходные результаты пишутся в РАЗНЫЕ файлы: смешивать
@@ -70,6 +72,9 @@ RESULTS_FIELDS = [
     "gt_min_bpm", "gt_max_bpm", "median_snr_db",
     "mae_all", "rmse_all", "mape_all_pct", "pearson_r_all", "pearson_r_all_informative",
     "mae_pub", "rmse_pub", "mape_pub_pct", "pearson_r_pub", "pearson_r_pub_informative",
+    # Основной эталон (полное 10-секундное окно, фиксированный способ, см.
+    # benchmark/reference_full10s.py) и пресет, которым получена строка.
+    "mae_pub_full10s", "preset",
 ]
 
 WINDOW_FIELDS = [
@@ -77,7 +82,7 @@ WINDOW_FIELDS = [
     # процедурой, что и оценка (участвует в метриках); bpm_ref_device — прежняя
     # колонка ЧСС прибора, оставлена рядом, т.к. расхождение между ними —
     # самостоятельный результат; ref_wave_snr_db — качество самой волны в окне.
-    "second", "bpm_pred", "bpm_ref_wave", "bpm_ref_device", "ref_wave_snr_db",
+    "second", "bpm_pred", "bpm_ref_wave", "bpm_ref_device", "ref_wave_snr_db", "bpm_ref_full10s",
     "error", "sqi_score", "publishable",
     # Задача 51, пункт 1: отдельные компоненты SQI — нужны для проверки,
     # какая (если хоть одна) из них реально предсказывает ошибку на уровне
@@ -173,6 +178,7 @@ def reference_bpm_from_wave(
     window_end_s: float,
     window_seconds: float,
     cfg: PipelineConfig,
+    method: str = "welch",
 ) -> tuple[float | None, float | None]:
     """Эталонная ЧСС окна, посчитанная из контактной волны ТОЙ ЖЕ
     процедурой, что и rPPG-оценка. Возвращает (bpm, snr_db волны).
@@ -245,7 +251,12 @@ def reference_bpm_from_wave(
         order=cfg.filt.filter_order, detrend_method=cfg.filt.detrend_method,
         tarvainen_lambda=lam, normalize_method=cfg.filt.normalize_method,
     )
-    est = estimate_hr(processed, fs, band, method=cfg.frequency_method.value)
+    # Эталон ПЕРВОЙ СТАТЬИ: метод фиксирован (по умолчанию Уэлч с одним
+    # 8-секундным сегментом) и НЕ берётся из cfg.frequency_method — после
+    # смены умолчаний оценщика (пресет fft_spectral_mean) эталон статьи
+    # иначе молча сменил бы определение. Используется только для сверки со
+    # статьями; основной эталон — benchmark/reference_full10s.py.
+    est = estimate_hr(processed, fs, band, method=method)
     _, snr_db = dominant_frequency_and_snr(processed, fs, band)
     bpm = float(est.bpm) if np.isfinite(est.bpm) else None
     return bpm, (float(snr_db) if np.isfinite(snr_db) else None)
@@ -272,13 +283,13 @@ def reference_median_for_window(t_sec: np.ndarray, hr: np.ndarray, window_end_s:
     return float(np.median(hr[mask]))
 
 
-def run_pipeline(video_path: Path, two_pass: bool = False) -> list:
+def run_pipeline(video_path: Path, two_pass: bool = False, preset: str = DEFAULT_PRESET) -> list:
     """two_pass=True — штатный режим ОФЛАЙН-обработки (см.
     rppg.pipeline.apply_second_pass и scripts/run_on_video.py): после
     причинного первого прохода окна, которым не хватило истории, ещё раз
     сверяются с итоговой историей за всю запись. Требует debug=True, иначе
     флаг history_was_insufficient недоступен."""
-    config = PipelineConfig()
+    config = make_pipeline_config(preset)
     config.face.model_asset_path = str(MODEL_PATH)
 
     cap = cv2.VideoCapture(str(video_path))
@@ -319,6 +330,7 @@ def build_window_records(
         window_end_s = r.timestamp_ms / 1000.0
         ref, ref_snr = reference_bpm_from_wave(t_ref, wave, window_end_s, window_seconds, cfg)
         ref_device = reference_median_for_window(t_ref, hr_device, window_end_s, window_seconds)
+        ref_full = reference_full10s(t_ref, wave, window_end_s)
         pred = r.bpm
         has_pred = pred is not None and np.isfinite(pred)
         error = (pred - ref) if (has_pred and ref is not None) else None
@@ -328,6 +340,7 @@ def build_window_records(
             "bpm_pred": pred if has_pred else None,
             "bpm_ref_wave": ref,
             "bpm_ref_device": ref_device,
+            "bpm_ref_full10s": None if ref_full is None else ref_full["bpm_ref"],
             "ref_wave_snr_db": ref_snr,
             "error": error,
             "sqi_score": r.sqi_score,
@@ -362,7 +375,7 @@ def _error_metrics(pred: np.ndarray, ref: np.ndarray) -> dict:
     return dict(mae=mae, rmse=rmse, mape_pct=mape_pct, pearson_r=r, pearson_r_informative=informative)
 
 
-def compute_subject_summary(subject: str, records: list[dict]) -> dict:
+def compute_subject_summary(subject: str, records: list[dict], preset: str = DEFAULT_PRESET) -> dict:
     valid_all = [w for w in records if w["bpm_pred"] is not None and w["bpm_ref_wave"] is not None]
     valid_pub = [w for w in valid_all if w["publishable"]]
 
@@ -394,7 +407,16 @@ def compute_subject_summary(subject: str, records: list[dict]) -> dict:
         "pearson_r_all": m_all["pearson_r"], "pearson_r_all_informative": m_all["pearson_r_informative"],
         "mae_pub": m_pub["mae"], "rmse_pub": m_pub["rmse"], "mape_pub_pct": m_pub["mape_pct"],
         "pearson_r_pub": m_pub["pearson_r"], "pearson_r_pub_informative": m_pub["pearson_r_informative"],
+        "mae_pub_full10s": _mae_full10s(records),
+        "preset": preset,
     }
+
+
+def _mae_full10s(records: list[dict]) -> float | None:
+    """MAE по опубликованным окнам против основного эталона (полное окно)."""
+    errs = [abs(w["bpm_pred"] - w["bpm_ref_full10s"]) for w in records
+            if w["publishable"] and w["bpm_pred"] is not None and w.get("bpm_ref_full10s") is not None]
+    return float(np.mean(errs)) if errs else None
 
 
 def write_window_csv(subject: str, records: list[dict]) -> Path:
@@ -490,6 +512,37 @@ def print_aggregate_summary() -> None:
         print(f"  Бутстрэп 95% ДИ для среднего MAE (n_boot={n_boot}): [{lo:.2f}, {hi:.2f}]")
 
 
+def write_run_meta(path: Path, preset: str, two_pass: bool) -> None:
+    """Метаданные прогона: пресет, полный конфиг, коммит, версии. Прогон
+    идёт по одной записи за вызов — файл перезаписывается каждым вызовом;
+    пресет КАЖДОЙ строки сохраняется ещё и в колонке preset ubfc_results*.csv."""
+    import json
+    import platform
+    import subprocess
+    from datetime import datetime, timezone
+
+    from rppg.config_io import config_to_dict
+
+    def _git(*a):
+        try:
+            return subprocess.run(["git", *a], capture_output=True, text=True, cwd=REPO_ROOT).stdout.strip() or None
+        except OSError:
+            return None
+
+    meta = {
+        "preset": preset,
+        "two_pass": two_pass,
+        "run_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "git_commit": _git("rev-parse", "HEAD"),
+        "git_dirty": bool(_git("status", "--porcelain", "--untracked-files=no")),
+        "versions": {"python": platform.python_version(), "numpy": np.__version__, "opencv": cv2.__version__},
+        "reference_main": "full10s-v1 (benchmark/reference_full10s.py) -> bpm_ref_full10s, mae_pub_full10s",
+        "reference_paper": "Welch 8 s (reference_bpm_from_wave, method frozen) -> bpm_ref_wave, mae_pub",
+        "pipeline_config": config_to_dict(make_pipeline_config(preset)),
+    }
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--subject-dir", type=str, required=True)
@@ -500,12 +553,24 @@ def main() -> None:
              "Результаты пишутся в ubfc_results_twopass.csv / ubfc_windows_twopass/ — ОТДЕЛЬНО от "
              "однопроходных, чтобы обе методики можно было сравнить, а не подменить одну другой.",
     )
+    parser.add_argument(
+        "--preset", default=DEFAULT_PRESET, choices=sorted(PRESET_OVERRIDES),
+        help="Пресет конфигурации пайплайна. legacy_welch8 — конфигурация, на которой получены "
+             "результаты статей (git-тег papers-v1).",
+    )
+    parser.add_argument(
+        "--out-dir", default=str(REPO_ROOT),
+        help="Каталог для ubfc_results*.csv, ubfc_windows*/ и метаданных прогона "
+             "(по умолчанию — корень репозитория, как раньше).",
+    )
     args = parser.parse_args()
 
     global RESULTS_CSV, WINDOWS_DIR
-    if args.two_pass:
-        RESULTS_CSV = REPO_ROOT / "ubfc_results_twopass.csv"
-        WINDOWS_DIR = REPO_ROOT / "ubfc_windows_twopass"
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "_twopass" if args.two_pass else ""
+    RESULTS_CSV = out_dir / f"ubfc_results{suffix}.csv"
+    WINDOWS_DIR = out_dir / f"ubfc_windows{suffix}"
 
     subject_dir = Path(args.subject_dir)
     if not subject_dir.is_dir():
@@ -529,20 +594,21 @@ def main() -> None:
     # среза детренда, которую надо перенести на fs контактной волны (см.
     # reference_bpm_from_wave); при умолчании 30.0 вместо фактических ~28.7
     # цель сместилась бы на 4%.
-    eval_config = PipelineConfig()
+    eval_config = make_pipeline_config(args.preset)
     _cap = cv2.VideoCapture(str(video_path))
     _fps = _cap.get(cv2.CAP_PROP_FPS)
     _cap.release()
     if _fps and np.isfinite(_fps) and _fps > 0:
         eval_config.window.assumed_fps = float(_fps)
-    rows, window_seconds = run_pipeline(video_path, two_pass=args.two_pass)
+    rows, window_seconds = run_pipeline(video_path, two_pass=args.two_pass, preset=args.preset)
     if not rows:
         print(f"ОШИБКА: пайплайн не вернул ни одного окна для {video_path}", file=sys.stderr)
         print("Ничего не записано в ubfc_results.csv.", file=sys.stderr)
         sys.exit(1)
 
     records = build_window_records(rows, window_seconds, t_ref, ref_wave, hr_device, eval_config)
-    summary = compute_subject_summary(subject, records)
+    summary = compute_subject_summary(subject, records, preset=args.preset)
+    write_run_meta(out_dir / f"ubfc_run_meta{suffix}.json", args.preset, args.two_pass)
 
     windows_path = write_window_csv(subject, records)
     upsert_results_csv(summary)

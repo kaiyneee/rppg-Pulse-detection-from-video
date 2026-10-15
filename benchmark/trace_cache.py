@@ -37,7 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "benchmark"))
 
 import rppg.pipeline as pipeline_mod  # noqa: E402
-from rppg.config import PipelineConfig  # noqa: E402
+from rppg.config import DEFAULT_PRESET, PipelineConfig, make_pipeline_config  # noqa: E402
 from rppg.pipeline import RPPGPipeline, apply_second_pass  # noqa: E402
 
 import eval_ubfc_subject as ev  # noqa: E402
@@ -86,9 +86,14 @@ def load_trace(record_id: str) -> RecordTrace:
         return _Unpickler(fh).load()
 
 
-def make_config(fps: float) -> PipelineConfig:
-    """Ровно тот конфиг, что использует scripts/eval_ubfc_subject.py."""
-    cfg = PipelineConfig()
+# Кэш построен при конфигурации статей; поле live — побитовая привязка к их
+# выгрузкам, поэтому сверка (verify) всегда идёт при этом пресете.
+CACHE_PRESET = "legacy_welch8"
+
+
+def make_config(fps: float, preset: str = DEFAULT_PRESET) -> PipelineConfig:
+    """Тот же конфиг, что строит scripts/eval_ubfc_subject.py, от пресета."""
+    cfg = make_pipeline_config(preset)
     cfg.face.model_asset_path = str(ev.MODEL_PATH)
     cfg.window.assumed_fps = float(fps)
     return cfg
@@ -108,7 +113,7 @@ def build_trace(record_id: str, subject_dir: Path) -> RecordTrace:
     t_ref, wave, hr_device = ev.load_reference_waveform(gt_path)
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cfg = make_config(fps)
+    cfg = make_config(fps, CACHE_PRESET)
 
     frames: list[FrameTrace] = []
     timestamps: list[int] = []
@@ -287,7 +292,7 @@ def cmd_verify(args) -> None:
     for path in sorted(CACHE_DIR.glob("*.pkl")):
         trace = load_trace(path.stem)
         t0 = time.time()
-        rows, _ = replay(trace)
+        rows, _ = replay(trace, make_config(trace.fps, CACHE_PRESET))
         t_total += time.time() - t0
         got = [_row(r) for r in rows]
         same_live = got == trace.live

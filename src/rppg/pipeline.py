@@ -55,6 +55,7 @@ from rppg.signal.quality import (
     compute_psd,
     effective_snr_peak_half_width_hz,
     resolvable_bpm_difference,
+    spectral_purity,
     SQIInputs,
     SQIResult,
 )
@@ -1793,6 +1794,15 @@ class RPPGPipeline:
 
         recent_bpm_history = list(self._recent_bpm_history) + [current_bpm]
 
+        # Чистота спектра, по которому получена оценка (в режиме
+        # spectral_mean — объединённого, он лежит на месте оценки best_roi).
+        purity_est = per_roi_freq_estimate.get(best_roi)
+        purity = (
+            spectral_purity(purity_est.freqs_hz, purity_est.power, purity_est.freq_hz,
+                            self.cfg.quality.spectral_purity_half_width_bpm)
+            if purity_est is not None else None
+        )
+
         sqi = assess_quality(
             SQIInputs(
                 spectral_snr_db=best_snr_db,
@@ -1809,6 +1819,7 @@ class RPPGPipeline:
                 harmonic_check_signal=harmonic_check_signal,
                 background_signal=background_signal,
                 recent_flicker_candidates=list(self._recent_flicker_candidates),
+                spectral_purity=purity,
             ),
             self.cfg.quality,
         )

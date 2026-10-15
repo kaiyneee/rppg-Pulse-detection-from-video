@@ -648,6 +648,21 @@ def detect_illumination_flicker(
     return candidate, bg_freq, bg_snr_db
 
 
+def spectral_purity(freqs_hz: np.ndarray, power: np.ndarray, peak_freq_hz: float,
+                    half_width_bpm: float = 3.0) -> float | None:
+    """Доля мощности спектра (уже ограниченного полосой) в окрестности
+    ±half_width_bpm от пика. None, если спектр пуст или пик не определён."""
+    freqs_hz = np.asarray(freqs_hz, dtype=float)
+    power = np.asarray(power, dtype=float)
+    if len(freqs_hz) == 0 or not np.isfinite(peak_freq_hz):
+        return None
+    total = float(np.sum(power))
+    if not np.isfinite(total) or total <= 0:
+        return None
+    near = np.abs(freqs_hz - peak_freq_hz) * 60.0 <= half_width_bpm
+    return float(np.sum(power[near]) / total)
+
+
 @dataclass
 class SQIInputs:
     """Входные измерения для assess_quality за одно окно оценки."""
@@ -683,6 +698,10 @@ class SQIInputs:
     # разовое совпадение гораздо вероятнее случайный шумовой пик). См.
     # QualityConfig.flicker_min_consecutive_windows.
     recent_flicker_candidates: list[bool] | None = None
+    # Чистота спектра, по которому получена оценка пульса (см.
+    # spectral_purity). None — не измерена (например, в режиме fusion);
+    # тогда жёсткая проверка чистоты не применяется.
+    spectral_purity: float | None = None
 
 
 @dataclass
@@ -733,6 +752,11 @@ class SQIResult:
     # snr_score_raw * harmonic_score). Нужна, чтобы отличать «слабый
     # спектральный пик» от «пик есть, но он похож на гармонику».
     snr_score_raw: float = 0.0
+    # Жёсткая проверка чистоты спектра (QualityConfig.min_spectral_purity):
+    # значение меры и результат проверки. При выключенной проверке
+    # purity_gate_pass всегда True.
+    spectral_purity: float = float("nan")
+    purity_gate_pass: bool = True
     warnings: list[str] = field(default_factory=list)
 
 
@@ -874,10 +898,21 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
     # освещения может дать высокий overall (все компоненты "согласны" —
     # именно потому, что артефакт синхронный), но is_reliable всё равно
     # должно быть False.
+    purity = inputs.spectral_purity
+    purity_gate_pass = (
+        qcfg.min_spectral_purity is None or purity is None or purity >= qcfg.min_spectral_purity
+    )
+    if not purity_gate_pass:
+        warnings.append(
+            f"Чистота спектра {purity:.3f} ниже порога {qcfg.min_spectral_purity:.3f}: "
+            "мощность не сосредоточена у пика — вероятно, пульса в сигнале нет."
+        )
+
     is_reliable = (
         (overall >= qcfg.min_overall_score_to_publish)
         and (inputs.spectral_snr_db >= qcfg.min_spectral_snr_db)
         and not flicker_suspected
+        and purity_gate_pass
     )
 
     if not is_reliable:
@@ -905,5 +940,7 @@ def assess_quality(inputs: SQIInputs, qcfg: QualityConfig) -> SQIResult:
         harmonic_support=harmonic_support,
         snr_score=snr_score,
         snr_score_raw=snr_score_raw,
+        spectral_purity=float(purity) if purity is not None else float("nan"),
+        purity_gate_pass=purity_gate_pass,
         warnings=warnings,
     )

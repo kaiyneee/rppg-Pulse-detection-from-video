@@ -131,7 +131,9 @@ class ROIConfig:
     #                     (benchmark/estimator_lab.py).
     # SQI (SNR, гармоники, согласие ROI) в обоих режимах считается по-прежнему
     # по ROI с наибольшим SNR — меняется только сама оценка частоты.
-    spectral_combination: str = "best_snr"
+    # Умолчание "spectral_mean" — с пресета fft_spectral_mean; прежнее
+    # поведение — пресет legacy_welch8 (см. make_pipeline_config).
+    spectral_combination: str = "spectral_mean"
 
 
 @dataclass
@@ -486,6 +488,17 @@ class QualityConfig:
     # ограничивающим сам по себе. Итоговый BPM передаётся в систему ПТСР
     # только если score >= порога.
     min_overall_score_to_publish: float = 0.5
+    # Жёсткая проверка «чистоты спектра» — ОТДЕЛЬНЫЙ гейт публикации, как
+    # проверка SNR и мерцания, а НЕ слагаемое композитного балла overall.
+    # Чистота — доля мощности полосы в ±spectral_purity_half_width_bpm от
+    # пика того спектра, по которому получена оценка пульса (в режиме
+    # roi.spectral_combination="spectral_mean" — объединённого). Окно
+    # публикуется, только если чистота >= min_spectral_purity.
+    # None — проверка выключена (умолчание). Порог — абсолютное значение
+    # доли, не квантиль окон; таблица порог -> покрытие/MAE/промахи на
+    # UBFC — results/accuracy/README.md.
+    min_spectral_purity: float | None = None
+    spectral_purity_half_width_bpm: float = 3.0
 
     # --- п.19: абсолютная нормировка landmark_stability на IPD ---
     # Доля межзрачкового (межуглового) расстояния, которую джиттер
@@ -690,8 +703,64 @@ class PipelineConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
     aggregate: AggregateConfig = field(default_factory=AggregateConfig)
     method: ExtractionMethod = ExtractionMethod.POS
-    frequency_method: FrequencyMethod = FrequencyMethod.WELCH
+    # Периодограмма ВСЕГО окна (Ханн, дополнение нулями). Прежнее умолчание
+    # WELCH с сегментом 8 с в окне 10 с помещало ровно один сегмент и не
+    # использовало последние ~2 с окна (results/accuracy/README.md).
+    frequency_method: FrequencyMethod = FrequencyMethod.FFT
+    # Имя пресета, от которого построен конфиг (см. make_pipeline_config).
+    # Пишется в сохраняемые конфиги и run_meta.json, чтобы по любому
+    # результату было видно, какими умолчаниями он получен; отдельные поля
+    # после построения могли быть изменены вручную.
+    preset: str = "fft_spectral_mean"
 
     @staticmethod
     def default_model_path() -> Path:
         return Path(__file__).resolve().parents[2] / "models" / "face_landmarker.task"
+
+
+# --------------------------------------------------------------------------
+# Именованные пресеты
+# --------------------------------------------------------------------------
+# Отличия пресета от умолчаний PipelineConfig. Ключ — путь к полю через точку.
+PRESET_OVERRIDES: dict[str, dict[str, object]] = {
+    # Текущие умолчания: периодограмма полного окна + усреднение нормированных
+    # спектров трёх ROI (results/accuracy/README.md).
+    "fft_spectral_mean": {},
+    # Конфигурация, на которой получены результаты статей 1 и 2 (git-тег
+    # papers-v1): Уэлч с сегментом 8 с, оценка по одному ROI с наибольшим SNR.
+    "legacy_welch8": {
+        "frequency_method": FrequencyMethod.WELCH,
+        "roi.spectral_combination": "best_snr",
+    },
+}
+DEFAULT_PRESET = "fft_spectral_mean"
+# Пресет, при котором записаны конфиги БЕЗ поля preset (созданные до
+# появления пресетов): их недостающие поля достраиваются от него, а не от
+# текущих умолчаний — иначе старый конфиг молча сменил бы смысл.
+PRESET_FOR_FILES_WITHOUT_PRESET = "legacy_welch8"
+
+
+def _set_dotted(cfg: "PipelineConfig", dotted: str, value: object) -> None:
+    obj = cfg
+    *path, last = dotted.split(".")
+    for part in path:
+        obj = getattr(obj, part)
+    setattr(obj, last, value)
+
+
+def apply_preset(cfg: "PipelineConfig", preset: str, only_missing: set[str] | None = None) -> "PipelineConfig":
+    """Применяет отличия пресета к cfg. only_missing — если задано,
+    применяются только поля из этого множества (используется при загрузке
+    частичного конфига: явно записанные в файле значения не трогаются)."""
+    if preset not in PRESET_OVERRIDES:
+        raise ValueError(f"неизвестный пресет {preset!r}; доступны: {', '.join(PRESET_OVERRIDES)}")
+    for dotted, value in PRESET_OVERRIDES[preset].items():
+        if only_missing is None or dotted in only_missing:
+            _set_dotted(cfg, dotted, value)
+    cfg.preset = preset
+    return cfg
+
+
+def make_pipeline_config(preset: str = DEFAULT_PRESET) -> "PipelineConfig":
+    """PipelineConfig, построенный от именованного пресета."""
+    return apply_preset(PipelineConfig(), preset)

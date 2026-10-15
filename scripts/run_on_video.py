@@ -47,6 +47,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rppg.config import PipelineConfig, ExtractionMethod, FrequencyMethod
+from rppg.config import DEFAULT_PRESET, PRESET_OVERRIDES, make_pipeline_config
 from rppg.config_io import load_config, save_config
 from rppg.pipeline import RPPGPipeline, apply_second_pass
 from rppg.structured_log import read_jsonl_records
@@ -82,6 +83,8 @@ def main() -> None:
         "--config", type=str, default=None,
         help="Базовый YAML/JSON-конфиг (см. rppg.config_io) — --method/--freq, если заданы, переопределяют его.",
     )
+    parser.add_argument("--preset", default=DEFAULT_PRESET, choices=sorted(PRESET_OVERRIDES),
+                        help="Пресет конфигурации, если не задан --config; legacy_welch8 — конфигурация статей")
     parser.add_argument("--method", type=str, default=None, choices=[m.value for m in ExtractionMethod])
     parser.add_argument("--freq", type=str, default=None, choices=[m.value for m in FrequencyMethod])
     parser.add_argument("--out", type=str, default="rppg_result.csv")
@@ -103,7 +106,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = load_config(args.config) if args.config else PipelineConfig()
+    # Явный --config задаёт всё сам (файл без поля preset достраивается от
+    # legacy_welch8, см. config_io); иначе — конфиг от пресета.
+    config = load_config(args.config) if args.config else make_pipeline_config(args.preset)
     config.face.model_asset_path = args.model
     if args.method is not None:
         config.method = ExtractionMethod(args.method)

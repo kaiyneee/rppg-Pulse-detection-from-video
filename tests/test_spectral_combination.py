@@ -88,9 +88,57 @@ def test_spectral_mean_needs_two_rois_on_the_same_grid():
     assert stub._spectral_mean_estimate(mismatched) is None
 
 
-def test_default_config_keeps_previous_behaviour():
-    """Умолчания не меняются этим кодом: прежние результаты статей
-    воспроизводятся без правки конфигов."""
+def test_default_config_is_fft_spectral_mean():
     cfg = PipelineConfig()
-    assert cfg.roi.spectral_combination == "best_snr"
+    assert cfg.preset == "fft_spectral_mean"
+    assert cfg.frequency_method.value == "fft"
+    assert cfg.roi.spectral_combination == "spectral_mean"
+
+
+def test_legacy_preset_restores_configuration_of_both_papers():
+    from rppg.config import make_pipeline_config
+
+    cfg = make_pipeline_config("legacy_welch8")
+    assert cfg.preset == "legacy_welch8"
     assert cfg.frequency_method.value == "welch"
+    assert cfg.roi.spectral_combination == "best_snr"
+
+
+def test_unknown_preset_is_rejected():
+    from rppg.config import make_pipeline_config
+
+    with pytest.raises(ValueError):
+        make_pipeline_config("no_such_preset")
+
+
+def test_config_file_without_preset_keeps_its_original_meaning():
+    """Конфиг, записанный до появления пресетов, достраивается от прежних
+    умолчаний, а не от текущих: иначе старый эксперимент молча сменил бы
+    метод оценки частоты и способ объединения ROI."""
+    from rppg.config_io import config_from_dict
+
+    partial = config_from_dict({"window": {"window_seconds": 12.0}})
+    assert partial.preset == "legacy_welch8"
+    assert partial.frequency_method.value == "welch"
+    assert partial.roi.spectral_combination == "best_snr"
+    assert partial.window.window_seconds == 12.0
+
+
+def test_explicit_values_in_old_file_win_over_preset():
+    from rppg.config_io import config_from_dict
+
+    cfg = config_from_dict({"frequency_method": "lomb_scargle"})
+    assert cfg.frequency_method.value == "lomb_scargle"
+    assert cfg.roi.spectral_combination == "best_snr"
+
+
+def test_config_roundtrip_preserves_preset():
+    from rppg.config import make_pipeline_config
+    from rppg.config_io import config_from_dict, config_to_dict
+
+    for name in ("fft_spectral_mean", "legacy_welch8"):
+        original = make_pipeline_config(name)
+        restored = config_from_dict(config_to_dict(original))
+        assert restored.preset == name
+        assert restored.frequency_method == original.frequency_method
+        assert restored.roi.spectral_combination == original.roi.spectral_combination

@@ -13,3 +13,5 @@ __pycache__/
 *.config.yaml
 *.bak_*
 cache/
+!results/reference/*.csv
+ubfc_run_meta*.json

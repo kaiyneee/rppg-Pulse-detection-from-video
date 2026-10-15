@@ -37,6 +37,9 @@ from rppg.config import (
     ExtractionMethod,
     FrequencyMethod,
     ROIName,
+    PRESET_FOR_FILES_WITHOUT_PRESET,
+    PRESET_OVERRIDES,
+    apply_preset,
 )
 
 
@@ -90,7 +93,15 @@ def config_from_dict(data: dict) -> PipelineConfig:
     if "frequency_method" in data:
         kwargs["frequency_method"] = FrequencyMethod(data["frequency_method"])
 
-    return PipelineConfig(**kwargs)
+    cfg = PipelineConfig(**kwargs)
+    # Пресет: поля, которых нет в файле, достраиваются от пресета, при
+    # котором файл записан. Файл без поля preset создан до появления
+    # пресетов, то есть при прежних умолчаниях (legacy_welch8), — без этого
+    # старые конфиги экспериментов молча начали бы означать другое.
+    preset = data.get("preset", PRESET_FOR_FILES_WITHOUT_PRESET)
+    present = {k for k in data if k not in ("roi",)} | {f"roi.{k}" for k in roi_data}
+    missing = {k for k in PRESET_OVERRIDES.get(preset, {}) if k not in present}
+    return apply_preset(cfg, preset, only_missing=missing)
 
 
 def save_config(config: PipelineConfig, path: str | Path) -> None:

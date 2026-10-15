@@ -77,11 +77,9 @@ def reference(trace: tc.RecordTrace, timestamp_ms: int, method: str = "welch") -
     key = (trace.record_id, int(timestamp_ms)) if method == "welch" else (trace.record_id, int(timestamp_ms), method)
     refs = _refs()
     if key not in refs:
-        from rppg.config import FrequencyMethod
-        cfg = tc.make_config(trace.fps)
-        cfg.frequency_method = FrequencyMethod(method)
+        cfg = tc.make_config(trace.fps, "legacy_welch8")
         ref, _snr = ev.reference_bpm_from_wave(
-            trace.t_ref, trace.wave, timestamp_ms / 1000.0, cfg.window.window_seconds, cfg,
+            trace.t_ref, trace.wave, timestamp_ms / 1000.0, cfg.window.window_seconds, cfg, method=method,
         )
         refs[key] = ref
     return refs[key]
@@ -101,8 +99,10 @@ def _rows_from(results, method: str = "welch") -> list[dict]:
 
 
 def _cfg(trace, **overrides):
+    """Варианты описываются как отличия от конфигурации статей
+    (legacy_welch8) — так их смысл не зависит от текущих умолчаний."""
     from rppg.config import FrequencyMethod
-    cfg = tc.make_config(trace.fps)
+    cfg = tc.make_config(trace.fps, overrides.pop("preset", "legacy_welch8"))
     if "frequency_method" in overrides:
         cfg.frequency_method = FrequencyMethod(overrides.pop("frequency_method"))
     for dotted, value in overrides.items():
@@ -124,12 +124,12 @@ def make_variant(**overrides):
 
 
 def v_baseline(trace):
-    rows, _ = tc.replay(trace)
+    rows, _ = tc.replay(trace, tc.make_config(trace.fps, "legacy_welch8"))
     return _rows_from(rows)
 
 
 def v_whitened(trace):
-    cfg = tc.make_config(trace.fps)
+    cfg = tc.make_config(trace.fps, "legacy_welch8")
     cfg.frequency.peak_selection = "whitened"
     rows, _ = tc.replay(trace, cfg)
     return _rows_from(rows)

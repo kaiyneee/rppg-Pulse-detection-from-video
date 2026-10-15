@@ -47,7 +47,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import rppg.pipeline as pipeline_mod  # noqa: E402
-from rppg.config import PipelineConfig  # noqa: E402
+from rppg.config import DEFAULT_PRESET, PRESET_OVERRIDES, PipelineConfig, make_pipeline_config  # noqa: E402
 from rppg.degrade import (  # noqa: E402
     H264_CRF,
     CONDITIONS,
@@ -251,7 +251,8 @@ def median_reference_bpm(t_ref, wave, cfg: PipelineConfig, window_seconds: float
 # --------------------------------------------------------------------------
 # Прогон одного условия на одной записи
 # --------------------------------------------------------------------------
-def run_condition(record_id: str, subject_dir: Path, condition: str, verbose: bool = True) -> list[dict]:
+def run_condition(record_id: str, subject_dir: Path, condition: str, verbose: bool = True,
+                  preset: str = DEFAULT_PRESET) -> list[dict]:
     video_path = ev.find_video(subject_dir)
     gt_path = ev.find_ground_truth(subject_dir)
     t_ref, wave, _hr_device = ev.load_reference_waveform(gt_path)
@@ -261,7 +262,7 @@ def run_condition(record_id: str, subject_dir: Path, condition: str, verbose: bo
         raise ev.SubjectDataError(f"не удалось открыть видео {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or PipelineConfig().window.assumed_fps
 
-    cfg = PipelineConfig()
+    cfg = make_pipeline_config(preset)
     cfg.face.model_asset_path = str(ev.MODEL_PATH)
     cfg.window.assumed_fps = float(fps)
     window_seconds = cfg.window.window_seconds
@@ -537,9 +538,13 @@ def load_windows_csv(path: Path) -> list[dict]:
 
 
 def _src_digest() -> str:
-    """Содержимое src/ одним хешем — замена хешу коммита: рабочая копия
-    не является git-репозиторием (проверено `git rev-parse`), и указать
-    коммит физически нечем."""
+    """Содержимое src/ одним хешем — дополнение к хешу коммита: при
+    незакоммиченных изменениях коммит не описывает код полностью.
+
+    Исправление: в прогонах заданий 1 и 4 здесь стояло утверждение, что
+    рабочая копия не под git, и git_commit записывался как null. Это было
+    неверно — репозиторий под git (проверялась родительская папка). Хеш
+    src в тех run_meta.json корректен."""
     h = hashlib.sha256()
     for path in sorted((REPO_ROOT / "src").rglob("*.py")):
         h.update(path.relative_to(REPO_ROOT).as_posix().encode())
@@ -547,14 +552,24 @@ def _src_digest() -> str:
     return h.hexdigest()
 
 
-def write_run_meta(path: Path, cfg: PipelineConfig, records, conditions, seed_note: str) -> None:
+def _git(args: list[str]) -> str | None:
+    import subprocess
+    try:
+        out = subprocess.run(["git", *args], capture_output=True, text=True, cwd=REPO_ROOT)
+    except OSError:
+        return None
+    return out.stdout.strip() or None
+
+
+def write_run_meta(path: Path, cfg: PipelineConfig, records, conditions, seed_note: str,
+                   preset: str = DEFAULT_PRESET) -> None:
     import mediapipe
     import scipy
 
     meta = {
         "run_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "git_commit": None,
-        "git_note": "рабочая копия не под git — вместо коммита sha256 по всем src/**/*.py",
+        "git_commit": _git(["rev-parse", "HEAD"]),
+        "git_dirty": bool(_git(["status", "--porcelain", "--untracked-files=no"])),
         "src_sha256": _src_digest(),
         "versions": {
             "python": platform.python_version(),
@@ -564,6 +579,7 @@ def write_run_meta(path: Path, cfg: PipelineConfig, records, conditions, seed_no
             "opencv": cv2.__version__,
             "platform": platform.platform(),
         },
+        "preset": preset,
         "seed": seed_note,
         "h264_crf_for_C2": H264_CRF,
         "records": [r for r, _ in records],
@@ -582,6 +598,8 @@ def main() -> None:
     ap.add_argument("--conditions", default=",".join(CONDITIONS))
     ap.add_argument("--records", default="", help="список record_id через запятую (по умолчанию все найденные)")
     ap.add_argument("--task0", action="store_true", help="приоритетная проверка детектора мерцания")
+    ap.add_argument("--preset", default=DEFAULT_PRESET, choices=sorted(PRESET_OVERRIDES),
+                    help="пресет конфигурации; legacy_welch8 — конфигурация статьи 2 (results/degenerate_v2)")
     ap.add_argument("--summarize-only", action="store_true",
                     help="пересобрать summary.csv/summary_percentiles.csv/run_meta.json из готового windows.csv")
     args = ap.parse_args()
@@ -617,13 +635,14 @@ def main() -> None:
         summary, percentiles = summarize(all_rows)
         write_csv(out_dir / "summary.csv", SUMMARY_FIELDS, summary)
         write_csv(out_dir / "summary_percentiles.csv", ["condition", "metric", "p25", "median", "p75", "n"], percentiles)
-        cfg = PipelineConfig()
+        cfg = make_pipeline_config(args.preset)
         cfg.face.model_asset_path = str(ev.MODEL_PATH)
         present = sorted({r["record_id"] for r in all_rows}, key=_natural_key)
         write_run_meta(
             out_dir / "run_meta.json", cfg, [(r, None) for r in present],
             [c for c in CONDITIONS if any(r["condition"] == c for r in all_rows)],
             "детерминированный: crc32(record_id|condition), см. rppg.degrade.condition_seed",
+            preset=args.preset,
         )
         print(f"сводки пересобраны из {out_dir / 'windows.csv'} ({len(all_rows)} строк)")
         return
@@ -653,7 +672,7 @@ def main() -> None:
     for condition in conditions:
         print(f"--- условие {condition} ---", flush=True)
         for record_id, subject_dir in records:
-            all_rows.extend(run_condition(record_id, subject_dir, condition))
+            all_rows.extend(run_condition(record_id, subject_dir, condition, preset=args.preset))
         # Промежуточная выгрузка после каждого условия: полный прогон идёт
         # часами, и падение на последнем условии не должно обнулять всё
         # посчитанное. Файл перезаписывается целиком и в конце заменяется
@@ -695,11 +714,12 @@ def main() -> None:
     summary, percentiles = summarize(all_rows)
     write_csv(out_dir / "summary.csv", SUMMARY_FIELDS, summary)
     write_csv(out_dir / "summary_percentiles.csv", ["condition", "metric", "p25", "median", "p75", "n"], percentiles)
-    cfg = PipelineConfig()
+    cfg = make_pipeline_config(args.preset)
     cfg.face.model_asset_path = str(ev.MODEL_PATH)
     write_run_meta(
         out_dir / "run_meta.json", cfg, records, conditions,
         "детерминированный: crc32(record_id|condition), см. rppg.degrade.condition_seed",
+        preset=args.preset,
     )
     print(f"\nвыгружено в {out_dir}: windows.csv ({len(all_rows)} строк), summary.csv, "
           f"summary_percentiles.csv, run_meta.json")
