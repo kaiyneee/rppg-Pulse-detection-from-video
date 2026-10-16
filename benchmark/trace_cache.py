@@ -111,6 +111,13 @@ def build_trace(record_id: str, subject_dir: Path) -> RecordTrace:
     video_path = ev.find_video(subject_dir)
     gt_path = ev.find_ground_truth(subject_dir)
     t_ref, wave, hr_device = ev.load_reference_waveform(gt_path)
+    return build_trace_from_video(record_id, video_path, t_ref, wave, hr_device,
+                                  subset=1 if gt_path.name == "gtdump.xmp" else 2)
+
+
+def build_trace_from_video(record_id: str, video_path, t_ref, wave, hr_device, subset) -> RecordTrace:
+    """Кэш по произвольному видео и эталонной волне (t_ref в секундах от
+    первого кадра). Метки кадров — номер кадра / частота контейнера."""
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cfg = make_config(fps, CACHE_PRESET)
@@ -176,7 +183,7 @@ def build_trace(record_id: str, subject_dir: Path) -> RecordTrace:
     return RecordTrace(
         record_id=record_id, fps=float(fps), timestamps_ms=timestamps, frames=frames,
         t_ref=t_ref, wave=wave, hr_device=hr_device,
-        subset=1 if gt_path.name == "gtdump.xmp" else 2,
+        subset=subset,
         live=[_row(r) for r in rows],
     )
 

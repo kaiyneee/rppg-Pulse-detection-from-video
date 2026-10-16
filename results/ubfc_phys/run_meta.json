@@ -1,0 +1,66 @@
+{
+  "run_utc": "2026-10-16T13:33:40+00:00",
+  "git_commit": "5fdbbd0f27fd1b78e0a2672f829021c6c3d5b0de",
+  "git_dirty": true,
+  "src_sha256": "f67f51232d6b407b6f88ead0cb2541e71331fdf45b0783c9d031c239befc628a",
+  "presets_sha256": "e08cbb19d916e8d1c5745dc0105373fc8c370dd8137737fae1b78985954587ce",
+  "configs": {
+    "legacy_welch8": {
+      "preset": "legacy_welch8",
+      "overrides": {}
+    },
+    "fft_best_snr": {
+      "preset": "legacy_welch8",
+      "overrides": {
+        "frequency_method": "fft"
+      }
+    },
+    "welch8_spectral_mean": {
+      "preset": "legacy_welch8",
+      "overrides": {
+        "roi.spectral_combination": "spectral_mean"
+      }
+    },
+    "fft_spectral_mean": {
+      "preset": "fft_spectral_mean",
+      "overrides": {}
+    }
+  },
+  "default_config": "fft_spectral_mean",
+  "reference_main": "benchmark/reference_full10s.py (full10s-v1) на BVP",
+  "reference_alt": "find_peaks на BVP после полосового фильтра (0.7, 4.0) Гц порядка 4, distance=0.33 с, prominence=0.3*СКО окна, 60/медиана интервалов",
+  "reliable_rule": "|ref_main_bpm - ref_alt_bpm| <= 5.0",
+  "gross_error": "|оценка - эталон| > 5.0 уд/мин",
+  "purity_thresholds": [
+    null,
+    0.1,
+    0.12,
+    0.14,
+    0.16,
+    0.18,
+    0.2,
+    0.22,
+    0.24,
+    0.26,
+    0.28,
+    0.3,
+    0.32,
+    0.35,
+    0.4
+  ],
+  "motion_tertile_edges": [
+    0.0011095293265877882,
+    0.004308195160767513
+  ],
+  "regression_ubfc_rppg_g0": {
+    "mae_by_records": 1.196987163727766,
+    "coverage_mean": 0.9921405194394134
+  },
+  "versions": {
+    "python": "3.9.6",
+    "numpy": "2.0.2",
+    "opencv": "5.0.0"
+  },
+  "shift_applied": true,
+  "lag_method": "MSPTD instantaneous HR cross-correlation, +-10 s, step 0.25 s, accept r >= 0.5"
+}

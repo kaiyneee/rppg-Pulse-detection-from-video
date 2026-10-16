@@ -1,0 +1,20 @@
+[
+  {
+    "record_id": "6",
+    "n_windows": 73,
+    "max_abs_bpm_diff": 0.0,
+    "publishable_identical": true
+  },
+  {
+    "record_id": "subject12",
+    "n_windows": 57,
+    "max_abs_bpm_diff": 0.0,
+    "publishable_identical": true
+  },
+  {
+    "record_id": "subject40",
+    "n_windows": 58,
+    "max_abs_bpm_diff": 0.0,
+    "publishable_identical": true
+  }
+]

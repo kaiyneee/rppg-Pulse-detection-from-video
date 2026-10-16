@@ -1,0 +1,949 @@
+########## [1/50] 5-gt 22:14:21
+Испытуемый 5: видео=vid-001.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 13, изменено 1 (кандидат 1, флип x2 0)
+
+=== Испытуемый 5 ===
+  окон: 74 (publishable: 71, покрытие: 95.9%)
+  эталон: 69.0-85.0 BPM, медиана spectral_snr_db: 3.94
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.79    4.69    3.72          0.21
+  publishable       2.54    4.30    3.37          0.28
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/5.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 2 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.14 ± 0.85
+  RMSE (publishable): 4.39 ± 0.12
+  Среднее покрытие: 96.1%
+########## [2/50] 6-gt 22:14:50
+Испытуемый 6: видео=vid-001.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый 6 ===
+  окон: 73 (publishable: 73, покрытие: 100.0%)
+  эталон: 70.0-91.0 BPM, медиана spectral_snr_db: 7.29
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.79    5.17    4.84          0.74
+  publishable       3.79    5.17    4.84          0.74
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/6.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 3 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.36 ± 0.71
+  RMSE (publishable): 4.65 ± 0.46
+  Среднее покрытие: 97.4%
+########## [3/50] 7-gt 22:15:20
+Испытуемый 7: видео=vid-001.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 12, изменено 1 (кандидат 1, флип x2 0)
+
+=== Испытуемый 7 ===
+  окон: 72 (publishable: 72, покрытие: 100.0%)
+  эталон: 91.0-99.0 BPM, медиана spectral_snr_db: 6.43
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.78    2.28    1.87          0.68
+  publishable       1.78    2.28    1.87          0.68
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/7.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 4 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 2.96 ± 0.98
+  RMSE (publishable): 4.06 ± 1.24
+  Среднее покрытие: 98.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.16, 3.76]
+########## [4/50] 8-gt 22:15:49
+Испытуемый 8: видео=vid.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 4, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый 8 ===
+  окон: 63 (publishable: 63, покрытие: 100.0%)
+  эталон: 62.0-74.0 BPM, медиана spectral_snr_db: 7.12
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          5.88    7.19    8.53         -0.06
+  publishable       5.88    7.19    8.53         -0.06
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/8.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 5 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.55 ± 1.56
+  RMSE (publishable): 4.68 ± 1.77
+  Среднее покрытие: 98.4%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.39, 4.79]
+########## [5/50] 10-gt 22:16:16
+Испытуемый 10: видео=vid.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый 10 ===
+  окон: 33 (publishable: 33, покрытие: 100.0%)
+  эталон: 71.0-74.0 BPM, медиана spectral_snr_db: 9.51
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.95    3.59    4.07-0.25 (неинф.)
+  publishable       2.95    3.59    4.07-0.25 (неинф.)
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/10.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 6 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.45 ± 1.41
+  RMSE (publishable): 4.50 ± 1.64
+  Среднее покрытие: 98.7%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.49, 4.50]
+########## [6/50] 11-gt 22:16:33
+Испытуемый 11: видео=vid.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 7, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый 11 ===
+  окон: 70 (publishable: 70, покрытие: 100.0%)
+  эталон: 75.0-81.0 BPM, медиана spectral_snr_db: 8.06
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.88    2.51    2.41          0.57
+  publishable       1.88    2.51    2.41          0.57
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/11.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 7 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.22 ± 1.42
+  RMSE (publishable): 4.21 ± 1.68
+  Среднее покрытие: 98.9%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.35, 4.27]
+########## [7/50] 12-gt 22:17:01
+Испытуемый 12: видео=vid-001.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый 12 ===
+  окон: 73 (publishable: 73, покрытие: 100.0%)
+  эталон: 90.0-97.0 BPM, медиана spectral_snr_db: 9.26
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.96    2.62    2.09          0.70
+  publishable       1.96    2.62    2.09          0.70
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/12.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 8 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.06 ± 1.39
+  RMSE (publishable): 4.02 ± 1.65
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.25, 4.05]
+########## [8/50] after-exercise 22:17:31
+Испытуемый after-exercise: видео=vid-001.avi, эталон=gtdump.xmp
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый after-exercise ===
+  окон: 107 (publishable: 107, покрытие: 100.0%)
+  эталон: 99.0-148.0 BPM, медиана spectral_snr_db: 7.04
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          5.23    6.63    4.44          0.94
+  publishable       5.23    6.63    4.44          0.94
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/after-exercise.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 9 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.30 ± 1.49
+  RMSE (publishable): 4.31 ± 1.77
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.46, 4.24]
+########## [9/50] subject1 22:18:12
+Испытуемый subject1: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject1 ===
+  окон: 42 (publishable: 42, покрытие: 100.0%)
+  эталон: 99.0-111.0 BPM, медиана spectral_snr_db: 6.23
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.10    3.83    2.91          0.54
+  publishable       3.10    3.83    2.91          0.54
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject1.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 10 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.28 ± 1.40
+  RMSE (publishable): 4.26 ± 1.68
+  Среднее покрытие: 99.2%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.51, 4.13]
+########## [10/50] subject3 22:18:33
+Испытуемый subject3: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject3 ===
+  окон: 51 (publishable: 51, покрытие: 100.0%)
+  эталон: 94.0-108.0 BPM, медиана spectral_snr_db: 5.71
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          9.56   11.60    9.18         -0.07
+  publishable       9.56   11.60    9.18         -0.07
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject3.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 11 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.85 ± 2.31
+  RMSE (publishable): 4.93 ± 2.73
+  Среднее покрытие: 99.3%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.70, 5.26]
+########## [11/50] subject4 22:18:56
+Испытуемый subject4: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject4 ===
+  окон: 36 (publishable: 36, покрытие: 100.0%)
+  эталон: 110.0-116.0 BPM, медиана spectral_snr_db: 4.39
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          9.80   12.88    8.59         -0.55
+  publishable       9.80   12.88    8.59         -0.55
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject4.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 12 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 4.35 ± 2.79
+  RMSE (publishable): 5.59 ± 3.47
+  Среднее покрытие: 99.3%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.97, 5.96]
+########## [12/50] subject5 22:19:15
+Испытуемый subject5: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject5 ===
+  окон: 42 (publishable: 42, покрытие: 100.0%)
+  эталон: 94.0-102.0 BPM, медиана spectral_snr_db: 9.00
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.49    1.80    1.51          0.85
+  publishable       1.49    1.80    1.51          0.85
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject5.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 13 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 4.13 ± 2.79
+  RMSE (publishable): 5.30 ± 3.48
+  Среднее покрытие: 99.4%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.78, 5.67]
+########## [13/50] subject8 22:19:36
+Испытуемый subject8: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject8 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 99.7-115.0 BPM, медиана spectral_snr_db: 8.43
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.60    3.27    2.34          0.56
+  publishable       2.60    3.27    2.34          0.56
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject8.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 14 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 4.02 ± 2.71
+  RMSE (publishable): 5.15 ± 3.39
+  Среднее покрытие: 99.4%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.79, 5.51]
+########## [14/50] subject9 22:20:02
+Испытуемый subject9: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 6, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject9 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 100.0-117.8 BPM, медиана spectral_snr_db: 5.05
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          4.31    5.15    4.00          0.77
+  publishable       4.31    5.15    4.00          0.77
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject9.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 15 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 4.04 ± 2.61
+  RMSE (publishable): 5.15 ± 3.27
+  Среднее покрытие: 99.5%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.88, 5.41]
+########## [15/50] subject10 22:20:29
+Испытуемый subject10: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject10 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 94.3-120.0 BPM, медиана spectral_snr_db: 6.71
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.23    2.86    2.08          0.97
+  publishable       2.23    2.86    2.08          0.97
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject10.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 16 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.93 ± 2.57
+  RMSE (publishable): 5.01 ± 3.21
+  Среднее покрытие: 99.5%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.82, 5.25]
+########## [16/50] subject11 22:20:55
+Испытуемый subject11: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject11 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 114.0-127.0 BPM, медиана spectral_snr_db: 6.88
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.68    2.14    1.38          0.91
+  publishable       1.68    2.14    1.38          0.91
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject11.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 17 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.79 ± 2.54
+  RMSE (publishable): 4.84 ± 3.18
+  Среднее покрытие: 99.5%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.75, 5.05]
+########## [17/50] subject12 22:21:22
+Испытуемый subject12: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 4, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject12 ===
+  окон: 57 (publishable: 57, покрытие: 100.0%)
+  эталон: 59.0-68.0 BPM, медиана spectral_snr_db: 9.54
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.52    3.90    3.98         -0.35
+  publishable       2.52    3.90    3.98         -0.35
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject12.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 18 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.72 ± 2.49
+  RMSE (publishable): 4.79 ± 3.09
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.72, 4.92]
+########## [18/50] subject13 22:21:48
+Испытуемый subject13: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject13 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 96.0-116.0 BPM, медиана spectral_snr_db: 6.38
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.42    3.16    2.31          0.93
+  publishable       2.42    3.16    2.31          0.93
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject13.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 19 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.66 ± 2.43
+  RMSE (publishable): 4.70 ± 3.03
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.67, 4.81]
+########## [19/50] subject14 22:22:14
+Испытуемый subject14: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 4, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject14 ===
+  окон: 57 (publishable: 57, покрытие: 100.0%)
+  эталон: 73.0-98.0 BPM, медиана spectral_snr_db: 6.09
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          9.31   12.08   11.33         -0.41
+  publishable       9.31   12.08   11.33         -0.41
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject14.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 20 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.94 ± 2.69
+  RMSE (publishable): 5.07 ± 3.38
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.90, 5.16]
+########## [20/50] subject15 22:22:40
+Испытуемый subject15: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 5, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject15 ===
+  окон: 58 (publishable: 57, покрытие: 98.3%)
+  эталон: 112.0-121.0 BPM, медиана spectral_snr_db: 1.88
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.09    3.61    2.66          0.75
+  publishable       3.05    3.57    2.62          0.75
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject15.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 21 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.90 ± 2.63
+  RMSE (publishable): 5.00 ± 3.31
+  Среднее покрытие: 99.5%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.88, 5.07]
+########## [21/50] subject16 22:23:07
+Испытуемый subject16: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject16 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 86.0-96.0 BPM, медиана spectral_snr_db: 7.47
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.67    3.95    2.95          0.30
+  publishable       2.67    3.95    2.95          0.30
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject16.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 22 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.84 ± 2.58
+  RMSE (publishable): 4.95 ± 3.24
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.88, 4.94]
+########## [22/50] subject17 22:23:34
+Испытуемый subject17: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject17 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 77.0-90.0 BPM, медиана spectral_snr_db: 7.89
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.33    2.90    2.73          0.60
+  publishable       2.33    2.90    2.73          0.60
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject17.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 23 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.77 ± 2.54
+  RMSE (publishable): 4.86 ± 3.19
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.85, 4.86]
+########## [23/50] subject18 22:24:01
+Испытуемый subject18: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject18 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 102.0-127.0 BPM, медиана spectral_snr_db: 9.69
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.60    1.84    1.34          0.98
+  publishable       1.60    1.84    1.34          0.98
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject18.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 24 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.68 ± 2.52
+  RMSE (publishable): 4.74 ± 3.18
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.76, 4.72]
+########## [24/50] subject20 22:24:27
+Испытуемый subject20: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject20 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 109.0-127.0 BPM, медиана spectral_snr_db: 6.10
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.65    3.42    2.15          0.86
+  publishable       2.65    3.42    2.15          0.86
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject20.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 25 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.64 ± 2.47
+  RMSE (publishable): 4.68 ± 3.13
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.78, 4.69]
+########## [25/50] subject22 22:24:54
+Испытуемый subject22: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 9, изменено 1 (кандидат 1, флип x2 0)
+
+=== Испытуемый subject22 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 90.0-109.0 BPM, медиана spectral_snr_db: 5.09
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.59    3.47    2.54          0.89
+  publishable       2.59    3.47    2.54          0.89
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject22.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 26 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.60 ± 2.43
+  RMSE (publishable): 4.64 ± 3.07
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.76, 4.59]
+########## [26/50] subject23 22:25:20
+Испытуемый subject23: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject23 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 58.0-70.0 BPM, медиана spectral_snr_db: 10.62
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.67    4.63    5.82          0.32
+  publishable       3.67    4.63    5.82          0.32
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject23.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 27 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.60 ± 2.39
+  RMSE (publishable): 4.64 ± 3.01
+  Среднее покрытие: 99.6%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.82, 4.56]
+########## [27/50] subject24 22:25:46
+Испытуемый subject24: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject24 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 90.0-127.0 BPM, медиана spectral_snr_db: 7.96
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          5.71    7.15    5.66          0.87
+  publishable       5.71    7.15    5.66          0.87
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject24.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 28 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.68 ± 2.38
+  RMSE (publishable): 4.73 ± 2.99
+  Среднее покрытие: 99.7%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.89, 4.61]
+########## [28/50] subject25 22:26:12
+Испытуемый subject25: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 29, изменено 2 (кандидат 2, флип x2 0)
+
+=== Испытуемый subject25 ===
+  окон: 51 (publishable: 51, покрытие: 100.0%)
+  эталон: 89.0-95.0 BPM, медиана spectral_snr_db: 5.74
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.67    3.36    2.92          0.19
+  publishable       2.67    3.36    2.92          0.19
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject25.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 29 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.65 ± 2.34
+  RMSE (publishable): 4.68 ± 2.95
+  Среднее покрытие: 99.7%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.86, 4.54]
+########## [29/50] subject26 22:26:32
+Испытуемый subject26: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 21, изменено 18 (кандидат 18, флип x2 0)
+
+=== Испытуемый subject26 ===
+  окон: 53 (publishable: 51, покрытие: 96.2%)
+  эталон: 68.0-78.0 BPM, медиана spectral_snr_db: 3.23
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.64    4.39    5.01          0.05
+  publishable       3.74    4.47    5.15          0.02
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject26.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 29 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.65 ± 2.34
+  RMSE (publishable): 4.68 ± 2.95
+  Среднее покрытие: 99.7%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.87, 4.55]
+########## [30/50] subject27 22:26:53
+Испытуемый subject27: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 5, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject27 ===
+  окон: 50 (publishable: 36, покрытие: 72.0%)
+  эталон: 83.0-99.0 BPM, медиана spectral_snr_db: 2.52
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          9.60   13.60   10.71          0.06
+  publishable       7.29    9.56    8.08          0.54
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject27.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 30 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.77 ± 2.39
+  RMSE (publishable): 4.84 ± 3.03
+  Среднее покрытие: 98.7%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.99, 4.66]
+########## [31/50] subject30 22:27:21
+Испытуемый subject30: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 8, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject30 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 69.0-103.0 BPM, медиана spectral_snr_db: 6.81
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          4.86    7.50    6.21          0.91
+  publishable       4.86    7.50    6.21          0.91
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject30.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 31 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.80 ± 2.36
+  RMSE (publishable): 4.93 ± 3.02
+  Среднее покрытие: 98.8%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.04, 4.68]
+########## [32/50] subject31 22:28:17
+Испытуемый subject31: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject31 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 76.0-81.0 BPM, медиана spectral_snr_db: 10.04
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.31    3.04    2.93          0.09
+  publishable       2.31    3.04    2.93          0.09
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject31.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 32 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.76 ± 2.34
+  RMSE (publishable): 4.87 ± 2.99
+  Среднее покрытие: 98.8%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.02, 4.58]
+########## [33/50] subject32 22:29:04
+Испытуемый subject32: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 5, изменено 1 (кандидат 1, флип x2 0)
+
+=== Испытуемый subject32 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 93.0-117.0 BPM, медиана spectral_snr_db: 8.44
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          4.46    7.75    4.29          0.82
+  publishable       4.46    7.75    4.29          0.82
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject32.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 33 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.78 ± 2.30
+  RMSE (publishable): 4.96 ± 2.99
+  Среднее покрытие: 98.9%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.05, 4.57]
+########## [34/50] subject33 22:29:49
+Испытуемый subject33: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject33 ===
+  окон: 57 (publishable: 57, покрытие: 100.0%)
+  эталон: 113.0-121.0 BPM, медиана spectral_snr_db: 8.24
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.76    3.65    2.35          0.47
+  publishable       2.76    3.65    2.35          0.47
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject33.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 34 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.75 ± 2.28
+  RMSE (publishable): 4.92 ± 2.95
+  Среднее покрытие: 98.9%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.06, 4.55]
+########## [35/50] subject34 22:30:40
+Испытуемый subject34: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject34 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 114.0-120.0 BPM, медиана spectral_snr_db: 6.70
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.64    1.95    1.41          0.73
+  publishable       1.64    1.95    1.41          0.73
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject34.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 35 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.69 ± 2.27
+  RMSE (publishable): 4.83 ± 2.95
+  Среднее покрытие: 98.9%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.99, 4.48]
+########## [36/50] subject35 22:31:29
+Испытуемый subject35: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject35 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 78.0-119.0 BPM, медиана spectral_snr_db: 10.26
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.66    3.56    2.78          0.98
+  publishable       2.66    3.56    2.78          0.98
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject35.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 36 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.66 ± 2.24
+  RMSE (publishable): 4.80 ± 2.91
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.98, 4.41]
+########## [37/50] subject36 22:32:14
+Испытуемый subject36: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject36 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 106.0-125.0 BPM, медиана spectral_snr_db: 6.47
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.56    3.34    2.18          0.90
+  publishable       2.56    3.34    2.18          0.90
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject36.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 37 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.63 ± 2.22
+  RMSE (publishable): 4.76 ± 2.88
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.96, 4.38]
+########## [38/50] subject37 22:33:01
+Испытуемый subject37: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 4, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject37 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 57.0-65.0 BPM, медиана spectral_snr_db: 11.34
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          6.36    7.58    9.92          0.04
+  publishable       6.36    7.58    9.92          0.04
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject37.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 38 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.70 ± 2.23
+  RMSE (publishable): 4.83 ± 2.88
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.05, 4.44]
+########## [39/50] subject38 22:33:44
+Испытуемый subject38: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject38 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 106.0-113.0 BPM, медиана spectral_snr_db: 7.15
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.36    1.68    1.24          0.85
+  publishable       1.36    1.68    1.24          0.85
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject38.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 39 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.64 ± 2.24
+  RMSE (publishable): 4.75 ± 2.89
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.99, 4.36]
+########## [40/50] subject39 22:34:26
+Испытуемый subject39: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject39 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 83.0-87.0 BPM, медиана spectral_snr_db: 8.26
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.54    3.46    2.98 0.17 (неинф.)
+  publishable       2.54    3.46    2.98 0.17 (неинф.)
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject39.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 40 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.61 ± 2.21
+  RMSE (publishable): 4.72 ± 2.86
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.98, 4.33]
+########## [41/50] subject40 22:35:06
+Испытуемый subject40: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject40 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 81.0-91.0 BPM, медиана spectral_snr_db: 9.76
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.83    3.38    3.21          0.64
+  publishable       2.83    3.38    3.21          0.64
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject40.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 41 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.59 ± 2.19
+  RMSE (publishable): 4.69 ± 2.83
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.96, 4.30]
+########## [42/50] subject41 22:35:48
+Испытуемый subject41: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 4, изменено 1 (кандидат 1, флип x2 0)
+
+=== Испытуемый subject41 ===
+  окон: 58 (publishable: 55, покрытие: 94.8%)
+  эталон: 97.0-107.0 BPM, медиана spectral_snr_db: 8.51
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          4.05    4.98    4.03          0.35
+  publishable       3.81    4.59    3.78          0.47
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject41.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 42 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.60 ± 2.16
+  RMSE (publishable): 4.68 ± 2.79
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.99, 4.28]
+########## [43/50] subject42 22:36:30
+Испытуемый subject42: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject42 ===
+  окон: 59 (publishable: 59, покрытие: 100.0%)
+  эталон: 82.0-99.2 BPM, медиана spectral_snr_db: 10.16
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.86    3.90    3.19          0.90
+  publishable       2.86    3.90    3.19          0.90
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject42.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 43 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.58 ± 2.14
+  RMSE (publishable): 4.67 ± 2.76
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [2.99, 4.27]
+########## [44/50] subject43 22:37:09
+Испытуемый subject43: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject43 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 92.0-101.0 BPM, медиана spectral_snr_db: 4.91
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.19    4.00    3.33          0.23
+  publishable       3.19    4.00    3.33          0.23
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject43.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 44 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.57 ± 2.12
+  RMSE (publishable): 4.65 ± 2.73
+  Среднее покрытие: 99.0%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.00, 4.24]
+########## [45/50] subject44 22:37:51
+Испытуемый subject44: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject44 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 78.0-87.0 BPM, медиана spectral_snr_db: 6.91
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          5.58    6.52    6.77         -0.04
+  publishable       5.58    6.52    6.77         -0.04
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject44.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 45 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.62 ± 2.11
+  RMSE (publishable): 4.69 ± 2.72
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.05, 4.27]
+########## [46/50] subject45 22:38:31
+Испытуемый subject45: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject45 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 104.0-116.0 BPM, медиана spectral_snr_db: 6.76
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          3.56    5.31    3.17          0.44
+  publishable       3.56    5.31    3.17          0.44
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject45.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 46 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.62 ± 2.09
+  RMSE (publishable): 4.71 ± 2.69
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.06, 4.26]
+########## [47/50] subject46 22:39:13
+Испытуемый subject46: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject46 ===
+  окон: 57 (publishable: 57, покрытие: 100.0%)
+  эталон: 89.0-103.0 BPM, медиана spectral_snr_db: 8.72
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.94    3.46    3.07          0.91
+  publishable       2.94    3.46    3.07          0.91
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject46.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 47 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.60 ± 2.07
+  RMSE (publishable): 4.68 ± 2.66
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.05, 4.23]
+########## [48/50] subject47 22:39:54
+Испытуемый subject47: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject47 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 105.0-118.0 BPM, медиана spectral_snr_db: 9.30
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          4.37    8.01    3.82          0.22
+  publishable       4.37    8.01    3.82          0.22
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject47.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 48 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.62 ± 2.05
+  RMSE (publishable): 4.75 ± 2.68
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.09, 4.23]
+########## [49/50] subject48 22:40:34
+Испытуемый subject48: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 3, изменено 0 (кандидат 0, флип x2 0)
+
+=== Испытуемый subject48 ===
+  окон: 58 (publishable: 58, покрытие: 100.0%)
+  эталон: 86.0-89.0 BPM, медиана spectral_snr_db: 5.63
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          1.67    2.11    1.90 0.35 (неинф.)
+  publishable       1.67    2.11    1.90 0.35 (неинф.)
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject48.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 49 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.58 ± 2.05
+  RMSE (publishable): 4.70 ± 2.68
+  Среднее покрытие: 99.1%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.03, 4.17]
+########## [50/50] subject49 22:41:13
+Испытуемый subject49: видео=vid.avi, эталон=ground_truth.txt
+  второй проход: пересмотрено 17, изменено 3 (кандидат 3, флип x2 0)
+
+=== Испытуемый subject49 ===
+  окон: 58 (publishable: 51, покрытие: 87.9%)
+  эталон: 85.0-93.0 BPM, медиана spectral_snr_db: 4.49
+  разрез             MAE    RMSE   MAPE%       r
+  все окна          2.58    3.47    2.95          0.57
+  publishable       2.52    3.25    2.89          0.56
+  пооконный лог: /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_windows_twopass/subject49.csv
+  сводная строка обновлена в /Users/ylhjn/Desktop/проекты/пульс по видео/rppg_ptsd/ubfc_results_twopass.csv
+
+=== Накопленный итог по 50 испытуемым (ubfc_results.csv) ===
+  (усреднение по ИСПЫТУЕМЫМ, не по окнам — иначе длинные записи получают больший вес)
+  MAE  (publishable): 3.56 ± 2.03
+  RMSE (publishable): 4.67 ± 2.66
+  Среднее покрытие: 98.9%
+  Бутстрэп 95% ДИ для среднего MAE (n_boot=10000): [3.03, 4.14]
+########## ВСЁ ГОТОВО 22:41:41
