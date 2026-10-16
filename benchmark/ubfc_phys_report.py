@@ -50,6 +50,7 @@ def main() -> None:
     rq, summ, summ_ns = rd("ref_quality"), rd("summary"), rd("summary", "no_shift")
     summ_id, trunc, extra = rd("summary_lag_identified"), rd("summary_truncated"), rd("summary_extra_s12")
     pairs, strata, curve, perrec = rd("pairwise"), rd("motion_strata"), rd("purity_curve"), rd("per_record")
+    t1 = {n: rd(n, "shift_from_T1") for n in ("summary", "per_record", "motion_strata", "purity_curve", "record_lag")}
     diag = rd("hr_series_lag_diagnostic")
     cache_chk = json.loads((OUT / "cache_check_ubfc_rppg.json").read_text(encoding="utf-8"))
     protocol = (OUT / "protocol.md").read_text(encoding="utf-8")
@@ -83,28 +84,28 @@ def main() -> None:
     pair_rows = "\n".join(f"| {r['config_a']} − {r['config_b']} | {r['task']} | {c(r['median_mae_diff_a_minus_b'], '.3f')} | "
                           f"{r['n_a_better']} из {r['n_records']} |" for r in pairs)
 
-    def strata_table(task):
+    def strata_table(task, rows=None):
         out = ["| конфигурация | терциль 1 (мало движения) | терциль 2 | терциль 3 (много) |", "|---|---|---|---|"]
         for cf in CONFIGS:
             cells = []
             for q in ("1", "2", "3"):
-                r = next(x for x in strata if x["config"] == cf and x["task"] == task and x["motion_tertile"] == q)
+                r = next(x for x in (rows or strata) if x["config"] == cf and x["task"] == task and x["motion_tertile"] == q)
                 cells.append(f"{c(r['mae'])} / {pct(r['gross_rate'])} (n={r['n_windows']})")
             out.append(f"| {cf} | " + " | ".join(cells) + " |")
         return "\n".join(out)
 
-    def curve_table(task):
-        out = ["| порог | покрытие | MAE | грубые промахи |", "|---|---|---|---|"]
-        for r in curve:
+    def curve_table(task, rows=None):
+        out = ["| порог | покрытие | MAE по окнам | MAE по записям (записей) | грубые промахи |", "|---|---|---|---|---|"]
+        for r in rows or curve:
             if r["task"] == task:
                 out.append(f"| {'выкл.' if r['threshold'] == '' else c(r['threshold'], '.2f')} | {pct(r['coverage'])} | "
-                           f"{c(r['mae'])} | {pct(r['gross_rate'])} |")
+                           f"{c(r['mae'])} | {c(r['mae_by_records'])} ({r['n_records_with_output']}) | {pct(r['gross_rate'])} |")
         return "\n".join(out)
 
-    def per_subject(cf):
+    def per_subject(cf, rows=None):
         out = ["| участник | T1 | T2 | T3 |", "|---|---|---|---|"]
         for s in ["s1", "s2", "s3", "s4", "s5", "s10", "s11"]:
-            cells = [c(next((r["mae"] for r in perrec if r["config"] == cf and r["subject"] == s and r["task"] == t), "")) for t in TASKS]
+            cells = [c(next((r["mae"] for r in (rows or perrec) if r["config"] == cf and r["subject"] == s and r["task"] == t), "")) for t in TASKS]
             out.append(f"| {s} | " + " | ".join(cells) + " |")
         return "\n".join(out)
 
@@ -208,6 +209,48 @@ MAE — среднее по записям участник × задание; �
 |---|---|---|---|---|
 """ + "\n".join(f"| {r['config']} | {r['task']} | {r['n_windows']} | {c(r['mae'])} | {pct(r['gross_rate'])} |" for r in summ_id) + f"""
 
+### Сдвиг T1 перенесён на T2/T3 (`shift_from_T1/`)
+
+Сдвиг, найденный на T1, применён к T2 и T3 того же участника, если у записи свой сдвиг не
+определился; на T2/T3 сдвиг не подбирался. Прежние таблицы не изменены.
+
+| запись | свой сдвиг, с | r | применён, с | источник |
+|---|---|---|---|---|
+""" + "\n".join(f"| {r['subject']} {r['task']} | {c(r['lag_s'])} | {c(r['r_at_lag'])} | {c(r['applied_shift_s'])} | {r['shift_source']} |"
+               for r in t1['record_lag'] if r['subject'] in ("s1", "s2", "s3", "s4", "s5", "s10", "s11")) + f"""
+
+У s2 определились оба собственных сдвига: """ + "; ".join(
+    f"{r['task']} {c(r['lag_s'])} с (r {c(r['r_at_lag'])})" for r in t1['record_lag'] if r['subject'] == 's2' and r['task'] in ("T1", "T2")) + """.
+У T2 применён свой сдвиг, у T3 — сдвиг T1.
+
+| конфигурация | T1 MAE | T2 MAE | T3 MAE |
+|---|---|---|---|
+""" + "\n".join(f"| {cf} | " + " | ".join(c(next(r['mae'] for r in t1['summary'] if r['config'] == cf and r['task'] == t)) for t in TASKS) + " |" for cf in CONFIGS) + f"""
+
+{summary_table(t1['summary'], 'T2')}
+
+{summary_table(t1['summary'], 'T3')}
+
+MAE по участникам (fft_spectral_mean):
+
+{per_subject('fft_spectral_mean', t1['per_record'])}
+
+Движение, T2: MAE / грубые промахи
+
+{strata_table('T2', t1['motion_strata'])}
+
+Движение, T3:
+
+{strata_table('T3', t1['motion_strata'])}
+
+Кривая порога чистоты, T2:
+
+{curve_table('T2', t1['purity_curve'])}
+
+Кривая порога чистоты, T3:
+
+{curve_table('T3', t1['purity_curve'])}
+
 ### MAE по участникам, текущее умолчание (fft_spectral_mean)
 
 {per_subject('fft_spectral_mean')}
@@ -274,13 +317,14 @@ MAE — среднее по записям участник × задание; �
 `motion_strata.csv`, `purity_curve.csv`, `run_meta.json` — как в задании; сверх задания —
 `record_lag.csv` (сдвиг BVP по записям), `hr_series_lag_diagnostic.csv`, `summary_lag_identified.csv`,
 `summary_truncated.csv`, `summary_extra_s12.csv`, `pairwise.csv`, `cache_check_ubfc_rppg.json`,
-каталог `no_shift/` (те же таблицы без сдвига). В `windows.csv` добавлена колонка `set`.
+каталоги `no_shift/` (те же таблицы без сдвига) и `shift_from_T1/` (сдвиг T1 перенесён на T2/T3). В `windows.csv` добавлена колонка `set`.
 Видео и кадры никуда не копировались.
 
 ```bash
 PYTHONPATH=src venv/bin/python3 benchmark/ubfc_phys.py build          # кэш по видео, ~2 ч
 PYTHONPATH=src venv/bin/python3 benchmark/ubfc_phys.py eval           # все таблицы из кэша
 PYTHONPATH=src venv/bin/python3 benchmark/ubfc_phys.py eval --no-shift
+PYTHONPATH=src venv/bin/python3 benchmark/ubfc_phys.py eval --shift-from-t1
 PYTHONPATH=src venv/bin/python3 benchmark/ubfc_phys_report.py
 ```
 

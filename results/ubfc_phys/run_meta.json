@@ -1,6 +1,6 @@
 {
-  "run_utc": "2026-10-16T13:33:40+00:00",
-  "git_commit": "5fdbbd0f27fd1b78e0a2672f829021c6c3d5b0de",
+  "run_utc": "2026-10-16T14:48:29+00:00",
+  "git_commit": "082bbd8bc4f5b883b2df488f362297089ab07b97",
   "git_dirty": true,
   "src_sha256": "f67f51232d6b407b6f88ead0cb2541e71331fdf45b0783c9d031c239befc628a",
   "presets_sha256": "e08cbb19d916e8d1c5745dc0105373fc8c370dd8137737fae1b78985954587ce",
@@ -61,6 +61,7 @@
     "numpy": "2.0.2",
     "opencv": "5.0.0"
   },
+  "shift_mode": "own",
   "shift_applied": true,
   "lag_method": "MSPTD instantaneous HR cross-correlation, +-10 s, step 0.25 s, accept r >= 0.5"
 }

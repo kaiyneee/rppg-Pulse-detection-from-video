@@ -329,8 +329,13 @@ def src_sha256() -> str:
     return h.hexdigest()
 
 
-def cmd_eval(shift: bool = True) -> None:
-    out_dir = OUT if shift else OUT / "no_shift"
+def cmd_eval(mode: str = "own") -> None:
+    """mode: own — свой сдвиг записи (если определён); none — без сдвига;
+    from_t1 — свой сдвиг, а где он не определён на T2/T3 — сдвиг T1 того же
+    участника (если определён на T1)."""
+    shift = mode != "none"
+    out_dir = {"own": OUT, "none": OUT / "no_shift", "from_t1": OUT / "shift_from_T1"}[mode]
+    t1_lag: dict[str, float] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
     reg = regression_check()
     print(f"регрессия UBFC-rPPG G0: MAE {reg['mae_by_records']:.4f}, покрытие {reg['coverage_mean']:.4f}")
@@ -355,8 +360,13 @@ def cmd_eval(shift: bool = True) -> None:
         bvp_f = bvp_bandpassed(bvp)
         lag, lag_r, lag_ok = estimate_lag(trace)
         applied = lag if (shift and lag_ok) else 0.0
+        source = "own" if (shift and lag_ok) else "none"
+        if rec["task"] == "T1" and lag_ok:
+            t1_lag[rec["subject"]] = lag
+        if mode == "from_t1" and not lag_ok and rec["task"] != "T1" and rec["subject"] in t1_lag:
+            applied, source = t1_lag[rec["subject"]], "T1"
         lags.append({"subject": rec["subject"], "task": rec["task"], "set": rs, "lag_s": fmt(lag, ".2f"),
-                     "r_at_lag": fmt(lag_r, ".3f"), "lag_identified": fmt(lag_ok), "applied_shift_s": fmt(applied, ".2f")})
+                     "r_at_lag": fmt(lag_r, ".3f"), "lag_identified": fmt(lag_ok), "applied_shift_s": fmt(applied, ".2f"), "shift_source": source})
         identified[k] = lag_ok
         refs = {}
         for live in trace.live:
@@ -433,7 +443,7 @@ def cmd_eval(shift: bool = True) -> None:
     full_keys = [k for k in traces if traces[k].subset == "full"]
     ref_by = {(w["key"], w["ts"]): (w["ref"], w["ref_reliable"]) for w in full if w["config"] == DEFAULT_CONFIG}
     for thr in PURITY_THRESHOLDS:
-        by_task = {t: {"n": 0, "pub": 0, "errs": []} for t in TASKS}
+        by_task = {t: {"n": 0, "pub": 0, "errs": [], "per_rec": {}} for t in TASKS}
         for k in full_keys:
             rows, _ = run_config(traces[k], DEFAULT_CONFIG, thr)
             t = k.split("_")[1]
@@ -444,6 +454,7 @@ def cmd_eval(shift: bool = True) -> None:
                     ref_, ok = ref_by.get((k, r.timestamp_ms), (np.nan, False))
                     if ok and np.isfinite(r.bpm):
                         by_task[t]["errs"].append(r.bpm - ref_)
+                        by_task[t]["per_rec"].setdefault(k, []).append(abs(r.bpm - ref_))
         for t in TASKS:
             if not by_task[t]["n"]:
                 continue
@@ -451,6 +462,9 @@ def cmd_eval(shift: bool = True) -> None:
             curve.append({"task": t, "threshold": "" if thr is None else thr,
                           "coverage": fmt(by_task[t]["pub"] / by_task[t]["n"]),
                           "mae": fmt(np.mean(np.abs(e)) if len(e) else np.nan),
+                          "mae_by_records": fmt(np.mean([np.mean(v) for v in by_task[t]["per_rec"].values()])
+                                                if by_task[t]["per_rec"] else np.nan),
+                          "n_records_with_output": len(by_task[t]["per_rec"]),
                           "gross_rate": fmt(np.mean(np.abs(e) > GROSS_BPM) if len(e) else np.nan)})
 
     windows_csv = []
@@ -495,7 +509,7 @@ def cmd_eval(shift: bool = True) -> None:
             "purity_thresholds": PURITY_THRESHOLDS, "motion_tertile_edges": [float(t1), float(t2)],
             "regression_ubfc_rppg_g0": reg,
             "versions": {"python": platform.python_version(), "numpy": np.__version__, "opencv": cv2.__version__}}
-    meta.update({"shift_applied": shift, "lag_method": "MSPTD instantaneous HR cross-correlation, +-10 s, step 0.25 s, accept r >= 0.5"})
+    meta.update({"shift_mode": mode, "shift_applied": shift, "lag_method": "MSPTD instantaneous HR cross-correlation, +-10 s, step 0.25 s, accept r >= 0.5"})
     (out_dir / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print("EVAL_DONE")
 
@@ -533,6 +547,6 @@ def cmd_lagdiag() -> None:
 
 if __name__ == "__main__":
     if sys.argv[1] == "eval":
-        cmd_eval(shift="--no-shift" not in sys.argv)
+        cmd_eval("none" if "--no-shift" in sys.argv else ("from_t1" if "--shift-from-t1" in sys.argv else "own"))
     else:
         {"build": cmd_build, "lagdiag": cmd_lagdiag}[sys.argv[1]]()
